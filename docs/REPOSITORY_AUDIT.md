@@ -31,7 +31,7 @@ These are original design decisions informed by reference behavior, not copies o
 
 Telegram's [official 2026 changelog](https://core.telegram.org/bots/api-changelog#august-24-2026) lists Bot API 10.3 rich buttons, ephemeral message parameters, compact tables, expandable quotes and draft controls. Telegram's [Mini App documentation](https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app) specifies the HMAC and timestamp checks. Its [formatting documentation](https://core.telegram.org/bots/api#formatting-options) limits custom-emoji use by bot eligibility and context; IDs alone do not guarantee rendering. The official MongoDB [migration guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/reference/migration/) recommends PyMongo Async over Motor.
 
-The sandbox has Python 3.11 and Node.js 22; `mongod` and Docker were not found at audit time. Real Telegram credentials and a MongoDB replica set have not been supplied. Live Telegram delivery, transaction behavior against a real cluster, deployment, custom-emoji entitlement and migration must not be claimed without verification.
+The sandbox has Python 3.11 and Node.js 22; `mongod` and Docker were not found at audit time. Real Telegram credentials and a MongoDB replica set have not been supplied. Later CI ran selected transaction tests on a disposable single-member MongoDB replica set; see [testing](TESTING.md). Live Telegram delivery, multi-node behavior, deployment, custom-emoji entitlement and migration must not be claimed without verification.
 
 ## Detailed upstream security and execution findings
 
