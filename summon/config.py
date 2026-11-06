@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     session_max_age: int = Field(default=3600, ge=60, le=86400)
     init_data_max_age: int = Field(default=3600, ge=60, le=86400)
     mongo_max_pool_size: int = Field(default=50, ge=1, le=500)
+    poll_watchdog_seconds: int = Field(default=300, ge=120, le=3600)
+    web_dist: str = ""
 
     @field_validator("telegram_api_id", mode="before")
     @classmethod

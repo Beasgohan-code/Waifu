@@ -105,6 +105,41 @@ jobs:
           run_smoke notes npm run test:notes-browser
           run_smoke auto-replies npm run test:auto-replies-browser
 
+  container:
+    name: Container and same-origin preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the pinned runtime image
+        run: docker build --tag summon-ci .
+      - name: Smoke-test the image without credentials or a database
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name summon-ci-web --publish 127.0.0.1:19090:10000 \
+            --env PORT=10000 --env SUMMON_PREVIEW_MODE=true summon-ci
+          trap 'docker rm -f summon-ci-web > /dev/null 2>&1 || true' EXIT
+          ready=false
+          for _ in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:19090/health > /dev/null; then ready=true; break; fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' summon-ci-web)" != true ]]; then break; fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs --tail 30 summon-ci-web
+            exit 1
+          fi
+          docker exec summon-ci-web sh -c 'test "$(id -u)" -eq 10001 && test -r /app/web/dist/index.html && test ! -e /app/.env && test ! -d /app/web/node_modules'
+          docker exec summon-ci-web python -c 'from summon.bot.main import main; assert callable(main)'
+          curl --fail --silent http://127.0.0.1:19090/ | grep -q '<div id="root">'
+          curl --fail --silent http://127.0.0.1:19090/art/aiko.webp > /dev/null
+          curl --fail --silent http://127.0.0.1:19090/api/bootstrap | python -c 'import json,sys; assert json.load(sys.stdin)["data"]["preview"] is True'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19090/api/not-a-route)" = 404
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST http://127.0.0.1:19090/api/auth/session)" = 403
+
   mongodb:
     name: Isolated MongoDB integration
     runs-on: ubuntu-24.04

@@ -14,6 +14,7 @@ from summon._vendor import richgram_builders as richgram
 from summon.api.context import Store
 from summon.bot.compat import validate_runtime
 from summon.bot.handlers import COMMANDS, build_router, group_commands
+from summon.bot.watchdog import run_supervised_polling
 from summon.config import Settings
 from summon.database import connect_database
 
@@ -71,8 +72,8 @@ async def run() -> None:
         # Polling and webhooks are mutually exclusive. Preserve pending updates.
         await bot.delete_webhook(drop_pending_updates=False)
         logger.info("SUMMON bot starting with aiogram as the sole update ingress")
-        await dispatcher.start_polling(
-            bot, allowed_updates=dispatcher.resolve_used_update_types(), close_bot_session=False
+        await run_supervised_polling(
+            dispatcher, bot, timeout_seconds=settings.poll_watchdog_seconds
         )
     finally:
         if outbound is not None:

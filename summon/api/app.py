@@ -20,6 +20,7 @@ from pymongo.errors import PyMongoError
 
 from summon.api.context import Store
 from summon.api.dependencies import get_current_session, get_current_user, get_store
+from summon.api.static import PublicWebFiles
 from summon.auth import (
     AuthenticationError,
     BoundSession,
@@ -279,6 +280,10 @@ def create_app(
     from summon.api.routes import router
 
     app.include_router(router)
+    if settings.web_dist:
+        # Only the explicitly configured build directory is public. API and
+        # health routes above take precedence, including for unknown API paths.
+        app.mount("/", PublicWebFiles(directory=settings.web_dist, html=True), name="web")
     return app
 
 

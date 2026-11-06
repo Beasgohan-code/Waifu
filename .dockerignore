@@ -1,0 +1,25 @@
+# Never send local secrets, database exports, or generated dependencies to a build.
+.git
+.venv
+.bootstrap
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.session
+**/*.session-journal
+**/*.db
+**/*.sqlite*
+**/*.log
+**/*.pem
+**/*.key
+migration-data
+**/migration-data
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/node_modules
+**/dist
+**/coverage
+build
