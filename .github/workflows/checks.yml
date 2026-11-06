@@ -113,6 +113,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify the Docker build context excludes local data
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f .env web/.env.local summon/synthetic.session private-export.txt migration-data/export.json; rmdir migration-data 2>/dev/null || true' EXIT
+          mkdir -p migration-data
+          printf '%s\n' 'synthetic ignored file' > .env
+          printf '%s\n' 'synthetic ignored file' > web/.env.local
+          printf '%s\n' 'synthetic ignored file' > summon/synthetic.session
+          printf '%s\n' 'synthetic ignored file' > private-export.txt
+          printf '%s\n' 'synthetic ignored file' > migration-data/export.json
+          cat > "$RUNNER_TEMP/context-check.Dockerfile" <<'DOCKERFILE'
+          FROM python:3.11.18-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39
+          COPY . /context/
+          RUN test ! -e /context/.git && test ! -e /context/.env && test ! -e /context/web/.env.local \
+              && test ! -e /context/summon/synthetic.session && test ! -e /context/private-export.txt \
+              && test ! -e /context/migration-data && test -f /context/summon/bot/main.py \
+              && test -f /context/web/src/App.tsx && test -f /context/web/tests/setup.ts
+          DOCKERFILE
+          docker build --file "$RUNNER_TEMP/context-check.Dockerfile" --tag summon-ci-context .
       - name: Build the pinned runtime image
         run: docker build --tag summon-ci .
       - name: Smoke-test the image without credentials or a database
