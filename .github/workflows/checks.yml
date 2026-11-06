@@ -227,7 +227,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          .venv/bin/pytest -q tests/integration --junitxml="$RUNNER_TEMP/mongo-integration.xml"
+          logfile="$RUNNER_TEMP/mongo-integration.log"
+          if ! .venv/bin/pytest -q tests/integration --junitxml="$RUNNER_TEMP/mongo-integration.xml" > "$logfile" 2>&1; then
+            # This job uses only disposable local databases and synthetic data.
+            # Surface bounded diagnostics when the Actions log service is unreachable.
+            python - "$logfile" <<'PY'
+          import pathlib
+          import sys
+          text = pathlib.Path(sys.argv[1]).read_text(errors='replace')[-12000:]
+          escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error title=Isolated Mongo integration::{escaped}')
+          PY
+            exit 1
+          fi
+          cat "$logfile"
           python - "$RUNNER_TEMP/mongo-integration.xml" <<'PY'
           import sys
           import xml.etree.ElementTree as ET
