@@ -15,10 +15,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
       - name: Install locked dependencies
@@ -41,13 +41,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -86,19 +86,33 @@ jobs:
             exit 1
           fi
           cd web
-          npm run test:browser
-          npm run test:warning-browser
-          npm run test:notes-browser
+          run_smoke() {
+            local label="$1" logfile="$RUNNER_TEMP/summon-$1.log"
+            shift
+            if "$@" 2>&1 | tee "$logfile"; then return 0; fi
+            # These are synthetic tests; surface bounded diagnostics in check annotations.
+            python - "$label" "$logfile" <<'PY'
+          import pathlib
+          import sys
+          text = pathlib.Path(sys.argv[2]).read_text(errors='replace')[-4000:]
+          escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error title=Browser smoke {sys.argv[1]} failed::{escaped}')
+          PY
+            return 1
+          }
+          run_smoke preview npm run test:browser
+          run_smoke warnings npm run test:warning-browser
+          run_smoke notes npm run test:notes-browser
 
   mongodb:
     name: Isolated MongoDB integration
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
       - name: Install locked dependencies
@@ -113,12 +127,21 @@ jobs:
           docker run -d --name summon-ci-replica --publish 127.0.0.1:27017:27017 "$image" mongod --replSet summon-ci --bind_ip_all
           docker run -d --name summon-ci-standalone --publish 127.0.0.1:27018:27017 "$image" mongod --bind_ip_all
           wait_for_ping() {
-            local container="$1"
+            local container="$1" output=""
             for _ in {1..60}; do
-              if docker exec "$container" mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'db.adminCommand({ping: 1}).ok' 2>/dev/null | grep -qx 1; then return 0; fi
+              if output=$(docker exec "$container" mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'db.adminCommand({ping: 1}).ok' 2>&1) && grep -qx 1 <<< "$output"; then return 0; fi
               sleep 1
             done
-            echo "MongoDB test container failed to start: $container" >&2
+            echo "::error title=Mongo startup::${container} failed ping; state=$(docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}}' "$container" 2>/dev/null || true)"
+            printf '%s\n' "$output" > "$RUNNER_TEMP/mongo-ping.log"
+            docker logs --tail 8 "$container" > "$RUNNER_TEMP/mongo-container.log" 2>&1 || true
+            python - "$RUNNER_TEMP/mongo-ping.log" "$RUNNER_TEMP/mongo-container.log" <<'PY'
+          import pathlib
+          import sys
+          text = '\n'.join(pathlib.Path(path).read_text(errors='replace')[-1800:] for path in sys.argv[1:])
+          escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error title=Mongo startup details::{escaped}')
+          PY
             return 1
           }
           wait_for_ping summon-ci-replica
