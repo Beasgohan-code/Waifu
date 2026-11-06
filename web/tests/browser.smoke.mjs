@@ -11,6 +11,8 @@ const browser = await chromium.launch({
   args: ['--no-sandbox', '--disable-dev-shm-usage'],
 });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+// The preview is synthetic; do not depend on the live Telegram bridge or its defaults.
+await page.route('https://telegram.org/js/telegram-web-app.js', route => route.fulfill({ contentType: 'application/javascript', body: '' }));
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 

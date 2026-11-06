@@ -17,6 +17,9 @@ const browser = await chromium.launch({
   args: ['--no-sandbox', '--disable-dev-shm-usage'],
 });
 const page = await browser.newPage({ viewport: { width: 320, height: 844 } });
+// Preview tests do not depend on Telegram's remote bridge or its default theme.
+await page.route('https://telegram.org/js/telegram-web-app.js', route => route.fulfill({ contentType: 'application/javascript', body: '' }));
+await page.addInitScript(() => localStorage.setItem('summon-theme', 'dark'));
 page.on('pageerror', error => errors.push(error.message));
 
 try {
@@ -61,6 +64,7 @@ try {
   await text.waitFor();
   assert.equal(await text.inputValue(), base.content);
   assert.ok(await page.getByText('Public in this group').isVisible());
+  assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
   assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), 'notes fit at 320px in dark theme');
   if (process.env.SUMMON_NOTES_SCREENSHOT) {
     await page.screenshot({ path: process.env.SUMMON_NOTES_SCREENSHOT, fullPage: true });

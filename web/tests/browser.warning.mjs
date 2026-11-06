@@ -11,6 +11,9 @@ const browser = await chromium.launch({
   args: ['--no-sandbox', '--disable-dev-shm-usage'],
 });
 const page = await browser.newPage({ viewport: { width: 320, height: 844 } });
+// Preview tests do not depend on Telegram's remote bridge or its default theme.
+await page.route('https://telegram.org/js/telegram-web-app.js', route => route.fulfill({ contentType: 'application/javascript', body: '' }));
+await page.addInitScript(() => localStorage.setItem('summon-theme', 'dark'));
 const errors = [];
 let revoked = false;
 let posts = 0;
@@ -49,6 +52,7 @@ try {
   assert.equal(posts, 0, 'opening the confirmation does not mutate');
   assert.ok(await confirmation.getByText(/member 456/).isVisible());
   assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), 'confirmation fits 320px');
+  assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
   await page.getByRole('button', { name: 'Switch to light theme' }).click();
   assert.equal(await page.locator('html').getAttribute('data-theme'), 'light');
   assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), 'light confirmation fits 320px');

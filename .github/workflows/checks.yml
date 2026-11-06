@@ -124,12 +124,16 @@ jobs:
         run: |
           set -euo pipefail
           image='mongo:8.0.34-noble@sha256:3c64937121b9437095921c4bb2569911084c05f7b88e4a263d62a8959d2b2399'
-          docker run -d --name summon-ci-replica --publish 127.0.0.1:27017:27017 "$image" mongod --replSet summon-ci --bind_ip_all
-          docker run -d --name summon-ci-standalone --publish 127.0.0.1:27018:27017 "$image" mongod --bind_ip_all
+          echo "Test runner kernel: $(uname -r)"
+          # Test-only allocator setting for the runner's kernel; see SERVER-121912.
+          # MongoDB's production recommendation is to use a supported kernel.
+          docker run -d --name summon-ci-replica --env GLIBC_TUNABLES=glibc.pthread.rseq=1 --publish 127.0.0.1:27017:27017 "$image" mongod --replSet summon-ci --bind_ip_all
+          docker run -d --name summon-ci-standalone --env GLIBC_TUNABLES=glibc.pthread.rseq=1 --publish 127.0.0.1:27018:27017 "$image" mongod --bind_ip_all
           wait_for_ping() {
             local container="$1" output=""
             for _ in {1..60}; do
               if output=$(docker exec "$container" mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'db.adminCommand({ping: 1}).ok' 2>&1) && grep -qx 1 <<< "$output"; then return 0; fi
+              if [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)" == false ]]; then break; fi
               sleep 1
             done
             echo "::error title=Mongo startup::${container} failed ping; state=$(docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}}' "$container" 2>/dev/null || true)"
@@ -153,6 +157,10 @@ jobs:
             sleep 1
           done
           if [[ "$primary" != true ]]; then echo 'Replica did not elect a primary' >&2; exit 1; fi
+          for container in summon-ci-replica summon-ci-standalone; do
+            caches=$(docker exec "$container" mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'db.serverStatus().tcmalloc.usingPerCPUCaches')
+            if [[ "$caches" != false ]]; then echo "::error::Test container $container did not disable per-CPU allocator caches"; exit 1; fi
+          done
       - name: Run every isolated MongoDB integration test
         env:
           SUMMON_TEST_MONGO_URI: 'mongodb://127.0.0.1:27017/?replicaSet=summon-ci&directConnection=true'
