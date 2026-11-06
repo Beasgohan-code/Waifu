@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Rarity = Literal["common", "rare", "epic", "legendary"]
+InventorySort = Literal["recent", "copies"]
 
 
 def normalize_name(value: str) -> str:

@@ -44,3 +44,10 @@ async def test_database_initialization_does_not_suppress_failures():
     database.list_collection_names = AsyncMock(side_effect=RuntimeError("database unavailable"))
     with pytest.raises(RuntimeError, match="unavailable"):
         await initialize_database(database)
+
+
+def test_inventory_copy_sort_index_is_scoped_and_stable():
+    assert any(
+        keys == [("user_id", 1), ("quantity", -1), ("character_id", 1)]
+        for keys, _options in INDEXES["inventory"]
+    )

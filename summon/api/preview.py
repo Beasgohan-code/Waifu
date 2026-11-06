@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from summon.models import GroupSettings
+from summon.models import GroupSettings, InventorySort
 
 _CHARACTERS: list[dict[str, Any]] = [
     {
@@ -82,11 +82,24 @@ class PreviewCatalog:
         }
 
     async def inventory(
-        self, user_id: int, *, page: int = 1, limit: int = 24, favorite: bool = False
+        self,
+        user_id: int,
+        *,
+        page: int = 1,
+        limit: int = 24,
+        favorite: bool = False,
+        duplicates: bool = False,
+        sort: InventorySort = "recent",
     ) -> dict[str, Any]:
+        if sort not in {"recent", "copies"}:
+            raise ValueError("Unknown inventory ordering")
         items = [
-            item for item in _CHARACTERS if item["quantity"] and (not favorite or item["favorite"])
+            item
+            for item in _CHARACTERS
+            if item["quantity"] > (1 if duplicates else 0) and (not favorite or item["favorite"])
         ]
+        if sort == "copies":
+            items.sort(key=lambda item: (-item["quantity"], item["id"]))
         return {
             "items": items[(page - 1) * limit : page * limit],
             "total": len(items),

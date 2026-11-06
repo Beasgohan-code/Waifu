@@ -42,6 +42,13 @@ try {
   await page.getByRole('button', { name: 'Favorites', exact: true }).click();
   await page.getByText('1 character', { exact: true }).waitFor();
   assert.equal(await page.getByRole('button', { name: 'View Aiko Tsukino' }).count(), 1);
+  await page.getByRole('button', { name: 'Duplicates', exact: true }).click();
+  await page.getByRole('button', { name: 'View Ren Aster' }).waitFor();
+  assert.equal(await page.getByRole('button', { name: 'View Aiko Tsukino' }).count(), 0);
+  await page.getByLabel('Sort collection').selectOption('copies');
+  await page.getByRole('button', { name: 'All characters', exact: true }).click();
+  await page.getByRole('button', { name: 'View Aiko Tsukino' }).waitFor();
+  assert.equal(await page.locator('.character-card').first().getByRole('button', { name: 'View Ren Aster' }).count(), 1);
 
   await page.getByRole('button', { name: 'Group manager' }).click();
   await page.getByRole('heading', { name: "The Collector's Club" }).waitFor();
@@ -89,6 +96,14 @@ try {
     const mobileNav = page.getByRole('navigation', { name: 'Mobile navigation' });
     assert.ok(await mobileNav.isVisible());
     assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `no horizontal overflow at ${width}px`);
+    if (width === 320) await page.getByRole('button', { name: /Switch to (light|dark) theme/ }).click();
+    await mobileNav.getByRole('button', { name: 'Collection', exact: true }).click();
+    const duplicatesButton = page.getByRole('button', { name: 'Duplicates', exact: true });
+    assert.ok((await duplicatesButton.boundingBox()).height >= 44, 'duplicate filter has a 44px touch target');
+    await duplicatesButton.click();
+    await page.getByRole('button', { name: 'View Ren Aster' }).waitFor();
+    await page.getByLabel('Sort collection').selectOption('copies');
+    assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `collection filters fit ${width}px`);
     await mobileNav.getByRole('button', { name: 'Groups', exact: true }).click();
     await page.getByRole('tab', { name: 'Welcome & rules' }).click();
     assert.ok(await page.getByLabel('Goodbye message').isDisabled());

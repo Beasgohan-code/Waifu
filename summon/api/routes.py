@@ -19,7 +19,7 @@ from summon.group_notes import (
     NOTE_REVISION_PATTERN,
     validate_note_content,
 )
-from summon.models import CharacterInput, GroupSettingsUpdate, Rarity
+from summon.models import CharacterInput, GroupSettingsUpdate, InventorySort, Rarity
 from summon.repositories.groups import public_group
 from summon.services.gifting import GiftService
 from summon.services.group_notes import GroupNotesService
@@ -136,11 +136,15 @@ async def inventory(
     page: int = Query(default=1, ge=1, le=25),
     limit: int = Query(default=24, ge=1, le=50),
     favorite: bool = False,
+    duplicates: bool = False,
+    sort: InventorySort = "recent",
     user: TelegramUser = Depends(get_current_user),
     store: Any = Depends(get_store),
 ) -> dict[str, Any]:
     return {
-        "data": await store.catalog.inventory(user.id, page=page, limit=limit, favorite=favorite)
+        "data": await store.catalog.inventory(
+            user.id, page=page, limit=limit, favorite=favorite, duplicates=duplicates, sort=sort
+        )
     }
 
 

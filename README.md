@@ -8,7 +8,7 @@ An async Telegram character-collection bot, group-management backend, and mobile
 
 ## What is here
 
-- **Collection:** activity-triggered group spawns, name guesses, duplicates, rarity tiers, favourites, wishlists, catalogue search, profiles, and leaderboards. Groups opt in to spawning. Points and XP are earned through catches and daily check-ins; there is no betting, wagering, deposit, cash-out, or casino.
+- **Collection:** activity-triggered group spawns, name guesses, duplicate quantities, rarity tiers, favourites, wishlists, catalogue search, profiles, and leaderboards. The Mini App can show only characters with extra copies and sort the full inventory by copy count or when the inventory record was first added. Groups opt in to spawning. Points and XP are earned through catches and daily check-ins; there is no betting, wagering, deposit, cash-out, or casino.
 - **Trading and gifts:** offers expire after 15 minutes; only the intended recipient can accept. Ownership is rechecked and the transfer, offer state, and history are written in a MongoDB transaction. These guarantees still require a real replica-set test.
 - **Group tools:** live Telegram administrator and bot permission checks for moderation, configurable spawns, welcome/goodbye messages and rules, and link, flood, duplicate, mention and keyword controls. Admins with change-info rights can manage public, text-only group notes with revision checks; members can request them with `/note`. Anyone who can see group messages may read or share the result, so never save secrets there. Restrict-authorized admins can review and explicitly revoke active warnings; corrections retain audit records and do not alter Telegram restrictions. Protection runs before delivered group commands and checks edits, subject to Telegram delivery and content limits. Warning escalation and several advanced workflows remain open.
 - **Mini App:** Telegram-themed responsive views for the catalogue, collection, progression, trades/gifts, group controls and authorized catalogue operators. Signed Telegram launches are bound to revocable server-side sessions so different launches sharing browser cookies do not silently see each other's accounts. The local sample preview is visibly read-only.
@@ -20,9 +20,10 @@ An async Telegram character-collection bot, group-management backend, and mobile
 Requires Python 3.11+ and Node.js 22+. Use two terminals from the repository root:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade 'pip>=26.3' 'setuptools>=84.1'
-.venv/bin/python -m pip install -e '.[dev]'
+# Keep the lockfile tool separate from the project environment it manages.
+python3 -m venv .bootstrap
+.bootstrap/bin/python -m pip install --upgrade 'pip==26.3' 'setuptools==84.2.1' 'uv==0.13.7'
+.bootstrap/bin/uv sync --locked --extra dev --python 3.11 --no-python-downloads
 cd web && npm ci && cd ..
 
 # Terminal 1: sample API, no database or Telegram credentials used
@@ -32,7 +33,7 @@ SUMMON_PREVIEW_MODE=true .venv/bin/uvicorn summon.api.app:app --host 0.0.0.0 --p
 cd web && npm run dev
 ```
 
-Open the Vite URL shown in the terminal. The preview contains fictional examples, rejects all API mutations, and cannot be enabled when `SUMMON_ENVIRONMENT=production`. It is not a test of a real Telegram account or database.
+Open the Vite URL shown in the terminal. The preview contains fictional examples, rejects all API mutations, and cannot be enabled when `SUMMON_ENVIRONMENT=production`. It is not a test of a real Telegram account or database. `uv.lock` pins direct and transitive Python dependencies; plain `pip install -e '.[dev]'` does not enforce that lock. See [deployment](docs/DEPLOYMENT.md) for production installs and the build-hash/platform limits.
 
 ## Run against your own infrastructure
 
@@ -43,6 +44,7 @@ The optional example catalogue is **not** installed automatically. `summon-seed`
 ## Checks
 
 ```bash
+.bootstrap/bin/uv lock --check
 .venv/bin/pytest -q
 .venv/bin/ruff check summon tests
 .venv/bin/mypy summon

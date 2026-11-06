@@ -2,15 +2,61 @@
 
 from __future__ import annotations
 
+import ipaddress
+import re
 from typing import Literal
-from urllib.parse import urlsplit
+from unicodedata import category
+from urllib.parse import SplitResult, urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _contains_unsafe_url_characters(value: str) -> bool:
+    # urlsplit silently strips several controls and leading spaces. Reject the
+    # original value instead of validating a normalized URL but using the input.
+    return len(value) > 2048 or any(
+        char.isspace() or category(char) in {"Cc", "Cf"} or char == "\\" for char in value
+    )
+
+
+def _valid_url_host(host: str | None) -> bool:
+    if not host or "%" in host:  # IPv6 zones and percent-encoded hosts are ambiguous.
+        return False
+    try:
+        if ":" in host:
+            return isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address)
+        ascii_host = host.encode("idna").decode("ascii")
+        if ascii_host.endswith("."):
+            ascii_host = ascii_host[:-1]
+        if not ascii_host or len(ascii_host) > 253:
+            return False
+        labels = ascii_host.split(".")
+        if all(label.isdecimal() for label in labels):
+            return isinstance(ipaddress.ip_address(ascii_host), ipaddress.IPv4Address)
+        return all(re.fullmatch(r"(?!-)[a-zA-Z0-9-]{1,63}(?<!-)", label) for label in labels)
+    except (UnicodeError, ValueError):
+        return False
+
+
+def _browser_origin(parsed: SplitResult) -> str:
+    # Browser Origin headers serialize scheme/host in lowercase, punycode IDNs,
+    # compress IPv6 addresses and omit the default port.
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{ipaddress.IPv6Address(host).compressed}]"
+    else:
+        host = host.encode("idna").decode("ascii")
+    port = parsed.port
+    default_port = 443 if parsed.scheme == "https" else 80
+    suffix = f":{port}" if port is not None and port != default_port else ""
+    return f"{parsed.scheme}://{host}{suffix}"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="SUMMON_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="SUMMON_", env_file=".env", extra="ignore", hide_input_in_errors=True
+    )
 
     environment: Literal["development", "production"] = "development"
     bot_token: SecretStr = SecretStr("")
@@ -43,13 +89,17 @@ class Settings(BaseSettings):
                 parsed = urlsplit(origin)
                 port = parsed.port  # Force validation of malformed ports.
                 valid_host = (
-                    bool(parsed.hostname) and parsed.username is None and parsed.password is None
+                    _valid_url_host(parsed.hostname)
+                    and parsed.username is None
+                    and parsed.password is None
                 )
                 secure = parsed.scheme == "https"
                 local = parsed.scheme == "http" and parsed.hostname == "localhost"
                 if (
                     not valid_host
+                    or _contains_unsafe_url_characters(origin)
                     or not (secure or local)
+                    or origin != _browser_origin(parsed)
                     or parsed.path
                     or parsed.query
                     or parsed.fragment
@@ -60,7 +110,7 @@ class Settings(BaseSettings):
                     raise ValueError
             except ValueError as exc:
                 raise ValueError(
-                    "Use exact HTTPS origins, or http://localhost in development"
+                    "Use browser-serialized HTTPS origins, or http://localhost in development"
                 ) from exc
         return value
 
@@ -73,7 +123,8 @@ class Settings(BaseSettings):
             parsed = urlsplit(value)
             port = parsed.port
             if (
-                not parsed.hostname
+                not _valid_url_host(parsed.hostname)
+                or _contains_unsafe_url_characters(value)
                 or parsed.username is not None
                 or parsed.password is not None
                 or parsed.fragment
@@ -102,8 +153,8 @@ class Settings(BaseSettings):
                 raise ValueError("SUMMON_BOT_TOKEN is required in production")
             if len(self.session_secret.get_secret_value()) < 32:
                 raise ValueError("SUMMON_SESSION_SECRET must be at least 32 characters")
-            if self.webapp_url and urlsplit(self.webapp_url).scheme != "https":
-                raise ValueError("SUMMON_WEBAPP_URL must use HTTPS in production")
+            if not self.webapp_url or urlsplit(self.webapp_url).scheme != "https":
+                raise ValueError("SUMMON_WEBAPP_URL must be a non-empty HTTPS URL in production")
             if any(urlsplit(origin).scheme != "https" for origin in self.allowed_origins):
                 raise ValueError("Production origins must use HTTPS")
         if self.rich_enabled and (

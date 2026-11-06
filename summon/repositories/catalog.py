@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from pymongo import ASCENDING, DESCENDING
 
-from summon.models import CharacterInput, normalize_name
+from summon.models import CharacterInput, InventorySort, normalize_name
 from summon.repositories.base import transaction, utcnow
 
 RARITY_WEIGHTS = {"common": 55, "rare": 25, "epic": 15, "legendary": 5}
@@ -153,13 +153,23 @@ class CatalogRepository:
         return {"items": items, "page": page, "limit": limit, "total": total}
 
     async def inventory(
-        self, user_id: int, *, page: int = 1, limit: int = 24, favorite: bool = False
+        self,
+        user_id: int,
+        *,
+        page: int = 1,
+        limit: int = 24,
+        favorite: bool = False,
+        duplicates: bool = False,
+        sort: InventorySort = "recent",
     ) -> dict[str, Any]:
-        query: dict[str, Any] = {"user_id": user_id, "quantity": {"$gt": 0}}
+        if sort not in {"recent", "copies"}:
+            raise ValueError("Unknown inventory ordering")
+        query: dict[str, Any] = {"user_id": user_id, "quantity": {"$gt": 1 if duplicates else 0}}
         if favorite:
             query["favorite"] = True
+        sort_field = "quantity" if sort == "copies" else "acquired_at"
         cursor = self.db.inventory.find(query).sort(
-            [("acquired_at", DESCENDING), ("character_id", ASCENDING)]
+            [(sort_field, DESCENDING), ("character_id", ASCENDING)]
         )
         rows = await cursor.skip((page - 1) * limit).limit(limit).to_list(length=limit)
         chars = await self.db.characters.find(

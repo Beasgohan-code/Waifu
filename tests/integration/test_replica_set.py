@@ -395,3 +395,55 @@ async def test_note_cap_is_atomic_under_concurrent_creates(isolated_database):
     assert sum(isinstance(result, NoteLimitError) for result in results) == 1
     assert len(await repo.list(-100)) == 30
     assert await db.activity.count_documents({"group_id": -100, "kind": "note_changed"}) == 1
+
+
+async def test_inventory_duplicates_sort_and_pagination_preserve_ownership(isolated_database):
+    from summon.repositories.catalog import CatalogRepository
+
+    _client, db = isolated_database
+    now = datetime.now(UTC)
+    await db.inventory.insert_many(
+        [
+            {
+                "user_id": 11,
+                "character_id": "aiko",
+                "quantity": 5,
+                "favorite": True,
+                "acquired_at": now,
+            },
+            {
+                "user_id": 11,
+                "character_id": "ren",
+                "quantity": 5,
+                "favorite": False,
+                "acquired_at": now,
+            },
+            {
+                "user_id": 11,
+                "character_id": "mira",
+                "quantity": 2,
+                "favorite": True,
+                "acquired_at": now,
+            },
+            {
+                "user_id": 22,
+                "character_id": "aiko",
+                "quantity": 99,
+                "favorite": True,
+                "acquired_at": now,
+            },
+        ]
+    )
+    repo = CatalogRepository(db)
+    first = await repo.inventory(11, duplicates=True, sort="copies", page=1, limit=2)
+    second = await repo.inventory(11, duplicates=True, sort="copies", page=2, limit=2)
+    assert [(row["id"], row["quantity"]) for row in first["items"]] == [("aiko", 5), ("ren", 5)]
+    assert [(row["id"], row["quantity"]) for row in second["items"]] == [("mira", 2)]
+    assert first["total"] == second["total"] == 3
+    favorite = await repo.inventory(11, favorite=True, duplicates=True, sort="copies")
+    assert [row["id"] for row in favorite["items"]] == ["aiko", "mira"]
+    assert (await db.inventory.find_one({"user_id": 22, "character_id": "aiko"}))["quantity"] == 99
+    assert (
+        sum(row["quantity"] for row in await db.inventory.find({"user_id": 11}).to_list(length=10))
+        == 12
+    )

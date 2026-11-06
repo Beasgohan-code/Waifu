@@ -163,6 +163,7 @@ INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
     "inventory": [
         ([("user_id", ASCENDING), ("character_id", ASCENDING)], {"unique": True}),
         ([("user_id", ASCENDING), ("acquired_at", DESCENDING), ("character_id", ASCENDING)], {}),
+        ([("user_id", ASCENDING), ("quantity", DESCENDING), ("character_id", ASCENDING)], {}),
         (
             [
                 ("user_id", ASCENDING),
