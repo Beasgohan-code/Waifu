@@ -1,0 +1,256 @@
+name: SUMMON checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Install locked dependencies
+        run: |
+          python -m pip install 'uv==0.13.7'
+          uv sync --locked --extra dev --python "$(command -v python)" --no-python-downloads
+          uv pip check --python .venv/bin/python
+      - name: Lint and type checks
+        run: |
+          .venv/bin/ruff check summon tests
+          .venv/bin/ruff format --check summon tests
+          .venv/bin/mypy summon
+      - name: Unit and fake-store tests
+        run: .venv/bin/pytest -q -m 'not integration'
+      - name: Audit installed Python packages
+        run: .venv/bin/pip-audit --skip-editable
+
+  frontend:
+    name: Frontend and preview browser checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked dependencies
+        run: |
+          python -m pip install 'uv==0.13.7'
+          uv sync --locked --python "$(command -v python)" --no-python-downloads
+          npm ci --prefix web
+      - name: Test, typecheck, build, and audit
+        working-directory: web
+        run: |
+          npm test
+          npm run typecheck
+          npm run build
+          npm audit
+          npm audit --omit=dev
+      - name: Read-only and intercepted browser smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROMIUM_PATH="$(command -v google-chrome || command -v chromium)"
+          export CHROMIUM_PATH
+          SUMMON_PREVIEW_MODE=true .venv/bin/uvicorn summon.api.app:app --host 127.0.0.1 --port 8000 --no-access-log > "$RUNNER_TEMP/summon-api.log" 2>&1 &
+          api_pid=$!
+          npm run dev --prefix web > "$RUNNER_TEMP/summon-vite.log" 2>&1 &
+          web_pid=$!
+          trap 'kill "$api_pid" "$web_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for _ in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:8000/health > /dev/null && curl --fail --silent http://127.0.0.1:5173/ > /dev/null; then ready=true; break; fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            cat "$RUNNER_TEMP/summon-api.log" "$RUNNER_TEMP/summon-vite.log"
+            exit 1
+          fi
+          cd web
+          run_smoke() {
+            local label="$1" logfile="$RUNNER_TEMP/summon-$1.log"
+            shift
+            if "$@" 2>&1 | tee "$logfile"; then return 0; fi
+            # These are synthetic tests; surface bounded diagnostics in check annotations.
+            python - "$label" "$logfile" <<'PY'
+          import pathlib
+          import sys
+          text = pathlib.Path(sys.argv[2]).read_text(errors='replace')[-4000:]
+          escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error title=Browser smoke {sys.argv[1]} failed::{escaped}')
+          PY
+            return 1
+          }
+          run_smoke preview npm run test:browser
+          run_smoke warnings npm run test:warning-browser
+          run_smoke notes npm run test:notes-browser
+          run_smoke auto-replies npm run test:auto-replies-browser
+
+  container:
+    name: Container and same-origin preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the Docker build context excludes local data
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f .env web/.env.local summon/synthetic.session private-export.txt migration-data/export.json; rmdir migration-data 2>/dev/null || true' EXIT
+          mkdir -p migration-data
+          printf '%s\n' 'synthetic ignored file' > .env
+          printf '%s\n' 'synthetic ignored file' > web/.env.local
+          printf '%s\n' 'synthetic ignored file' > summon/synthetic.session
+          printf '%s\n' 'synthetic ignored file' > private-export.txt
+          printf '%s\n' 'synthetic ignored file' > migration-data/export.json
+          cat > "$RUNNER_TEMP/context-check.Dockerfile" <<'DOCKERFILE'
+          FROM python:3.11.18-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39
+          COPY . /context/
+          RUN test ! -e /context/.git && test ! -e /context/.env && test ! -e /context/web/.env.local \
+              && test ! -e /context/summon/synthetic.session && test ! -e /context/private-export.txt \
+              && test ! -e /context/migration-data && test -f /context/summon/bot/main.py \
+              && test -f /context/web/src/App.tsx && test -f /context/web/tests/setup.ts
+          DOCKERFILE
+          docker build --file "$RUNNER_TEMP/context-check.Dockerfile" --tag summon-ci-context .
+      - name: Build the pinned runtime image
+        run: docker build --tag summon-ci .
+      - name: Smoke-test the image without credentials or a database
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name summon-ci-web --publish 127.0.0.1:19090:10000 \
+            --env PORT=10000 --env SUMMON_PREVIEW_MODE=true summon-ci
+          trap 'docker rm -f summon-ci-web > /dev/null 2>&1 || true' EXIT
+          ready=false
+          for _ in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:19090/health > /dev/null; then ready=true; break; fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' summon-ci-web)" != true ]]; then break; fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs --tail 30 summon-ci-web
+            exit 1
+          fi
+          docker exec summon-ci-web sh -c 'test "$(id -u)" -eq 10001 && test -r /app/web/dist/index.html && test ! -e /app/.env && test ! -d /app/web/node_modules'
+          docker exec summon-ci-web python -c 'from summon.bot.main import main; assert callable(main)'
+          curl --fail --silent http://127.0.0.1:19090/ | grep -q '<div id="root">'
+          curl --fail --silent http://127.0.0.1:19090/art/aiko.webp > /dev/null
+          curl --fail --silent http://127.0.0.1:19090/api/bootstrap | python -c 'import json,sys; assert json.load(sys.stdin)["data"]["preview"] is True'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19090/api/not-a-route)" = 404
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST http://127.0.0.1:19090/api/auth/session)" = 403
+
+  mongodb:
+    name: Isolated MongoDB integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Install locked dependencies
+        run: |
+          python -m pip install 'uv==0.13.7'
+          uv sync --locked --extra dev --python "$(command -v python)" --no-python-downloads
+      - name: Start disposable local databases
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='mongo:8.0.34-noble@sha256:3c64937121b9437095921c4bb2569911084c05f7b88e4a263d62a8959d2b2399'
+          echo "Test runner kernel: $(uname -r)"
+          # Test-only allocator setting for the runner's kernel; see SERVER-121912.
+          # MongoDB's production recommendation is to use a supported kernel.
+          docker run -d --name summon-ci-replica --env GLIBC_TUNABLES=glibc.pthread.rseq=1 --publish 127.0.0.1:27017:27017 "$image" mongod --replSet summon-ci --bind_ip_all
+          docker run -d --name summon-ci-standalone --env GLIBC_TUNABLES=glibc.pthread.rseq=1 --publish 127.0.0.1:27018:27017 "$image" mongod --bind_ip_all
+          wait_for_ping() {
+            local container="$1" output=""
+            for _ in {1..60}; do
+              if output=$(docker exec "$container" mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'db.adminCommand({ping: 1}).ok' 2>&1) && grep -qx 1 <<< "$output"; then return 0; fi
+              if [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)" == false ]]; then break; fi
+              sleep 1
+            done
+            echo "::error title=Mongo startup::${container} failed ping; state=$(docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}}' "$container" 2>/dev/null || true)"
+            printf '%s\n' "$output" > "$RUNNER_TEMP/mongo-ping.log"
+            docker logs --tail 8 "$container" > "$RUNNER_TEMP/mongo-container.log" 2>&1 || true
+            python - "$RUNNER_TEMP/mongo-ping.log" "$RUNNER_TEMP/mongo-container.log" <<'PY'
+          import pathlib
+          import sys
+          text = '\n'.join(pathlib.Path(path).read_text(errors='replace')[-1800:] for path in sys.argv[1:])
+          escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error title=Mongo startup details::{escaped}')
+          PY
+            return 1
+          }
+          wait_for_ping summon-ci-replica
+          wait_for_ping summon-ci-standalone
+          docker exec summon-ci-replica mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'rs.initiate({_id: "summon-ci", members: [{_id: 0, host: "127.0.0.1:27017"}]})'
+          primary=false
+          for _ in {1..60}; do
+            if docker exec summon-ci-replica mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -qx true; then primary=true; break; fi
+            sleep 1
+          done
+          if [[ "$primary" != true ]]; then echo 'Replica did not elect a primary' >&2; exit 1; fi
+          for container in summon-ci-replica summon-ci-standalone; do
+            caches=$(docker exec "$container" mongosh 'mongodb://127.0.0.1:27017/?directConnection=true' --quiet --eval 'db.serverStatus().tcmalloc.usingPerCPUCaches')
+            if [[ "$caches" != false ]]; then echo "::error::Test container $container did not disable per-CPU allocator caches"; exit 1; fi
+          done
+      - name: Run every isolated MongoDB integration test
+        env:
+          SUMMON_TEST_MONGO_URI: 'mongodb://127.0.0.1:27017/?replicaSet=summon-ci&directConnection=true'
+          SUMMON_TEST_MONGO_CONFIRM: CREATE_ISOLATED_TEST_DB
+          SUMMON_TEST_MONGO_DROP_CONFIRM: DROP_ISOLATED_TEST_DB
+          SUMMON_TEST_STANDALONE_URI: 'mongodb://127.0.0.1:27018/?directConnection=true'
+          SUMMON_TEST_STANDALONE_CONFIRM: PROBE_STANDALONE_READ_ONLY
+        shell: bash
+        run: |
+          set -euo pipefail
+          logfile="$RUNNER_TEMP/mongo-integration.log"
+          if ! .venv/bin/pytest -q tests/integration --junitxml="$RUNNER_TEMP/mongo-integration.xml" > "$logfile" 2>&1; then
+            # This job uses only disposable local databases and synthetic data.
+            # Surface bounded diagnostics when the Actions log service is unreachable.
+            python - "$logfile" <<'PY'
+          import pathlib
+          import sys
+          text = pathlib.Path(sys.argv[1]).read_text(errors='replace')[-12000:]
+          escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error title=Isolated Mongo integration::{escaped}')
+          PY
+            exit 1
+          fi
+          cat "$logfile"
+          python - "$RUNNER_TEMP/mongo-integration.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = root.findall('.//testcase')
+          skipped = [case for case in cases if case.find('skipped') is not None]
+          if len(cases) < 19 or skipped:
+              raise SystemExit(f'Expected at least 19 integration cases and no skips; got {len(cases)} cases and {len(skipped)} skipped')
+          print(f'All {len(cases)} integration cases ran without skips.')
+          PY
+      - name: Remove disposable test containers
+        if: always()
+        run: docker rm -f summon-ci-replica summon-ci-standalone || true
