@@ -145,6 +145,7 @@ def create_app(
             503, "database_unavailable", "The database is unavailable; please try again"
         )
 
+    from summon.auto_replies import AutoReplyConflict, AutoReplyStorageError
     from summon.group_notes import NoteConflict, NoteStorageError
     from summon.repositories.users import DailyAlreadyClaimed
     from summon.services.gifting import GiftConflict, GiftForbidden, GiftNotFound
@@ -161,12 +162,21 @@ def create_app(
     @app.exception_handler(GiftConflict)
     @app.exception_handler(DailyAlreadyClaimed)
     @app.exception_handler(NoteConflict)
+    @app.exception_handler(AutoReplyConflict)
     async def conflict_error(_request: Request, exc: Exception) -> JSONResponse:
         return error_response(409, "conflict", str(exc))
 
     @app.exception_handler(NoteStorageError)
     async def note_storage_error(_request: Request, _exc: NoteStorageError) -> JSONResponse:
         return error_response(503, "notes_unavailable", "Stored notes need operator review")
+
+    @app.exception_handler(AutoReplyStorageError)
+    async def auto_reply_storage_error(
+        _request: Request, _exc: AutoReplyStorageError
+    ) -> JSONResponse:
+        return error_response(
+            503, "auto_replies_unavailable", "Stored auto replies need operator review"
+        )
 
     @app.exception_handler(TradeNotFound)
     @app.exception_handler(GiftNotFound)

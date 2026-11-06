@@ -6,9 +6,10 @@ import { useRemote } from '../hooks';
 import type { Group, GroupSettings } from '../types';
 import WarningReview from './WarningReview';
 import GroupNotes from './GroupNotes';
+import GroupAutoReplies from './GroupAutoReplies';
 
-type Tab = 'overview' | 'protection' | 'community' | 'moderation' | 'notes';
-interface Props { preview: boolean; revision: number; refresh: () => void; notify: (message: string, error?: boolean) => void; onNoteDraftChange?: (hasDraft: boolean) => void }
+type Tab = 'overview' | 'protection' | 'community' | 'moderation' | 'notes' | 'auto-replies';
+interface Props { preview: boolean; revision: number; refresh: () => void; notify: (message: string, error?: boolean) => void; onNoteDraftChange?: (hasDraft: boolean, kind?: 'note' | 'auto-reply') => void }
 type PendingNavigation = { tab: Tab } | { group: number };
 
 function Toggle({ label, hint, checked, onChange, disabled }: { label: string; hint: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean }) {
@@ -23,7 +24,13 @@ export default function Groups({ preview, revision, refresh, notify, onNoteDraft
   const [pendingNavigation, setPendingNavigation] = useState<PendingNavigation | null>(null);
   const navigationConfirmRef = useRef<HTMLDivElement>(null);
   const navigationOpenerRef = useRef<HTMLElement | null>(null);
-  const reportNoteDraft = useCallback((value: boolean) => { setNoteDraft(value); onNoteDraftChange?.(value); }, [onNoteDraftChange]);
+  // Refresh audit activity after leaving the editor, not while it is recovering
+  // a confirmed save whose follow-up list request may have failed.
+  const pendingAutoRefresh = useRef(false);
+  const markAutoRefresh = useCallback(() => { pendingAutoRefresh.current = true; }, []);
+  function refreshAutoActivity() { if (pendingAutoRefresh.current) { pendingAutoRefresh.current = false; refresh(); } }
+  const reportNoteDraft = useCallback((value: boolean) => { setNoteDraft(value); onNoteDraftChange?.(value, 'note'); }, [onNoteDraftChange]);
+  const reportReplyDraft = useCallback((value: boolean) => { setNoteDraft(value); onNoteDraftChange?.(value, 'auto-reply'); }, [onNoteDraftChange]);
   const [settings, setSettings] = useState<GroupSettings | null>(null);
   const [keywords, setKeywords] = useState('');
   const [target, setTarget] = useState('');
@@ -37,20 +44,22 @@ export default function Groups({ preview, revision, refresh, notify, onNoteDraft
   useEffect(() => { if (pendingNavigation) navigationConfirmRef.current?.focus(); }, [pendingNavigation]);
   function changeTab(next: Tab, opener: HTMLElement) {
     if (next === tab) return;
-    if (tab === 'notes' && noteDraft) { navigationOpenerRef.current = opener; setPendingNavigation({ tab: next }); }
-    else setTab(next);
+    if ((tab === 'notes' || tab === 'auto-replies') && noteDraft) { navigationOpenerRef.current = opener; setPendingNavigation({ tab: next }); }
+    else { setTab(next); if (tab === 'auto-replies') refreshAutoActivity(); }
   }
   function changeGroup(next: number, opener: HTMLElement) {
     if (next === selected) return;
-    if (tab === 'notes' && noteDraft) { navigationOpenerRef.current = opener; setPendingNavigation({ group: next }); }
-    else { setSelected(next); setTab('overview'); }
+    if ((tab === 'notes' || tab === 'auto-replies') && noteDraft) { navigationOpenerRef.current = opener; setPendingNavigation({ group: next }); }
+    else { setSelected(next); setTab('overview'); if (tab === 'auto-replies') refreshAutoActivity(); }
   }
   function continueNavigation() {
     if (!pendingNavigation) return;
     const next = pendingNavigation;
-    setPendingNavigation(null); reportNoteDraft(false);
+    setPendingNavigation(null);
+    if (tab === 'auto-replies') reportReplyDraft(false); else reportNoteDraft(false);
     if ('tab' in next) setTab(next.tab);
     else { setSelected(next.group); setTab('overview'); }
+    if (tab === 'auto-replies') refreshAutoActivity();
   }
   function set<K extends keyof GroupSettings>(key: K, value: GroupSettings[K]) { setSettings(current => current ? { ...current, [key]: value } : current); }
   async function save(part: 'overview' | 'protection' | 'community') {
@@ -85,12 +94,13 @@ export default function Groups({ preview, revision, refresh, notify, onNoteDraft
       <div className="group-select-row"><label>YOUR GROUP <select value={selected ?? ''} onChange={event => changeGroup(Number(event.target.value), event.currentTarget)}>{groups.map(item => <option value={item.id} key={item.id}>{item.title}</option>)}</select></label>{preview && <span className="sample-label">SAMPLE GROUP · READ ONLY</span>}</div>
       {groupLoading ? <div className="loading-line">Loading group…</div> : groupError ? <EmptyState title="Couldn't load this group" text={groupError} /> : group && settings && <>
         <div className="group-header"><div className="group-avatar"><Users size={23} /></div><div><span className="eyebrow">GROUP MANAGEMENT</span><h2>{group.title}</h2><p>Permission-aware controls for your community.</p></div><span className="group-badge"><ShieldCheck size={14} /> ADMIN ACCESS</span></div>
-        {pendingNavigation && <div ref={navigationConfirmRef} tabIndex={-1} className="warning-confirm" role="region" aria-label="Discard note draft"><h4>Leave your note draft?</h4><p>Leaving will discard the draft. If a save is already in progress, it may still complete; review the notes before retrying.</p><div className="warning-confirm-actions"><button className="button button-subtle" type="button" onClick={() => { setPendingNavigation(null); navigationOpenerRef.current?.focus(); }}>Keep editing</button><button className="button button-primary" type="button" onClick={continueNavigation}>Discard and continue</button></div></div>}
+        {pendingNavigation && <div ref={navigationConfirmRef} tabIndex={-1} className="warning-confirm" role="region" aria-label={tab === 'auto-replies' ? 'Discard auto-reply draft' : 'Discard note draft'}><h4>Leave your {tab === 'auto-replies' ? 'auto-reply' : 'note'} draft?</h4><p>Leaving will discard the draft. If a save is already in progress, it may still complete; review the {tab === 'auto-replies' ? 'auto replies' : 'notes'} before retrying.</p><div className="warning-confirm-actions"><button className="button button-subtle" type="button" onClick={() => { setPendingNavigation(null); navigationOpenerRef.current?.focus(); }}>Keep editing</button><button className="button button-primary" type="button" onClick={continueNavigation}>Discard and continue</button></div></div>}
         <div className="group-tabs" role="tablist" aria-label="Group management sections">
           <button role="tab" aria-selected={tab === 'overview'} onClick={event => changeTab('overview', event.currentTarget)}>Overview</button>
           {group.permissions.can_restrict_members && <button role="tab" aria-selected={tab === 'protection'} onClick={event => changeTab('protection', event.currentTarget)}>Protection</button>}
           {group.permissions.can_change_info && <button role="tab" aria-selected={tab === 'community'} onClick={event => changeTab('community', event.currentTarget)}>Welcome & rules</button>}
           {group.permissions.can_change_info && <button role="tab" aria-selected={tab === 'notes'} onClick={event => changeTab('notes', event.currentTarget)}>Notes</button>}
+          {group.permissions.can_change_info && <button role="tab" aria-selected={tab === 'auto-replies'} onClick={event => changeTab('auto-replies', event.currentTarget)}>Auto replies</button>}
           {group.permissions.can_restrict_members && <button role="tab" aria-selected={tab === 'moderation'} onClick={event => changeTab('moderation', event.currentTarget)}>Moderation</button>}
         </div>
         {tab === 'overview' && <div className="group-layout"><div><div className="group-stat-grid"><div className="page-card"><MessageCircle size={18} /><span>Messages counted</span><strong>{group.total_messages.toLocaleString()}</strong></div><div className="page-card"><Sparkles size={18} /><span>Character summons</span><strong>{settings.spawn_enabled ? 'Enabled' : 'Off'}</strong></div><div className="page-card"><Activity size={18} /><span>Summon frequency</span><strong>{settings.spawn_every} messages</strong></div></div>
@@ -98,7 +108,7 @@ export default function Groups({ preview, revision, refresh, notify, onNoteDraft
             <Toggle label="Automatic summons" hint="Characters can appear as members chat." checked={settings.spawn_enabled} onChange={value => set('spawn_enabled', value)} disabled={preview || !group.permissions.can_change_info} />
             <div className="form-grid group-form"><label>Messages per summon<input type="number" min="20" max="10000" value={settings.spawn_every} disabled={preview || !group.permissions.can_change_info} onChange={event => set('spawn_every', Number(event.target.value))} /></label><label>Minimum cooldown (seconds)<input type="number" min="60" max="86400" value={settings.spawn_cooldown_seconds} disabled={preview || !group.permissions.can_change_info} onChange={event => set('spawn_cooldown_seconds', Number(event.target.value))} /></label></div>
             {group.permissions.can_change_info && <button className="button button-primary" disabled={preview || busy} onClick={() => save('overview')}>Save summon settings <ArrowRight size={15} /></button>}
-          </div></div><div className="page-card activity-panel"><div className="panel-title"><div><span className="eyebrow">THE LATEST</span><h3>Recent activity</h3></div><Activity size={18} /></div>{group.recent_activity?.length ? group.recent_activity.map((item, index) => <div className="activity-row" key={`${item.created_at}-${index}`}><span className="activity-dot" /><div><strong>{item.kind === 'moderation' ? item.action === 'warning_revoked' ? 'Warning revoked' : `${item.action || 'Moderation'} recorded` : item.kind === 'spam_removed' ? 'Spam message removed' : item.kind === 'settings_changed' ? 'Settings updated' : item.kind === 'note_changed' ? `Note ${item.action || 'changed'}` : item.kind.replaceAll('_', ' ')}</strong><small>{item.reason || new Date(item.created_at).toLocaleDateString()}</small>{item.warning_id && <small>Warning {item.warning_id}</small>}{item.note_name && <small>Note {item.note_name}</small>}</div></div>) : <p className="muted-small">No recent activity yet.</p>}</div></div>}
+          </div></div><div className="page-card activity-panel"><div className="panel-title"><div><span className="eyebrow">THE LATEST</span><h3>Recent activity</h3></div><Activity size={18} /></div>{group.recent_activity?.length ? group.recent_activity.map((item, index) => <div className="activity-row" key={`${item.created_at}-${index}`}><span className="activity-dot" /><div><strong>{item.kind === 'moderation' ? item.action === 'warning_revoked' ? 'Warning revoked' : `${item.action || 'Moderation'} recorded` : item.kind === 'spam_removed' ? 'Spam message removed' : item.kind === 'settings_changed' ? 'Settings updated' : item.kind === 'note_changed' ? `Note ${item.action || 'changed'}` : item.kind === 'auto_reply_changed' ? `Auto reply ${item.action || 'changed'}` : item.kind.replaceAll('_', ' ')}</strong><small>{item.reason || new Date(item.created_at).toLocaleDateString()}</small>{item.warning_id && <small>Warning {item.warning_id}</small>}{item.note_name && <small>Note {item.note_name}</small>}{item.reply_name && <small>Auto reply {item.reply_name}</small>}</div></div>) : <p className="muted-small">No recent activity yet.</p>}</div></div>}
         {tab === 'protection' && group.permissions.can_restrict_members && <div className="page-card group-panel"><div className="panel-title"><div><span className="eyebrow">KEEP THE CONVERSATION HEALTHY</span><h3>Protection settings</h3><p>Suspected messages are removed only when the bot has permission. Administrators are exempt.</p></div><ShieldCheck size={20} /></div>
           <Toggle label="Link filter" hint="Remove messages containing web or Telegram links." checked={settings.link_filter} onChange={value => set('link_filter', value)} disabled={preview} />
           <Toggle label="Flood control" hint="Limit rapid messages from the same member." checked={settings.flood_enabled} onChange={value => set('flood_enabled', value)} disabled={preview} />
@@ -111,6 +121,7 @@ export default function Groups({ preview, revision, refresh, notify, onNoteDraft
           <div className="form-grid group-form"><label className="wide-field">Welcome message<textarea maxLength={1000} value={settings.welcome_text} disabled={preview} onChange={event => set('welcome_text', event.target.value)} /></label><label className="wide-field">Goodbye message<textarea maxLength={1000} value={settings.goodbye_text} disabled={preview} onChange={event => set('goodbye_text', event.target.value)} /></label><label className="wide-field">Group rules<textarea maxLength={3000} value={settings.rules} disabled={preview} onChange={event => set('rules', event.target.value)} /></label></div>
           <button className="button button-primary" disabled={preview || busy} onClick={() => save('community')}>Save community settings <ArrowRight size={15} /></button></div>}
         {tab === 'notes' && group.permissions.can_change_info && <GroupNotes key={group.id} groupId={group.id} preview={preview} notify={notify} onChanged={refresh} onDraftChange={reportNoteDraft} />}
+        {tab === 'auto-replies' && group.permissions.can_change_info && <GroupAutoReplies key={group.id} groupId={group.id} preview={preview} notify={notify} onChanged={markAutoRefresh} onDraftChange={reportReplyDraft} />}
         {tab === 'moderation' && group.permissions.can_restrict_members && <><form className="page-card group-panel" onSubmit={moderate}><div className="panel-title"><div><span className="eyebrow">ADMINISTRATOR TOOLS</span><h3>Moderate a member</h3><p>SUMMON checks your current Telegram rights and the bot's permissions before every action.</p></div><CircleAlert size={20} /></div>
           <div className="form-grid group-form"><label>Telegram user ID<input inputMode="numeric" value={target} disabled={preview} onChange={event => setTarget(event.target.value)} required placeholder="Member's numeric ID" /></label><label>Action<select value={action} disabled={preview} onChange={event => setAction(event.target.value)}><option value="warn">Warn</option><option value="mute">Mute</option><option value="unmute">Unmute</option><option value="ban">Ban</option><option value="unban">Unban</option><option value="kick">Kick</option></select></label><label className="wide-field">Reason<input maxLength={500} value={reason} disabled={preview} onChange={event => setReason(event.target.value)} placeholder="Optional reason for the action log" /></label>{['ban', 'mute'].includes(action) && <label>Duration in minutes (optional)<input type="number" min="1" max="527040" value={duration} disabled={preview} onChange={event => setDuration(event.target.value)} placeholder="Leave blank for indefinite" /></label>}</div>
           <p className="field-hint">Warning records do not currently trigger an automatic penalty. Admins and the bot cannot be targeted.</p><button className="button button-primary" type="submit" disabled={preview || busy}><Check size={15} /> Apply action</button></form><WarningReview key={group.id} groupId={group.id} preview={preview} notify={notify} /></>}

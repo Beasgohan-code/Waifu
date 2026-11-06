@@ -233,6 +233,23 @@ class PreviewGroups:
     async def preview_get(self, group_id: int) -> dict[str, Any] | None:
         return self.group() if group_id == -100 else None
 
+    async def preview_auto_replies(self, group_id: int) -> list[dict[str, Any]]:
+        if group_id != -100:
+            raise LookupError("Sample group not found")
+        return [
+            {
+                "name": "greeting",
+                "trigger": "hello everyone",
+                "response": "Welcome to our little universe! Please be kind to each other.",
+                "enabled": False,
+                "revision": "c" * 32,
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "created_by": 1,
+                "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_by": 1,
+            }
+        ]
+
     async def preview_notes(self, group_id: int) -> list[dict[str, Any]]:
         if group_id != -100:
             raise LookupError("Sample group not found")

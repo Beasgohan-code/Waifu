@@ -52,8 +52,9 @@ export interface Group {
   permissions: { can_change_info: boolean; can_restrict_members: boolean };
   recent_activity?: Activity[];
 }
-export interface Activity { kind: string; action: string | null; reason: string | null; actor_id?: number; target_id?: number; warning_id?: string | null; note_name?: string | null; created_at: string }
+export interface Activity { kind: string; action: string | null; reason: string | null; actor_id?: number; target_id?: number; warning_id?: string | null; note_name?: string | null; reply_name?: string | null; created_at: string }
 export interface GroupNote { name: string; content: string; revision: string; created_at: string; updated_at: string; created_by: number; updated_by: number }
+export interface GroupAutoReply { name: string; trigger: string; response: string; enabled: boolean; revision: string; created_at: string; updated_at: string; created_by: number; updated_by: number }
 export interface WarningRecord { id: string; actor_id: number; reason: string; created_at: string }
 export interface WarningPage { items: WarningRecord[]; active_count: number; next_cursor: string | null }
 

@@ -245,6 +245,7 @@ class GroupRepository:
                 "target_id": row.get("target_id"),
                 "warning_id": row.get("warning_id"),
                 "note_name": row.get("note_name"),
+                "reply_name": row.get("reply_name"),
                 "created_at": row["created_at"],
             }
             async for row in cursor

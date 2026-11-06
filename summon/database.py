@@ -11,6 +11,13 @@ from typing import Any
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
 from pymongo.errors import CollectionInvalid, OperationFailure
 
+from summon.auto_replies import (
+    AUTO_REPLY_NAME_PATTERN,
+    AUTO_REPLY_REVISION_PATTERN,
+    MAX_AUTO_REPLIES,
+    MAX_REPLY_LENGTH,
+    MAX_TRIGGER_LENGTH,
+)
 from summon.config import Settings
 from summon.group_notes import MAX_NOTE_LENGTH, MAX_NOTES, NOTE_NAME_PATTERN, NOTE_REVISION_PATTERN
 
@@ -47,6 +54,48 @@ COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "title": {"bsonType": "string", "maxLength": 255},
             "settings": {"bsonType": "object"},
             "message_count": {"bsonType": _NUMBER, "minimum": 0},
+            "auto_replies_v1": {
+                "bsonType": "object",
+                "maxProperties": MAX_AUTO_REPLIES,
+                "additionalProperties": False,
+                "patternProperties": {
+                    AUTO_REPLY_NAME_PATTERN: {
+                        "bsonType": "object",
+                        "required": [
+                            "trigger",
+                            "response",
+                            "enabled",
+                            "revision",
+                            "created_at",
+                            "created_by",
+                            "updated_at",
+                            "updated_by",
+                        ],
+                        "additionalProperties": False,
+                        "properties": {
+                            "trigger": {
+                                "bsonType": "string",
+                                "minLength": 2,
+                                "maxLength": MAX_TRIGGER_LENGTH,
+                            },
+                            "response": {
+                                "bsonType": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_REPLY_LENGTH,
+                            },
+                            "enabled": {"bsonType": "bool"},
+                            "revision": {
+                                "bsonType": "string",
+                                "pattern": AUTO_REPLY_REVISION_PATTERN,
+                            },
+                            "created_at": {"bsonType": "date"},
+                            "created_by": {"bsonType": _NUMBER, "minimum": 1},
+                            "updated_at": {"bsonType": "date"},
+                            "updated_by": {"bsonType": _NUMBER, "minimum": 1},
+                        },
+                    }
+                },
+            },
             "saved_notes_v1": {
                 "bsonType": "object",
                 "maxProperties": MAX_NOTES,

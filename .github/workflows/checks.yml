@@ -103,6 +103,7 @@ jobs:
           run_smoke preview npm run test:browser
           run_smoke warnings npm run test:warning-browser
           run_smoke notes npm run test:notes-browser
+          run_smoke auto-replies npm run test:auto-replies-browser
 
   mongodb:
     name: Isolated MongoDB integration
@@ -178,8 +179,8 @@ jobs:
           root = ET.parse(sys.argv[1]).getroot()
           cases = root.findall('.//testcase')
           skipped = [case for case in cases if case.find('skipped') is not None]
-          if len(cases) < 13 or skipped:
-              raise SystemExit(f'Expected at least 13 integration cases and no skips; got {len(cases)} cases and {len(skipped)} skipped')
+          if len(cases) < 17 or skipped:
+              raise SystemExit(f'Expected at least 17 integration cases and no skips; got {len(cases)} cases and {len(skipped)} skipped')
           print(f'All {len(cases)} integration cases ran without skips.')
           PY
       - name: Remove disposable test containers

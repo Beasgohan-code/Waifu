@@ -21,6 +21,7 @@ from aiogram.types import (
 from pymongo.errors import PyMongoError
 
 from summon.auth import TelegramUser
+from summon.auto_replies import AutoReplyStorageError, find_auto_reply
 from summon.bot.presentation import (
     Card,
     Emoji,
@@ -1229,7 +1230,9 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
         )
 
     @router.message(F.chat.type.in_({"group", "supergroup"}))
-    async def group_activity(message: Message) -> None:
+    async def group_activity(
+        message: Message, summon_group_snapshot: dict[str, Any] | None = None
+    ) -> None:
         user = _user(message)
         bot = message.bot
         if not user or bot is None or not is_group_user_content(message):
@@ -1237,6 +1240,51 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
         # Ephemeral inputs and service events are not public group activity.
         if message.ephemeral_message_id is not None:
             return
+        # Only genuinely new human-written text can trigger a public response.
+        # Protection has already accepted the message; unknown slash commands,
+        # forwards and inline/bot-authored content must never trigger replies.
+        if (
+            summon_group_snapshot
+            and message.content_type == "text"
+            and message.text
+            and message.message_id > 0
+            and not message.forward_origin
+            and not message.is_automatic_forward
+            and not message.forward_date
+            and not message.forward_from
+            and not message.forward_from_chat
+            and not message.forward_from_message_id
+            and not message.forward_sender_name
+            and not message.forward_signature
+            and not message.via_bot
+            and not message.sender_business_bot
+        ):
+            try:
+                response = find_auto_reply(summon_group_snapshot, message.text)
+                if (
+                    response is not None
+                    and await store.limiter.allow(
+                        f"group:{message.chat.id}:auto-reply:user:{user.id}", limit=3, seconds=60
+                    )
+                    and await store.limiter.allow(
+                        f"group:{message.chat.id}:auto-reply", limit=15, seconds=60
+                    )
+                    # Persist an opaque, 48-hour claim before sending. Replayed
+                    # Telegram updates cannot retry an ambiguous external send.
+                    and await store.limiter.claim_once(
+                        f"group:{message.chat.id}:auto-reply:message:{message.message_id}",
+                        seconds=48 * 60 * 60,
+                    )
+                ):
+                    # Standard, escaped Bot API output avoids rich-client retries;
+                    # send_card retries only a definite custom-emoji rejection.
+                    await respond(
+                        message, Card("Group reply", response, emoji=Emoji.NOTE), standard=True
+                    )
+            except (AutoReplyStorageError, PyMongoError, TelegramAPIError, TimeoutError):
+                # Never log public content or retry an ambiguous send. Collection
+                # activity still runs if an optional auto-reply fails.
+                logger.warning("Could not complete a group auto reply")
         now = datetime.now(UTC)
         await store.groups.ensure(message.chat.id, message.chat.title or "Group", now)
         event = await collection.on_message(

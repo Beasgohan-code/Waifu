@@ -214,6 +214,9 @@ img { display: block; max-width: 100%; }
 .notes-editor input, .notes-editor textarea { width: 100%; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; font-size: 12px; font-weight: 400; }
 .notes-editor textarea { min-height: 150px; resize: vertical; line-height: 1.6; }
 .notes-editor label small { color: var(--muted); font-size: 10px; font-weight: 400; line-height: 1.5; }
+.notes-editor .auto-reply-toggle { display: flex; align-items: flex-start; gap: 11px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.notes-editor .auto-reply-toggle input { width: 18px; height: 18px; flex: 0 0 18px; margin: 1px 0 0; accent-color: var(--accent-strong); }
+.auto-reply-toggle span { display: grid; gap: 5px; line-height: 1.4; }
 .notes-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .notes-delete { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; margin-left: auto; padding: 0 7px; border: 0; background: transparent; color: var(--muted); font-size: 11px; font-weight: 700; }
 .notes-error { margin: 16px 0 8px; color: var(--accent-strong); font-size: 11px; line-height: 1.6; }

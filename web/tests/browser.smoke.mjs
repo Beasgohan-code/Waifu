@@ -143,6 +143,11 @@ try {
     assert.ok(await page.getByLabel('Note text').isDisabled());
     assert.ok(await page.getByRole('button', { name: 'Save note' }).isDisabled());
     assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `group notes fit ${width}px`);
+    await page.getByRole('tab', { name: 'Auto replies' }).click();
+    await page.getByText('Sample data only · auto replies cannot be changed in this preview.').waitFor();
+    assert.ok(await page.getByLabel('Reply text').isDisabled());
+    assert.ok(await page.getByRole('button', { name: 'Save auto reply' }).isDisabled());
+    assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `auto replies fit ${width}px`);
     await page.getByRole('tab', { name: 'Moderation' }).click();
     await page.getByRole('button', { name: 'Find warnings' }).click();
     await page.getByText('Sample warning for review').waitFor();

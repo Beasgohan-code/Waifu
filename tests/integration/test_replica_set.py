@@ -447,3 +447,150 @@ async def test_inventory_duplicates_sort_and_pagination_preserve_ownership(isola
         sum(row["quantity"] for row in await db.inventory.find({"user_id": 11}).to_list(length=10))
         == 12
     )
+
+
+async def test_auto_reply_concurrent_edits_and_audit_rollback(isolated_database):
+    from types import SimpleNamespace
+
+    from summon.auto_replies import AutoReplyConflict
+    from summon.repositories.auto_replies import AutoReplyRepository
+
+    client, db = isolated_database
+    now = datetime.now(UTC).replace(microsecond=0)
+    await db.groups.insert_many(
+        [
+            {
+                "_id": -100,
+                "title": "Replies group",
+                "settings": GroupSettings().model_dump(),
+                "message_count": 0,
+            },
+            {
+                "_id": -200,
+                "title": "Other group",
+                "settings": GroupSettings().model_dump(),
+                "message_count": 0,
+            },
+        ]
+    )
+    repo = AutoReplyRepository(client, db)
+    original = await repo.save(-100, 42, "hello", "Hello", "Original", True, None, now)
+    results = await asyncio.gather(
+        repo.save(-100, 42, "hello", "hello", "First", True, original["revision"], now),
+        repo.save(-100, 43, "hello", "hello", "Second", False, original["revision"], now),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(isinstance(result, AutoReplyConflict) for result in results) == 1
+    winner = next(result for result in results if isinstance(result, dict))
+    assert await db.activity.count_documents({"group_id": -100, "kind": "auto_reply_changed"}) == 2
+    with pytest.raises(AutoReplyConflict):
+        await repo.delete(-100, 42, "hello", original["revision"], now)
+    with pytest.raises(AutoReplyConflict):
+        await repo.delete(-200, 42, "hello", winner["revision"], now)
+
+    class FailingActivity:
+        async def insert_one(self, *args, **kwargs):
+            await db.activity.insert_one(*args, **kwargs)
+            raise RuntimeError("injected audit failure")
+
+    failing = AutoReplyRepository(
+        client, SimpleNamespace(groups=db.groups, activity=FailingActivity())
+    )
+    with pytest.raises(RuntimeError, match="injected"):
+        await failing.save(-100, 42, "hello", "hello", "Rolled back", True, winner["revision"], now)
+    assert (await repo.list(-100))[0] == winner
+    with pytest.raises(RuntimeError, match="injected"):
+        await failing.delete(-100, 42, "hello", winner["revision"], now)
+    assert (await repo.list(-100))[0] == winner
+    assert await db.activity.count_documents({"group_id": -100, "kind": "auto_reply_changed"}) == 2
+    for audit in await db.activity.find({"kind": "auto_reply_changed"}).to_list(length=10):
+        assert "trigger" not in audit and "response" not in audit
+
+
+async def test_auto_reply_normalized_trigger_uniqueness_is_atomic(isolated_database):
+    from summon.auto_replies import AutoReplyConflict
+    from summon.repositories.auto_replies import AutoReplyRepository
+
+    client, db = isolated_database
+    now = datetime.now(UTC)
+    await db.groups.insert_one(
+        {
+            "_id": -100,
+            "title": "Replies group",
+            "settings": GroupSettings().model_dump(),
+            "message_count": 0,
+        }
+    )
+    repo = AutoReplyRepository(client, db)
+    results = await asyncio.gather(
+        repo.save(-100, 42, "one", "HELLO Straße", "First", True, None, now),
+        repo.save(-100, 43, "two", " hello  STRASSE ", "Second", False, None, now),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(isinstance(result, AutoReplyConflict) for result in results) == 1
+    assert len(await repo.list(-100)) == 1
+    assert await db.activity.count_documents({"group_id": -100, "kind": "auto_reply_changed"}) == 1
+
+
+async def test_auto_reply_cap_and_schema_validation_are_enforced(isolated_database):
+    from pymongo.errors import WriteError
+
+    from summon.auto_replies import AutoReplyLimitError
+    from summon.repositories.auto_replies import AutoReplyRepository
+
+    client, db = isolated_database
+    now = datetime.now(UTC)
+    await db.groups.insert_one(
+        {
+            "_id": -100,
+            "title": "Replies group",
+            "settings": GroupSettings().model_dump(),
+            "message_count": 0,
+            "auto_replies_v1": {
+                f"r{i}": {
+                    "trigger": f"trigger {i}",
+                    "response": "Example",
+                    "enabled": False,
+                    "revision": "a" * 32,
+                    "created_at": now,
+                    "created_by": 42,
+                    "updated_at": now,
+                    "updated_by": 42,
+                }
+                for i in range(19)
+            },
+        }
+    )
+    repo = AutoReplyRepository(client, db)
+    results = await asyncio.gather(
+        repo.save(-100, 42, "new-a", "hello one", "First", True, None, now),
+        repo.save(-100, 43, "new-b", "hello two", "Second", True, None, now),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(isinstance(result, AutoReplyLimitError) for result in results) == 1
+    assert len(await repo.list(-100)) == 20
+    assert await db.activity.count_documents({"group_id": -100, "kind": "auto_reply_changed"}) == 1
+    # Direct malformed writes do not bypass the installed Mongo schema.
+    with pytest.raises(WriteError):
+        await db.groups.update_one({"_id": -100}, {"$set": {"auto_replies_v1.r0.enabled": "yes"}})
+    assert len(await repo.list(-100)) == 20
+
+
+async def test_auto_reply_delivery_claim_is_shared_across_workers(isolated_database):
+    from summon.repositories.limits import RateLimiter
+
+    _client, db = isolated_database
+    one, two = RateLimiter(db), RateLimiter(db)
+    key = "group:-100:auto-reply:message:123"
+    results = await asyncio.gather(
+        one.claim_once(key, seconds=48 * 60 * 60),
+        two.claim_once(key, seconds=48 * 60 * 60),
+    )
+    assert sorted(results) == [False, True]
+    assert not await RateLimiter(db).claim_once(key, seconds=48 * 60 * 60)
+    rows = await db.rate_limits.find({"_id": {"$regex": "^once:"}}).to_list(length=5)
+    assert len(rows) == 1 and "-100" not in rows[0]["_id"]
+    assert rows[0]["expires_at"] > datetime.now(UTC) + timedelta(hours=47)

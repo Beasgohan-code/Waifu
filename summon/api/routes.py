@@ -13,6 +13,12 @@ from pymongo.errors import PyMongoError
 
 from summon.api.dependencies import get_current_user, get_store, limit_action
 from summon.auth import TelegramUser
+from summon.auto_replies import (
+    MAX_REPLY_LENGTH,
+    MAX_TRIGGER_INPUT,
+    normalize_trigger,
+    validate_reply_text,
+)
 from summon.group_notes import (
     MAX_NOTE_LENGTH,
     NOTE_NAME_PATTERN,
@@ -21,6 +27,7 @@ from summon.group_notes import (
 )
 from summon.models import CharacterInput, GroupSettingsUpdate, InventorySort, Rarity
 from summon.repositories.groups import public_group
+from summon.services.auto_replies import AutoReplyService
 from summon.services.gifting import GiftService
 from summon.services.group_notes import GroupNotesService
 from summon.services.moderation import ModerationService, PermissionDenied, require_group_admin
@@ -83,6 +90,26 @@ class NoteWrite(BaseModel):
 class NoteDelete(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: str = Field(pattern=NOTE_REVISION_PATTERN)
+
+
+class AutoReplyWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    trigger: str = Field(min_length=1, max_length=MAX_TRIGGER_INPUT)
+    response: str = Field(min_length=1, max_length=MAX_REPLY_LENGTH)
+    enabled: bool = Field(strict=True)
+    # Explicit null creates only; a revision updates only that exact version.
+    expected_revision: str | None = Field(pattern=NOTE_REVISION_PATTERN)
+
+    @field_validator("trigger")
+    @classmethod
+    def valid_trigger(cls, value: str) -> str:
+        return normalize_trigger(value)
+
+    @field_validator("response")
+    @classmethod
+    def valid_response(cls, value: str) -> str:
+        validate_reply_text(value)
+        return value
 
 
 def get_bot(request: Request) -> Any:
@@ -390,6 +417,84 @@ async def moderate(
         datetime.now(UTC),
         body.duration_seconds,
     )
+    return {"data": result}
+
+
+@router.get("/groups/{group_id}/auto-replies")
+async def list_group_auto_replies(
+    group_id: WarningGroupID,
+    request: Request,
+    user: TelegramUser = Depends(get_current_user),
+    store: Any = Depends(get_store),
+) -> dict[str, Any]:
+    if request.app.state.settings.preview_mode:
+        return {"data": await store.groups.preview_auto_replies(group_id)}
+    await limit_action(request, user, "auto_replies_read", limit=30)
+    try:
+        result = await AutoReplyService(get_bot(request), store.auto_replies).list_for_admin(
+            group_id, user.id
+        )
+    except TelegramAPIError:
+        raise HTTPException(503, "Could not verify current group permissions") from None
+    return {"data": result}
+
+
+@router.put("/groups/{group_id}/auto-replies/{name}")
+async def save_group_auto_reply(
+    group_id: WarningGroupID,
+    name: NoteName,
+    body: AutoReplyWrite,
+    request: Request,
+    user: TelegramUser = Depends(get_current_user),
+    store: Any = Depends(get_store),
+) -> dict[str, Any]:
+    await limit_action(request, user, "auto_replies_write", limit=20)
+    try:
+        result = await AutoReplyService(get_bot(request), store.auto_replies).save(
+            group_id,
+            user.id,
+            name,
+            body.trigger,
+            body.response,
+            body.enabled,
+            body.expected_revision,
+            datetime.now(UTC),
+        )
+    except ValueError:
+        raise HTTPException(422, "Invalid auto-reply input") from None
+    except TelegramAPIError:
+        raise HTTPException(503, "Could not verify current group permissions") from None
+    except PyMongoError:
+        logger.warning("Group auto-reply change could not be confirmed")
+        raise HTTPException(
+            503, "Could not confirm the change; review auto replies before retrying"
+        ) from None
+    return {"data": result}
+
+
+@router.post("/groups/{group_id}/auto-replies/{name}/delete")
+async def delete_group_auto_reply(
+    group_id: WarningGroupID,
+    name: NoteName,
+    body: NoteDelete,
+    request: Request,
+    user: TelegramUser = Depends(get_current_user),
+    store: Any = Depends(get_store),
+) -> dict[str, Any]:
+    await limit_action(request, user, "auto_replies_write", limit=20)
+    try:
+        result = await AutoReplyService(get_bot(request), store.auto_replies).delete(
+            group_id, user.id, name, body.expected_revision, datetime.now(UTC)
+        )
+    except ValueError:
+        raise HTTPException(422, "Invalid auto-reply input") from None
+    except TelegramAPIError:
+        raise HTTPException(503, "Could not verify current group permissions") from None
+    except PyMongoError:
+        logger.warning("Group auto-reply removal could not be confirmed")
+        raise HTTPException(
+            503, "Could not confirm the removal; review auto replies before retrying"
+        ) from None
     return {"data": result}
 
 

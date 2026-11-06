@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from summon.repositories.auth import AuthRepository
+from summon.repositories.auto_replies import AutoReplyRepository
 from summon.repositories.catalog import CatalogRepository
 from summon.repositories.collection import CollectionRepository
 from summon.repositories.gifts import GiftRepository
@@ -19,6 +20,7 @@ from summon.repositories.users import UserRepository
 class Store:
     def __init__(self, client: Any, database: Any) -> None:
         self.auth = AuthRepository(database)
+        self.auto_replies = AutoReplyRepository(client, database)
         self.catalog = CatalogRepository(database, client=client)
         self.collection = CollectionRepository(client, database)
         self.groups = GroupRepository(client, database)

@@ -87,6 +87,9 @@ class GroupProtectionMiddleware(BaseMiddleware):
         group = await self.groups.get(event.chat.id)
         if not group:
             return await handler(event, data)
+        # The catch-all can use the same protected group snapshot without a second
+        # per-message database read. It must not run before this middleware.
+        data["summon_group_snapshot"] = group
         config = GroupSettings.model_validate(group["settings"])
         now = datetime.now(UTC)
         reason = await self.guard.inspect(
