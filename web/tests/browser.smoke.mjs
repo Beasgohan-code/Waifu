@@ -13,16 +13,39 @@ const browser = await chromium.launch({
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
 // The preview is synthetic; do not depend on the live Telegram bridge or its defaults.
 await page.route('https://telegram.org/js/telegram-web-app.js', route => route.fulfill({ contentType: 'application/javascript', body: '' }));
+await page.addInitScript(() => {
+  const state = { visible: false, params: null, callbacks: new Set() };
+  window.__summonNativeButton = state;
+  window.Telegram = { WebApp: {
+    initData: '', isVersionAtLeast: version => version === '9.5',
+    MainButton: {
+      setParams: params => { state.params = params; },
+      onClick: callback => state.callbacks.add(callback),
+      offClick: callback => state.callbacks.delete(callback),
+      show: () => { state.visible = true; },
+      hide: () => { state.visible = false; },
+    },
+  } };
+});
 const errors = [];
+const writes = [];
 page.on('pageerror', error => errors.push(error.message));
+page.on('request', request => {
+  if (new URL(request.url()).pathname.startsWith('/api/') && request.method() !== 'GET') writes.push(request.method());
+});
 
 try {
   await page.goto(url, { waitUntil: 'networkidle' });
   await page.getByText('Read-only preview', { exact: false }).first().waitFor();
+  await page.waitForFunction(() => window.__summonNativeButton.visible);
+  assert.deepEqual(await page.evaluate(() => window.__summonNativeButton.params), {
+    text: 'Open collection', icon_custom_emoji_id: '6215348101478097302',
+  });
   assert.equal(await page.locator('.character-card').count(), 3);
   const opener = page.getByRole('button', { name: 'View Aiko Tsukino' });
   await opener.click();
   await page.getByRole('dialog', { name: 'Character details' }).waitFor();
+  await page.waitForFunction(() => !window.__summonNativeButton.visible && window.__summonNativeButton.callbacks.size === 0);
   await page.getByText('Sample character · actions are disabled in preview.').waitFor();
   assert.equal(await page.getByRole('button', { name: 'Favorited' }).isDisabled(), true);
   await page.keyboard.press('Shift+Tab');
@@ -32,6 +55,11 @@ try {
   await page.keyboard.press('Escape');
   await page.getByRole('dialog').waitFor({ state: 'hidden' });
   assert.equal(await opener.evaluate(element => document.activeElement === element), true, 'dialog restores focus');
+  await page.waitForFunction(() => window.__summonNativeButton.visible && window.__summonNativeButton.callbacks.size === 1);
+  await page.evaluate(() => window.__summonNativeButton.callbacks.forEach(callback => callback()));
+  await page.getByRole('heading', { name: 'Your collection.' }).waitFor();
+  await page.waitForFunction(() => !window.__summonNativeButton.visible && window.__summonNativeButton.callbacks.size === 0);
+  await page.getByRole('button', { name: 'Overview', exact: true }).click();
 
   await page.getByRole('button', { name: 'Discover', exact: true }).first().click();
   await page.getByRole('heading', { name: 'Meet the characters.' }).waitFor();
@@ -125,8 +153,21 @@ try {
     await page.getByRole('heading', { name: 'Trade with friends.' }).waitFor();
     assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `trade page fits ${width}px`);
   }
+  await page.route('**/api/bootstrap', route => route.fulfill({ json: { data: {
+    preview: true, collection_button_emoji: { fallback: '💎', custom_emoji_id: null },
+  } } }));
+  const homeUrl = new URL(url);
+  homeUrl.hash = 'home';
+  await page.goto(homeUrl.toString(), { waitUntil: 'networkidle' });
+  // Changing only the hash does not remount the app or re-fetch bootstrap.
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForFunction(() => window.__summonNativeButton.visible);
+  assert.deepEqual(await page.evaluate(() => window.__summonNativeButton.params), {
+    text: '💎 Open collection', icon_custom_emoji_id: '',
+  });
+  assert.deepEqual(writes, []);
   assert.deepEqual(errors, []);
-  console.log('Browser smoke passed: desktop navigation, search, dialogs, preview safety, themes, and 390/320px mobile.');
+  console.log('Browser smoke passed: native shortcut mock, desktop navigation, search, dialogs, preview safety, themes, and 390/320px mobile.');
 } finally {
   await browser.close();
 }

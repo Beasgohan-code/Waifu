@@ -272,3 +272,19 @@ def test_production_session_cookie_is_secure_and_requires_https():
         assert client.get("/api/me").status_code == 200
         # This only checks client cookie behavior; real TLS/proxy setup is a release gate.
         assert client.get("http://miniapp.example/api/me").status_code == 401
+
+
+@pytest.mark.parametrize("premium", [True, False])
+def test_bootstrap_exposes_only_presentation_metadata_for_native_collection_button(premium):
+    from summon.bot.presentation import Emoji
+
+    settings = Settings(preview_mode=True, premium_emoji_enabled=premium, _env_file=None)
+    with TestClient(create_app(settings=settings)) as client:
+        data = client.get("/api/bootstrap").json()["data"]
+    assert data == {
+        "preview": True,
+        "collection_button_emoji": {
+            "fallback": Emoji.OPEN_COLLECTION.value[0],
+            "custom_emoji_id": Emoji.OPEN_COLLECTION.value[1] if premium else None,
+        },
+    }

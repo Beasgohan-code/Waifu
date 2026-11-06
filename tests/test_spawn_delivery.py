@@ -177,9 +177,13 @@ async def test_rejected_premium_caption_retries_photo_with_unicode_without_cance
     first, second = photo.await_args_list
     assert first.kwargs["photo"] == second.kwargs["photo"] == "https://example.com/aiko.webp"
     assert Emoji.SPARK.value[1] in first.kwargs["caption"]
+    assert Emoji.SERIES_TAG.value[1] in first.kwargs["caption"]
+    assert Emoji.RARITY_STAR.value[1] in first.kwargs["caption"]
     assert "tg-emoji" in first.kwargs["caption"]
     assert "tg-emoji" not in second.kwargs["caption"]
     assert Emoji.SPARK.value[0] in second.kwargs["caption"]
+    assert Emoji.SERIES_TAG.value[0] in second.kwargs["caption"]
+    assert Emoji.RARITY_STAR.value[0] in second.kwargs["caption"]
     card.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_not_awaited()
     await bot.session.close()
@@ -221,4 +225,16 @@ async def test_both_caption_attempts_definitely_rejected_cancel_once():
     assert photo.await_count == 2
     card.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_awaited_once_with(-100, "spawn-one")
+    await bot.session.close()
+
+
+async def test_spawn_photo_contains_supplied_series_and_rarity_icons():
+    dp, _ = setup_spawn("https://example.com/aiko.webp", premium=True)
+    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
+    with patch.object(Bot, "send_photo", new_callable=AsyncMock) as photo:
+        await dp.feed_update(bot, ordinary_message(bot))
+    caption = photo.await_args.kwargs["caption"]
+    assert Emoji.SERIES_TAG.value[1] in caption
+    assert Emoji.RARITY_STAR.value[1] in caption
+    assert "Sky" in caption and "Rare" in caption
     await bot.session.close()

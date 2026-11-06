@@ -281,3 +281,26 @@ async def test_public_notes_use_standard_escaped_text_even_when_rich_output_is_e
     assert "&lt;b&gt;safe &amp; public&lt;/b&gt;\nSecond line" in public.await_args.args[
         2
     ].telegram_html(premium=False)
+
+
+async def test_notes_and_guidance_use_ios_icons_without_changing_privacy():
+    from summon.bot.presentation import Emoji
+
+    router, _, _, message = setup()
+    with (
+        patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+    ):
+        await handler(router, "list_notes")(message)
+        await handler(router, "show_note")(message, SimpleNamespace(args="hello"))
+        await handler(router, "note_version")(message, SimpleNamespace(args="hello"))
+        await handler(router, "save_note")(message, SimpleNamespace(args=None))
+        await handler(router, "edit_note")(message, SimpleNamespace(args=None))
+        await handler(router, "delete_note")(message, SimpleNamespace(args=None))
+    assert [call.args[2].emoji for call in public.await_args_list] == [Emoji.NOTE, Emoji.NOTE]
+    assert [call.args[3].emoji for call in private.await_args_list] == [
+        Emoji.NOTE,
+        Emoji.NOTE,
+        Emoji.NOTE_EDIT,
+        Emoji.NOTE_DELETE,
+    ]

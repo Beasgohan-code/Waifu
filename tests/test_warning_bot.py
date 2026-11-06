@@ -227,3 +227,16 @@ async def test_aiogram_dispatches_each_warning_command_once(text, expected):
     assert store.groups.list_warnings.await_count == (1 if expected == "list" else 0)
     assert store.groups.revoke_warning.await_count == (1 if expected == "revoke" else 0)
     await bot.session.close()
+
+
+async def test_warning_review_uses_summon_alert_without_making_content_public():
+    from summon.bot.presentation import Emoji
+
+    router, _, _, message = setup()
+    with (
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+        patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
+    ):
+        await handler(router, "review_warnings")(message, SimpleNamespace(args=None))
+    assert private.await_args.args[3].emoji is Emoji.ALERT
+    public.assert_not_awaited()

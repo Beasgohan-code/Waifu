@@ -88,8 +88,8 @@ async def test_start_button_has_user_icon_or_unicode_and_preserves_webapp(premiu
         await find_handler(router, "start")(make_message())
     button = send.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.web_app.url == "https://miniapp.example"
-    assert button.icon_custom_emoji_id == (Emoji.SPARK.value[1] if premium else None)
-    assert button.text == ("Open the collection" if premium else "✨ Open the collection")
+    assert button.icon_custom_emoji_id == (Emoji.OPEN_COLLECTION.value[1] if premium else None)
+    assert button.text == ("Open the collection" if premium else "💎 Open the collection")
     assert send.await_args.kwargs["premium"] is premium
 
 
@@ -98,7 +98,7 @@ async def test_start_button_has_user_icon_or_unicode_and_preserves_webapp(premiu
     ("handler_name", "arguments", "role", "accept_role", "prefix"),
     [
         ("propose_trade", "aiko ren", "TRADE", "CHECK", "trade"),
-        ("propose_gift", "aiko", "GIFT", "GIFT", "gift"),
+        ("propose_gift", "aiko", "GIFT", "GIFT_ACTION", "gift"),
     ],
 )
 async def test_exchange_icons_keep_callbacks_and_have_unicode_when_disabled(
@@ -148,3 +148,41 @@ async def test_guess_guidance_uses_search_icon():
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, "guess")(make_message(), SimpleNamespace(args=None))
     assert send.await_args.args[2].emoji is Emoji.SEARCH
+
+
+async def test_start_uses_new_summon_brand_and_collection_button():
+    router = build_router(
+        make_store(), Settings(webapp_url="https://miniapp.example", _env_file=None)
+    )
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await find_handler(router, "start")(make_message())
+    card = send.await_args.args[2]
+    button = send.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert card.emoji is Emoji.SUMMON_BRAND
+    assert button.icon_custom_emoji_id == Emoji.OPEN_COLLECTION.value[1]
+    assert button.web_app.url == "https://miniapp.example"
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "expected"),
+    [
+        ("profile", ("RARITY_STAR", "REWARD_COIN", "OPEN_COLLECTION", "SPARK")),
+        ("daily", ("REWARD_COIN", "RARITY_STAR", "SPARK")),
+    ],
+)
+async def test_profile_and_reward_fields_use_semantic_icons(handler_name, expected):
+    router = build_router(make_store(), Settings(_env_file=None))
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await find_handler(router, handler_name)(make_message())
+    card = send.await_args.args[2]
+    assert card.field_icons == tuple(Emoji[name] for name in expected)
+    assert len(card.field_icons) == len(card.fields)
+
+
+async def test_group_rules_use_ios_document_icon():
+    store = make_store()
+    store.groups.get = AsyncMock(return_value={"settings": {"rules": "Be kind"}})
+    router = build_router(store, Settings(_env_file=None))
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await find_handler(router, "rules")(make_message("supergroup"))
+    assert send.await_args.args[2].emoji is Emoji.RULES

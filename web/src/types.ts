@@ -59,12 +59,23 @@ export interface WarningPage { items: WarningRecord[]; active_count: number; nex
 
 export type View = 'home' | 'collection' | 'catalog' | 'trades' | 'progress' | 'leaderboard' | 'groups' | 'profile' | 'settings' | 'admin';
 
+export interface CollectionButtonEmoji { fallback: string; custom_emoji_id: string | null }
+interface TelegramBottomButton {
+  setParams: (params: { text: string; icon_custom_emoji_id?: string }) => void;
+  onClick: (callback: () => void) => void;
+  offClick: (callback: () => void) => void;
+  show: () => void;
+  hide: () => void;
+}
+
 declare global {
   interface Window {
     Telegram?: { WebApp?: {
       initData: string;
       colorScheme?: 'light' | 'dark';
       themeParams?: Record<string, string>;
+      MainButton?: TelegramBottomButton;
+      isVersionAtLeast?: (version: string) => boolean;
       ready?: () => void;
       expand?: () => void;
       onEvent?: (name: string, callback: () => void) => void;

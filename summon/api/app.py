@@ -28,6 +28,7 @@ from summon.auth import (
     launch_fingerprint,
     verify_init_data,
 )
+from summon.bot.emoji_palette import palette_icon
 from summon.config import Settings
 from summon.database import DatabaseTopologyError, connect_database, require_transaction_topology
 
@@ -188,7 +189,16 @@ def create_app(
 
     @app.get("/api/bootstrap")
     async def bootstrap() -> dict[str, Any]:
-        return {"data": {"preview": settings.preview_mode}}
+        fallback, custom_emoji_id = palette_icon("summon_bot", 60)
+        return {
+            "data": {
+                "preview": settings.preview_mode,
+                "collection_button_emoji": {
+                    "fallback": fallback,
+                    "custom_emoji_id": custom_emoji_id if settings.premium_emoji_enabled else None,
+                },
+            }
+        }
 
     @app.post("/api/auth/session")
     async def create_session(

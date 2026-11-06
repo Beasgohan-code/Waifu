@@ -8,16 +8,18 @@ from summon.bot.emoji_palette import PALETTES, palette_icon
 from summon.bot.presentation import Card, Emoji, fallback_keyboard
 
 
-def test_all_five_user_palettes_are_preserved_and_have_distinct_ids():
+def test_all_seven_user_palettes_are_preserved_and_have_distinct_ids():
     assert {name: len(icons) for name, icons in PALETTES.items()} == {
         "vector": 118,
         "emoji_fan": 200,
         "rijif": 200,
         "boseh": 200,
         "news": 100,
+        "summon_bot": 60,
+        "telegram_ios": 100,
     }
     all_identifiers = [identifier for icons in PALETTES.values() for _, identifier in icons]
-    assert len(all_identifiers) == len(set(all_identifiers)) == 818
+    assert len(all_identifiers) == len(set(all_identifiers)) == 978
     for icons in PALETTES.values():
         assert len({identifier for _, identifier in icons}) == len(icons)
         assert all(
@@ -45,6 +47,7 @@ def test_all_five_user_palettes_are_preserved_and_have_distinct_ids():
         ("boseh", 45, ("❓", "5116240346656801621")),
         ("boseh", 99, ("🧪", "5134183530313548836")),
         ("boseh", 113, ("0️⃣", "5140999334174655345")),
+        ("boseh", 119, ("6️⃣", "5139005588881015916")),
         ("boseh", 122, ("9️⃣", "5141137309999039199")),
         ("boseh", 141, ("⚙️", "4904936030232117798")),
         ("boseh", 200, ("📍", "5104989658350093220")),
@@ -114,7 +117,9 @@ def test_real_message_roles_use_each_new_pack_with_unicode_fallback(role, palett
     assert "tg-emoji" not in message.rich_html(premium=False)
 
 
-@pytest.mark.parametrize("palette", ["vector", "emoji_fan", "rijif", "boseh", "news"])
+@pytest.mark.parametrize(
+    "palette", ["vector", "emoji_fan", "rijif", "boseh", "news", "summon_bot", "telegram_ios"]
+)
 def test_button_json_serializes_each_palette_id_as_an_exact_string(palette):
     import json
 

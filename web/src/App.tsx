@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTheme } from './theme';
 import { api, startSession } from './api';
 import { Brand, CharacterDetail, EmptyState } from './components';
-import type { Character, Profile, View } from './types';
+import { fallbackCollectionButtonEmoji, useTelegramCollectionButton } from './telegram-collection-button';
+import type { Character, CollectionButtonEmoji, Profile, View } from './types';
 import Admin from './pages/Admin';
 import Catalog from './pages/Catalog';
 import Groups from './pages/Groups';
@@ -36,6 +37,7 @@ export default function App() {
   const [view, setView] = useState<View>(initialView);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [preview, setPreview] = useState(false);
+  const [collectionButtonEmoji, setCollectionButtonEmoji] = useState<CollectionButtonEmoji>(fallbackCollectionButtonEmoji);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [revision, setRevision] = useState(0);
@@ -60,6 +62,8 @@ export default function App() {
   }, [view, noteDraft, navigateNow]);
   const closeCharacter = useCallback(() => setCharacter(null), []);
   const notify = useCallback((message: string, isError = false) => setToast({ message, error: isError }), []);
+  const openCollection = useCallback(() => navigate('collection'), [navigate]);
+  useTelegramCollectionButton(Boolean(profile) && !loading && view === 'home' && !character && !moreOpen && !pendingView, collectionButtonEmoji, openCollection);
 
   useEffect(() => {
     let active = true;
@@ -67,9 +71,9 @@ export default function App() {
     telegram?.ready?.(); telegram?.expand?.();
     async function boot() {
       try {
-        const status = await api.get<{ preview: boolean }>('/bootstrap');
+        const status = await api.get<{ preview: boolean; collection_button_emoji?: CollectionButtonEmoji }>('/bootstrap');
         const user = await startSession(telegram?.initData || '');
-        if (active) { setPreview(status.preview); setProfile(user); setError(''); }
+        if (active) { setPreview(status.preview); setCollectionButtonEmoji(status.collection_button_emoji || fallbackCollectionButtonEmoji); setProfile(user); setError(''); }
       } catch (err) {
         if (active) setError(err instanceof Error ? err.message : 'Could not connect to SUMMON.');
       } finally { if (active) setLoading(false); }

@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Final
 
 from summon.bot.emoji_extra_palettes import BOSEH_ICONS, FAN_ICONS, NEWS_ICONS, RIJIF_ICONS
+from summon.bot.emoji_summon_ios import SUMMON_BOT_ICONS, TELEGRAM_IOS_ICONS
 
 # Keep the user's 1-based order and Unicode fallback exactly, including variants.
 VECTOR_ICONS: Final[tuple[tuple[str, str], ...]] = (
@@ -143,6 +144,8 @@ PALETTES: Final[Mapping[str, tuple[tuple[str, str], ...]]] = MappingProxyType(
         "rijif": RIJIF_ICONS,
         "boseh": BOSEH_ICONS,
         "news": NEWS_ICONS,
+        "summon_bot": SUMMON_BOT_ICONS,
+        "telegram_ios": TELEGRAM_IOS_ICONS,
     }
 )
 

@@ -47,6 +47,22 @@ class Emoji(Enum):
     QUESTION = palette_icon("boseh", 45)
     TOP = vector_icon(16)
     MOON = vector_icon(38)
+    # New user-supplied SUMMON bot and Telegram iOS sets. Keep existing roles
+    # available as well so earlier palettes are not displaced wholesale.
+    SUMMON_BRAND = palette_icon("summon_bot", 34)
+    OPEN_COLLECTION = palette_icon("summon_bot", 60)
+    SERIES_TAG = palette_icon("summon_bot", 1)
+    RARITY_STAR = palette_icon("summon_bot", 5)
+    REWARD_COIN = palette_icon("summon_bot", 48)
+    GIFT_ACTION = palette_icon("summon_bot", 19)
+    DONE = palette_icon("summon_bot", 37)
+    ALERT = palette_icon("summon_bot", 38)
+    NOTE = palette_icon("telegram_ios", 22)
+    NOTE_EDIT = palette_icon("telegram_ios", 30)
+    NOTE_DELETE = palette_icon("telegram_ios", 77)
+    RULES = palette_icon("telegram_ios", 76)
+    PRIVATE = palette_icon("telegram_ios", 68)
+    ADMIN_SHIELD = palette_icon("telegram_ios", 94)
 
     def render(self, *, premium: bool = True) -> str:
         glyph, emoji_id = self.value
@@ -62,6 +78,19 @@ class Card:
     emoji: Emoji = Emoji.SPARK
     fields: tuple[tuple[str, str], ...] = ()
     details: tuple[str, str] | None = None
+    field_icons: tuple[Emoji | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.field_icons and len(self.field_icons) != len(self.fields):
+            raise ValueError("Field icons must match the number of fields")
+
+    def _render_fields(self, *, premium: bool) -> list[tuple[str, str]]:
+        rendered = []
+        for index, (key, value) in enumerate(self.fields):
+            icon = self.field_icons[index] if self.field_icons else None
+            prefix = f"{icon.render(premium=premium)} " if icon else ""
+            rendered.append((prefix + html.escape(key), html.escape(value)))
+        return rendered
 
     def telegram_html(self, *, premium: bool = True) -> str:
         heading = f"{self.emoji.render(premium=premium)} <b>{html.escape(self.title)}</b>"
@@ -70,7 +99,9 @@ class Card:
             parts.append(html.escape(self.body))
         if self.fields:
             parts.append(
-                "\n".join(f"<b>{html.escape(k)}</b>  {html.escape(v)}" for k, v in self.fields)
+                "\n".join(
+                    f"<b>{key}</b>  {value}" for key, value in self._render_fields(premium=premium)
+                )
             )
         if self.details:
             parts.append(f"<b>{html.escape(self.details[0])}</b>\n{html.escape(self.details[1])}")
@@ -82,8 +113,9 @@ class Card:
         if self.body:
             pieces.append(f"<p>{html.escape(self.body)}</p>")
         if self.fields:
-            pairs = [(html.escape(k), html.escape(v)) for k, v in self.fields]
-            pieces.append(richgram.rich_kv_table(pairs, compact=True))
+            pieces.append(
+                richgram.rich_kv_table(self._render_fields(premium=premium), compact=True)
+            )
         if self.details:
             pieces.append(
                 richgram.rich_details(html.escape(self.details[0]), html.escape(self.details[1]))

@@ -128,7 +128,11 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                 return await send_card(
                     message.bot,
                     message.chat.id,
-                    Card("Open your private chat", "Start SUMMON privately to see this response."),
+                    Card(
+                        "Open your private chat",
+                        "Start SUMMON privately to see this response.",
+                        emoji=Emoji.PRIVATE,
+                    ),
                     premium=settings.premium_emoji_enabled,
                     message_thread_id=message.message_thread_id,
                 )
@@ -157,12 +161,12 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                         InlineKeyboardButton(
                             text=button_label(
                                 "Open the collection",
-                                Emoji.SPARK,
+                                Emoji.OPEN_COLLECTION,
                                 premium=settings.premium_emoji_enabled,
                             ),
                             web_app=WebAppInfo(url=settings.webapp_url),
                             style="primary",
-                            icon_custom_emoji_id=Emoji.SPARK.value[1]
+                            icon_custom_emoji_id=Emoji.OPEN_COLLECTION.value[1]
                             if settings.premium_emoji_enabled
                             else None,
                         )
@@ -177,7 +181,9 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                     "Collect. Discover. Summon.\n\nCharacters appear as your group chats. "
                     "Guess their names, grow your collection, and trade with friends."
                 ),
+                emoji=Emoji.SUMMON_BRAND,
                 fields=(("Get started", "/help"), ("For group admins", "/manage")),
+                field_icons=(Emoji.QUESTION, Emoji.ADMIN_SHIELD),
             ),
             markup=keyboard,
         )
@@ -259,6 +265,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                     ("Rarity", character["rarity"].title()),
                     ("Reward", "+40 points · +25 XP"),
                 ),
+                field_icons=(Emoji.SERIES_TAG, Emoji.RARITY_STAR, Emoji.REWARD_COIN),
             ),
         )
 
@@ -310,6 +317,12 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                     ),
                     ("Total summons", str(profile_data["catch_count"])),
                 ),
+                field_icons=(
+                    Emoji.RARITY_STAR,
+                    Emoji.REWARD_COIN,
+                    Emoji.OPEN_COLLECTION,
+                    Emoji.SPARK,
+                ),
             ),
             private=True,
         )
@@ -343,6 +356,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                     ("Experience", "+20 XP"),
                     ("Streak", f"{reward['streak']} days"),
                 ),
+                field_icons=(Emoji.REWARD_COIN, Emoji.RARITY_STAR, Emoji.SPARK),
             ),
             private=True,
         )
@@ -495,11 +509,11 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                 [
                     InlineKeyboardButton(
                         text=button_label(
-                            "Accept gift", Emoji.GIFT, premium=settings.premium_emoji_enabled
+                            "Accept gift", Emoji.GIFT_ACTION, premium=settings.premium_emoji_enabled
                         ),
                         callback_data=f"gift:accept:{gift['id']}",
                         style="success",
-                        icon_custom_emoji_id=Emoji.GIFT.value[1]
+                        icon_custom_emoji_id=Emoji.GIFT_ACTION.value[1]
                         if settings.premium_emoji_enabled
                         else None,
                     ),
@@ -591,11 +605,12 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                     "Open SUMMON privately to manage this group. "
                     "Use /spawns on to enable character appearances."
                 ),
-                emoji=Emoji.SHIELD,
+                emoji=Emoji.ADMIN_SHIELD,
                 fields=(
                     ("Summons", "On" if current.spawn_enabled else "Off"),
                     ("Frequency", f"Every {current.spawn_every} messages"),
                 ),
+                field_icons=(Emoji.SUMMON_BRAND, Emoji.GEAR),
             ),
             private=True,
         )
@@ -662,7 +677,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             Card(
                 "Group rules",
                 rules_text or "This group has not set its rules yet.",
-                emoji=Emoji.SHIELD,
+                emoji=Emoji.RULES,
             ),
         )
 
@@ -682,7 +697,11 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
         if not text or len(text) > 3000:
             await respond(
                 message,
-                Card("Set the rules", "Use /setrules followed by up to 3000 characters."),
+                Card(
+                    "Set the rules",
+                    "Use /setrules followed by up to 3000 characters.",
+                    emoji=Emoji.RULES,
+                ),
                 private=True,
             )
             return
@@ -746,7 +765,10 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             return
         if not _group(message):
             await respond(
-                message, Card("Group notes", "Use /notes in the group you want to explore.")
+                message,
+                Card(
+                    "Group notes", "Use /notes in the group you want to explore.", emoji=Emoji.NOTE
+                ),
             )
             return
         if not await notes_rate_allowed(message, user.id, "read", public=True):
@@ -770,7 +792,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             if names
             else "No notes yet. A group admin can add one."
         )
-        await respond(message, Card("Group notes", text, emoji=Emoji.QUESTION), standard=True)
+        await respond(message, Card("Group notes", text, emoji=Emoji.NOTE), standard=True)
 
     @router.message(Command("note"))
     async def show_note(message: Message, command: CommandObject) -> None:
@@ -778,7 +800,10 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
         if not user:
             return
         if not _group(message):
-            await respond(message, Card("Group notes", "Use /note <name> in the relevant group."))
+            await respond(
+                message,
+                Card("Group notes", "Use /note <name> in the relevant group.", emoji=Emoji.NOTE),
+            )
             return
         name = (command.args or "").strip().lower()
         if not await notes_rate_allowed(message, user.id, "read", public=True):
@@ -800,7 +825,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
         # Preserve plain-text line breaks and escape all user-authored markup.
         await respond(
             message,
-            Card(f"Note · {note['name']}", note["content"], emoji=Emoji.QUESTION),
+            Card(f"Note · {note['name']}", note["content"], emoji=Emoji.NOTE),
             standard=True,
         )
 
@@ -831,7 +856,9 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             Card(
                 f"Note revision · {name}",
                 "Use this revision with /editnote or /delnote. Notes are public in group messages.",
+                emoji=Emoji.NOTE,
                 fields=(("Revision", note["revision"]),),
+                field_icons=(Emoji.PRIVATE,),
             ),
             private=True,
         )
@@ -846,7 +873,9 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             await respond(
                 message,
                 Card(
-                    "Create a note", "Use /savenote <name> <text>. Notes are public to the group."
+                    "Create a note",
+                    "Use /savenote <name> <text>. Notes are public to the group.",
+                    emoji=Emoji.NOTE,
                 ),
                 private=True,
             )
@@ -873,7 +902,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             Card(
                 "Note created",
                 "Members can read it with /note. Use /noteinfo to edit or remove it.",
-                emoji=Emoji.CHECK,
+                emoji=Emoji.DONE,
             ),
             private=True,
         )
@@ -891,6 +920,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                     "Edit a note",
                     "Use /editnote <name> <revision> <text>. "
                     "Get the current revision with /noteinfo <name>.",
+                    emoji=Emoji.NOTE_EDIT,
                 ),
                 private=True,
             )
@@ -914,7 +944,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             return
         await respond(
             message,
-            Card("Note updated", "Members can read the new text with /note.", emoji=Emoji.CHECK),
+            Card("Note updated", "Members can read the new text with /note.", emoji=Emoji.DONE),
             private=True,
         )
 
@@ -931,6 +961,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                     "Confirm note removal",
                     "Use /delnote <name> <revision> confirm. "
                     "Get the current revision with /noteinfo <name>.",
+                    emoji=Emoji.NOTE_DELETE,
                 ),
                 private=True,
             )
@@ -957,7 +988,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             Card(
                 "Note removed",
                 "The removal is recorded in the group activity log.",
-                emoji=Emoji.CHECK,
+                emoji=Emoji.DONE,
             ),
             private=True,
         )
@@ -1005,7 +1036,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             Card(
                 "Moderation recorded",
                 f"{command.command.title()} applied to {target.first_name}.{suffix}",
-                emoji=Emoji.SHIELD,
+                emoji=Emoji.ADMIN_SHIELD,
             ),
         )
 
@@ -1089,7 +1120,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
                 "Active warnings",
                 f"Member {target.id} has {page['active_count']} active warnings. "
                 "No automatic penalty is applied.",
-                emoji=Emoji.SHIELD,
+                emoji=Emoji.ALERT,
                 fields=fields,
                 details=details,
             ),
@@ -1219,6 +1250,7 @@ def build_router(store: Any, settings: Settings, rich_client: Any | None = None)
             "A new companion is nearby. Guess their name with /summon name before they disappear!",
             emoji=Emoji.SPARK,
             fields=(("Series", character["category"]), ("Rarity", character["rarity"].title())),
+            field_icons=(Emoji.SERIES_TAG, Emoji.RARITY_STAR),
         )
         image = character.get("image_url", "")
         if image.startswith("/art/"):
