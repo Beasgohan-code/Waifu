@@ -14,9 +14,11 @@ from summon._vendor import richgram_builders as richgram
 from summon.api.context import Store
 from summon.bot.compat import validate_runtime
 from summon.bot.handlers import COMMANDS, build_router, group_commands
+from summon.bot.poller_health import PollerHealthPublisher
 from summon.bot.watchdog import run_supervised_polling
 from summon.config import Settings
 from summon.database import connect_database
+from summon.repositories.poller_health import PollerHealthRepository
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,8 @@ async def run() -> None:
     client, database = await connect_database(settings)
     bot = Bot(token)
     outbound: Client | None = None
+    publisher: PollerHealthPublisher | None = None
+    publisher_task: asyncio.Task[None] | None = None
     try:
         if settings.rich_enabled and richgram.RICH_AVAILABLE:
             candidate = create_outbound_client(settings)
@@ -72,10 +76,21 @@ async def run() -> None:
         # Polling and webhooks are mutually exclusive. Preserve pending updates.
         await bot.delete_webhook(drop_pending_updates=False)
         logger.info("SUMMON bot starting with aiogram as the sole update ingress")
+        if settings.poller_heartbeat_enabled:
+            publisher = PollerHealthPublisher(
+                PollerHealthRepository(database, token, settings.session_secret.get_secret_value())
+            )
+            publisher_task = asyncio.create_task(publisher.run())
         await run_supervised_polling(
-            dispatcher, bot, timeout_seconds=settings.poll_watchdog_seconds
+            dispatcher,
+            bot,
+            timeout_seconds=settings.poll_watchdog_seconds,
+            on_success=publisher.observe if publisher is not None else None,
         )
     finally:
+        if publisher_task is not None:
+            publisher_task.cancel()
+            await asyncio.gather(publisher_task, return_exceptions=True)
         if outbound is not None:
             await outbound.stop()
         await bot.session.close()

@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     init_data_max_age: int = Field(default=3600, ge=60, le=86400)
     mongo_max_pool_size: int = Field(default=50, ge=1, le=500)
     poll_watchdog_seconds: int = Field(default=300, ge=120, le=3600)
+    poller_heartbeat_enabled: bool = False
+    poller_monitor_token: SecretStr = SecretStr("")
+    poller_status_max_age_seconds: int = Field(default=120, ge=60, le=900)
     web_dist: str = ""
 
     @field_validator("telegram_api_id", mode="before")
@@ -159,6 +162,13 @@ class Settings(BaseSettings):
                 raise ValueError("SUMMON_WEBAPP_URL must be a non-empty HTTPS URL in production")
             if any(urlsplit(origin).scheme != "https" for origin in self.allowed_origins):
                 raise ValueError("Production origins must use HTTPS")
+        if self.poller_heartbeat_enabled and (
+            not self.bot_token.get_secret_value()
+            or len(self.session_secret.get_secret_value()) < 32
+        ):
+            raise ValueError(
+                "Polling health requires a bot token and a 32-character session secret"
+            )
         if self.rich_enabled and (
             not self.telegram_api_id or not self.telegram_api_hash.get_secret_value()
         ):

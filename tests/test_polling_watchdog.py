@@ -241,3 +241,32 @@ async def test_watchdog_internal_failure_still_stops_poller_and_unregisters(monk
     assert dispatcher.stops == 1
     assert len(bot.session.middleware) == 0
     await bot.session.close()
+
+
+async def test_supervisor_delivers_only_successful_polls_to_optional_observer(monkeypatch):
+    from unittest.mock import MagicMock
+
+    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
+    observer = MagicMock()
+    calls = []
+
+    async def make_request(_bot, method, **_kwargs):
+        calls.append(type(method).__name__)
+        return []
+
+    monkeypatch.setattr(bot.session, "make_request", make_request)
+
+    class Dispatcher:
+        def resolve_used_update_types(self):
+            return ["message"]
+
+        async def start_polling(self, current_bot, **_kwargs):
+            await current_bot(GetMe())
+            await current_bot(GetUpdates())
+            await current_bot(GetUpdates())
+
+    await run_supervised_polling(Dispatcher(), bot, timeout_seconds=1, on_success=observer)
+    assert calls == ["GetMe", "GetUpdates", "GetUpdates"]
+    assert observer.call_count == 2
+    assert len(bot.session.middleware) == 0
+    await bot.session.close()

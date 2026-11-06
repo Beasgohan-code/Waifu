@@ -25,12 +25,17 @@ class PollingStalled(RuntimeError):
 
 class PollingHeartbeat:
     def __init__(
-        self, *, timeout_seconds: float, clock: Callable[[], float] = time.monotonic
+        self,
+        *,
+        timeout_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+        on_success: Callable[[], None] | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("Polling watchdog timeout must be positive")
         self.timeout_seconds = timeout_seconds
         self.clock = clock
+        self.on_success = on_success
         self.last_success = clock()
 
     async def __call__(
@@ -43,6 +48,12 @@ class PollingHeartbeat:
         if isinstance(method, GetUpdates):
             # An empty successful long poll is healthy in a quiet group.
             self.last_success = self.clock()
+            if self.on_success is not None:
+                try:
+                    self.on_success()
+                except Exception as exc:
+                    # Monitoring must never turn a successful fetch into a retry.
+                    logger.warning("Polling health observation failed (%s)", type(exc).__name__)
         return response
 
     async def wait_until_stale(self) -> None:
@@ -76,6 +87,7 @@ async def run_supervised_polling(
     *,
     timeout_seconds: float,
     shutdown_timeout: float = 15,
+    on_success: Callable[[], None] | None = None,
 ) -> None:
     """Run exactly one poller; stop and fail on sustained getUpdates failure.
 
@@ -84,7 +96,7 @@ async def run_supervised_polling(
     """
     if shutdown_timeout <= 0:
         raise ValueError("Polling shutdown timeout must be positive")
-    heartbeat = PollingHeartbeat(timeout_seconds=timeout_seconds)
+    heartbeat = PollingHeartbeat(timeout_seconds=timeout_seconds, on_success=on_success)
     bot.session.middleware.register(heartbeat)
     polling: asyncio.Task[None] | None = None
     monitor: asyncio.Task[None] | None = None

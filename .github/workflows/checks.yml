@@ -234,8 +234,8 @@ jobs:
           root = ET.parse(sys.argv[1]).getroot()
           cases = root.findall('.//testcase')
           skipped = [case for case in cases if case.find('skipped') is not None]
-          if len(cases) < 17 or skipped:
-              raise SystemExit(f'Expected at least 17 integration cases and no skips; got {len(cases)} cases and {len(skipped)} skipped')
+          if len(cases) < 19 or skipped:
+              raise SystemExit(f'Expected at least 19 integration cases and no skips; got {len(cases)} cases and {len(skipped)} skipped')
           print(f'All {len(cases)} integration cases ran without skips.')
           PY
       - name: Remove disposable test containers

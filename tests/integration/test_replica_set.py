@@ -594,3 +594,90 @@ async def test_auto_reply_delivery_claim_is_shared_across_workers(isolated_datab
     rows = await db.rate_limits.find({"_id": {"$regex": "^once:"}}).to_list(length=5)
     assert len(rows) == 1 and "-100" not in rows[0]["_id"]
     assert rows[0]["expires_at"] > datetime.now(UTC) + timedelta(hours=47)
+
+
+async def _wait_for_majority_poll_observation(repo):
+    # Publisher writes use w=1; a majority read may briefly lag even after
+    # a successful write, and that conservative delay is expected behavior.
+    async with asyncio.timeout(5):
+        while not await repo.is_recent(120):  # noqa: ASYNC110 - remote snapshot has no event
+            await asyncio.sleep(0.05)
+
+
+async def test_optional_polling_health_schema_and_server_clock(isolated_database):
+    from pymongo.errors import WriteError
+    from pymongo.write_concern import WriteConcern
+
+    from summon.repositories.poller_health import PollerHealthRepository, poller_health_key
+
+    _client, db = isolated_database
+    bot, secret = "123456:FAKE_INTEGRATION_BOT", "s" * 40
+    assert "summon_poller_heartbeats_v1" not in await db.list_collection_names()
+    await initialize_database(db, include_poller_health=True)
+    index_info = await db.summon_poller_heartbeats_v1.index_information()
+    assert any(index.get("expireAfterSeconds") == 0 for index in index_info.values())
+    repo = PollerHealthRepository(db, bot, secret)
+    key = poller_health_key(bot, secret)
+    now = (await db.command("hello"))["localTime"]
+    assert await repo.is_recent(120) is False
+
+    # Far-future first observations cannot become fresh later when time catches up.
+    await repo.record(now + timedelta(minutes=10))
+    assert await repo.is_recent(120) is False
+    doc = await db.summon_poller_heartbeats_v1.find_one({"_id": key})
+    if doc is not None:  # TTL may remove the expired sentinel asynchronously.
+        assert doc["observed_at"] < now - timedelta(hours=1)
+
+    await repo.record(now - timedelta(minutes=3))
+    assert await repo.is_recent(120) is False
+    await repo.record(now)
+    await _wait_for_majority_poll_observation(repo)
+    doc = await db.summon_poller_heartbeats_v1.find_one({"_id": key})
+    assert set(doc) == {"_id", "observed_at", "expires_at"}
+    assert doc["observed_at"] == now and doc["expires_at"] == now + timedelta(hours=1)
+    assert bot not in str(doc) and secret not in str(doc)
+    assert await PollerHealthRepository(db, "different-fake-bot", secret).is_recent(120) is False
+
+    # Validator rejects extra payload data and malformed identifiers.
+    with pytest.raises(WriteError):
+        await db.summon_poller_heartbeats_v1.insert_one(
+            {"_id": "unapproved", "observed_at": now, "expires_at": now, "payload": "private"}
+        )
+    # Freshness is checked independently of TTL and also rejects a future DB timestamp.
+    durable = db.summon_poller_heartbeats_v1.with_options(
+        write_concern=WriteConcern(w="majority", wtimeout=5000)
+    )
+    await durable.update_one({"_id": key}, {"$set": {"observed_at": now + timedelta(minutes=10)}})
+    assert await repo.is_recent(120) is False
+    await durable.update_one({"_id": key}, {"$set": {"observed_at": now - timedelta(minutes=3)}})
+    assert await repo.is_recent(120) is False
+
+
+async def test_poller_health_out_of_order_and_future_writes_fail_safely(isolated_database):
+    from summon.repositories.poller_health import PollerHealthRepository, poller_health_key
+
+    _client, db = isolated_database
+    await initialize_database(db, include_poller_health=True)
+    bot, secret = "123456:FAKE_INTEGRATION_BOT", "s" * 40
+    reader = PollerHealthRepository(db, bot, secret)
+    writer = PollerHealthRepository(db, bot, secret)
+    now = (await db.command("hello"))["localTime"]
+    await writer.record(now - timedelta(minutes=3))
+    await asyncio.gather(
+        writer.record(now - timedelta(seconds=1)),
+        writer.record(now),
+        writer.record(now - timedelta(minutes=2)),
+        writer.record(now + timedelta(minutes=10)),
+    )
+    doc = await db.summon_poller_heartbeats_v1.find_one({"_id": poller_health_key(bot, secret)})
+    assert doc["observed_at"] == now
+    assert doc["expires_at"] == now + timedelta(hours=1)
+    await _wait_for_majority_poll_observation(reader)
+    # A delayed write and an invalid forward-skewed clock neither advance the
+    # event nor prolong its TTL; neither creates new polling progress.
+    await writer.record(now - timedelta(minutes=3))
+    await writer.record(now + timedelta(minutes=10))
+    unchanged = await db.summon_poller_heartbeats_v1.find_one(
+        {"_id": poller_health_key(bot, secret)}
+    )
+    assert unchanged == doc

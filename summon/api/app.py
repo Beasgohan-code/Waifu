@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -32,6 +34,7 @@ from summon.auth import (
 from summon.bot.emoji_palette import palette_icon
 from summon.config import Settings
 from summon.database import DatabaseTopologyError, connect_database, require_transaction_topology
+from summon.repositories.poller_health import PollerHealthRepository
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,13 @@ def create_app(
     *, settings: Settings | None = None, store: Any | None = None, telegram_bot: Any | None = None
 ) -> FastAPI:
     settings = settings or Settings()
+    monitor_token = settings.poller_monitor_token.get_secret_value()
+    if settings.poller_heartbeat_enabled and (
+        not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", monitor_token)
+        or monitor_token == settings.bot_token.get_secret_value()
+        or monitor_token == settings.session_secret.get_secret_value()
+    ):
+        raise ValueError("SUMMON_POLLER_MONITOR_TOKEN must be a separate URL-safe secret")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -109,7 +119,7 @@ def create_app(
         response: Response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith("/api/"):
+        if request.url.path.startswith("/api/") or request.url.path == "/health/poller":
             response.headers["Cache-Control"] = "no-store"
         route = request.scope.get("route")
         logger.info(
@@ -197,6 +207,40 @@ def create_app(
         await database.command("ping")
         await require_transaction_topology(database.client)
         return {"status": "ready"}
+
+    @app.get("/health/poller", include_in_schema=False)
+    async def poller_health(request: Request) -> JSONResponse:
+        candidates = request.headers.getlist("X-Summon-Monitor-Token")
+        # Authenticate before any DB access. Never accept a token in the URL.
+        if (
+            not settings.poller_heartbeat_enabled
+            or len(candidates) != 1
+            or len(candidates[0]) > 128
+            or not secrets.compare_digest(
+                candidates[0].encode("utf-8"), monitor_token.encode("utf-8")
+            )
+        ):
+            raise HTTPException(404, "Not Found")
+        database = getattr(request.app.state, "database", None)
+        if settings.preview_mode or store is not None or database is None:
+            return JSONResponse(status_code=503, content={"status": "unavailable"})
+        try:
+            repository = PollerHealthRepository(
+                database,
+                settings.bot_token.get_secret_value(),
+                settings.session_secret.get_secret_value(),
+            )
+            async with asyncio.timeout(5):
+                recent = await repository.is_recent(settings.poller_status_max_age_seconds)
+        except Exception as exc:
+            # Monitoring failures never become an apparently healthy result,
+            # and underlying database errors may contain sensitive details.
+            logger.warning("Polling health lookup failed (%s)", type(exc).__name__)
+            return JSONResponse(status_code=503, content={"status": "unavailable"})
+        return JSONResponse(
+            status_code=200 if recent else 503,
+            content={"status": "recent_poll" if recent else "no_recent_poll"},
+        )
 
     @app.get("/api/bootstrap")
     async def bootstrap() -> dict[str, Any]:

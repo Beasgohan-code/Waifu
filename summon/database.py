@@ -259,9 +259,31 @@ INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
 }
 
 
-async def initialize_database(database: Any) -> None:
+# Optional and separately named so enabling monitoring is an explicit schema
+# change. It stores no Telegram update content or raw credential.
+POLLER_HEALTH_SCHEMA: dict[str, Any] = {
+    "bsonType": "object",
+    "required": ["_id", "observed_at", "expires_at"],
+    "additionalProperties": False,
+    "properties": {
+        "_id": {"bsonType": "string", "pattern": "^poller:[0-9a-f]{64}$"},
+        "observed_at": {"bsonType": "date"},
+        "expires_at": {"bsonType": "date"},
+    },
+}
+POLLER_HEALTH_INDEXES: list[tuple[list[tuple[str, int]], dict[str, Any]]] = [
+    ([("expires_at", ASCENDING)], {"expireAfterSeconds": 0})
+]
+
+
+async def initialize_database(database: Any, *, include_poller_health: bool = False) -> None:
+    schemas = dict(COLLECTION_SCHEMAS)
+    indexes_by_collection = dict(INDEXES)
+    if include_poller_health:
+        schemas["summon_poller_heartbeats_v1"] = POLLER_HEALTH_SCHEMA
+        indexes_by_collection["summon_poller_heartbeats_v1"] = POLLER_HEALTH_INDEXES
     existing = set(await database.list_collection_names())
-    for name, schema in COLLECTION_SCHEMAS.items():
+    for name, schema in schemas.items():
         validator = {"$jsonSchema": schema}
         if name not in existing:
             try:
@@ -270,7 +292,7 @@ async def initialize_database(database: Any) -> None:
             except CollectionInvalid:  # Another instance created it concurrently.
                 pass
         await database.command("collMod", name, validator=validator, validationLevel="moderate")
-    for name, indexes in INDEXES.items():
+    for name, indexes in indexes_by_collection.items():
         for keys, options in indexes:
             await database[name].create_index(keys, **options)
 
@@ -338,7 +360,7 @@ async def connect_database(settings: Settings) -> tuple[AsyncMongoClient, Any]:
         await client.admin.command("ping")
         await require_transaction_topology(client)
         database = client[settings.mongo_database]
-        await initialize_database(database)
+        await initialize_database(database, include_poller_health=settings.poller_heartbeat_enabled)
         return client, database
     except BaseException:
         await client.close()

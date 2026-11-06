@@ -110,7 +110,7 @@ async def test_supported_transaction_topologies_initialize_after_check(hello, lo
     ):
         result, db = await connect_database(config())
     assert result is client
-    initialize.assert_awaited_once_with(db)
+    initialize.assert_awaited_once_with(db, include_poller_health=False)
     client.close.assert_not_awaited()
 
 
@@ -232,3 +232,28 @@ def test_preview_and_injected_readiness_remain_explicitly_non_database_results()
         assert preview.get("/health/ready").json() == {"status": "preview"}
     with TestClient(create_app(settings=Settings(_env_file=None), store=object())) as injected:
         assert injected.get("/health/ready").json() == {"status": "injected"}
+
+
+async def test_enabled_polling_health_is_explicitly_forwarded_to_schema_initialization():
+    client = client_for(
+        {
+            "ok": 1,
+            "setName": "rs",
+            "isWritablePrimary": True,
+            "maxWireVersion": 17,
+            "logicalSessionTimeoutMinutes": 30,
+        }
+    )
+    settings = Settings(
+        mongo_uri="mongodb://example.invalid:27017",
+        bot_token="123456:TEST_TOKEN_NOT_REAL",
+        session_secret="s" * 40,
+        poller_heartbeat_enabled=True,
+        _env_file=None,
+    )
+    with (
+        patch("summon.database.AsyncMongoClient", return_value=client),
+        patch("summon.database.initialize_database", new_callable=AsyncMock) as initialize,
+    ):
+        _, db = await connect_database(settings)
+    initialize.assert_awaited_once_with(db, include_poller_health=True)
