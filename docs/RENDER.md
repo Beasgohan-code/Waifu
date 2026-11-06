@@ -1,6 +1,6 @@
 # Render deployment guide (not yet verified live)
 
-Render can run SUMMON, but this guide is a **deployment candidate**, not a claim of a successful deployment or a production-readiness certification. No Render resources or real credentials were used to write it. Complete the [deployment](DEPLOYMENT.md), [testing](TESTING.md) and [migration/backup](MIGRATION_BACKUP.md) gates first, and rehearse with a **new test bot and isolated database**.
+Render can run SUMMON, but this guide is a **deployment candidate**, not a claim of a successful deployment or a production-readiness certification. The image and credential-free preview passed [hosted CI](https://github.com/Beasgohan-code/Waifu/actions/runs/42231639031); no Render resources or real credentials were used. Complete the [deployment](DEPLOYMENT.md), [testing](TESTING.md) and [migration/backup](MIGRATION_BACKUP.md) gates first, and rehearse with a **new test bot and isolated database**.
 
 ## Cost, uptime and one polling worker
 
