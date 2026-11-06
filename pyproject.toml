@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=84.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "summon-platform"
+version = "0.1.0"
+description = "SUMMON — Collect. Discover. Summon."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiogram==3.31.0",
+  "fastapi==0.162.0",
+  "itsdangerous==2.2.0",
+  "wzgram==3.1.6",
+  "warpcrypto==2.1.0",
+  "pydantic-settings==2.16.2",
+  "pymongo==4.19.0",
+  "uvicorn[standard]==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "mypy==2.4.1",
+  "pip-audit==2.10.1",
+  "pytest==9.2.0",
+  "pytest-asyncio==1.4.1.post1",
+  "ruff==0.17.3",
+]
+
+[project.scripts]
+summon-api = "summon.api.run:main"
+summon-bot = "summon.bot.main:main"
+summon-seed = "summon.seed:main"
+summon-migration-preview = "summon.migration_preview:main"
+
+[tool.setuptools.packages.find]
+include = ["summon*"]
+
+[tool.setuptools.package-data]
+"summon._vendor" = ["RICHGRAM_LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: opt-in tests requiring explicitly authorized external infrastructure"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# Assertions and test-only fake tokens are expected in the test suite.
+"tests/*" = ["S101", "S105", "S106"]
+# FastAPI declares dependency injection in parameter defaults.
+"summon/api/app.py" = ["B008"]
+"summon/api/routes.py" = ["B008"]
+# The API must be reachable through the container/preview proxy.
+"summon/api/run.py" = ["S104"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+check_untyped_defs = true
