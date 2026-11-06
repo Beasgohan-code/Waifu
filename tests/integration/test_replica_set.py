@@ -618,7 +618,8 @@ async def test_optional_polling_health_schema_and_server_clock(isolated_database
     assert any(index.get("expireAfterSeconds") == 0 for index in index_info.values())
     repo = PollerHealthRepository(db, bot, secret)
     key = poller_health_key(bot, secret)
-    now = (await db.command("hello"))["localTime"]
+    # Database.command decodes this BSON UTC field as naive even with tz_aware.
+    now = (await db.command("hello"))["localTime"].replace(tzinfo=UTC)
     assert await repo.is_recent(120) is False
 
     # Far-future first observations cannot become fresh later when time catches up.
@@ -661,7 +662,7 @@ async def test_poller_health_out_of_order_and_future_writes_fail_safely(isolated
     bot, secret = "123456:FAKE_INTEGRATION_BOT", "s" * 40
     reader = PollerHealthRepository(db, bot, secret)
     writer = PollerHealthRepository(db, bot, secret)
-    now = (await db.command("hello"))["localTime"]
+    now = (await db.command("hello"))["localTime"].replace(tzinfo=UTC)
     await writer.record(now - timedelta(minutes=3))
     await asyncio.gather(
         writer.record(now - timedelta(seconds=1)),
