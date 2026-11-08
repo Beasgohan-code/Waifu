@@ -47,6 +47,7 @@ def client():
     users = SimpleNamespace(
         touch=AsyncMock(),
         profile=AsyncMock(side_effect=lambda user_id: {"id": user_id, "first_name": "Mika"}),
+        collection_insights=AsyncMock(side_effect=lambda user_id: {"owner": user_id}),
         leaderboard=AsyncMock(return_value=[]),
     )
     store = SimpleNamespace(
@@ -292,3 +293,27 @@ def test_bootstrap_exposes_only_presentation_metadata_for_native_collection_butt
             "custom_emoji_id": Emoji.OPEN_COLLECTION.value[1] if premium else None,
         },
     }
+
+
+def test_collection_insights_require_session_and_ignore_user_supplied_identity(client):
+    assert client.get("/api/me/collection-insights?user_id=999").status_code == 401
+    assert sign_in(client, 123).status_code == 200
+    result = client.get("/api/me/collection-insights?user_id=999")
+    assert result.status_code == 200
+    assert result.json()["data"]["owner"] == 123
+    client.app.state.store.users.collection_insights.assert_awaited_once_with(123)
+
+
+def test_collection_insights_fail_closed_when_limited_or_database_is_unavailable(client):
+    from pymongo.errors import AutoReconnect
+
+    assert sign_in(client).status_code == 200
+    store = client.app.state.store
+    store.limiter.allow.return_value = False
+    assert client.get("/api/me/collection-insights").status_code == 429
+    store.users.collection_insights.assert_not_awaited()
+    store.limiter.allow.return_value = True
+    store.users.collection_insights.side_effect = AutoReconnect("FAKE_PRIVATE_DB_DETAIL")
+    result = client.get("/api/me/collection-insights")
+    assert result.status_code == 503
+    assert "FAKE_PRIVATE_DB_DETAIL" not in result.text

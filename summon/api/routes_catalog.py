@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
+from pymongo.errors import PyMongoError
 
 from summon.api.dependencies import get_current_user, get_store, limit_action
 from summon.api.schemas import (
@@ -16,6 +17,7 @@ from summon.api.schemas import (
 from summon.auth import TelegramUser
 from summon.models import InventorySort, Rarity
 from summon.repositories.character_numbers import CharacterNumberingUnavailable
+from summon.repositories.collection_insights import InsightsDataError
 from summon.repositories.inventory_paging import (
     CursorDataError,
     CursorExpired,
@@ -180,6 +182,22 @@ async def daily(
 ) -> dict[str, Any]:
     await limit_action(request, user, "daily", limit=10)
     return {"data": await store.users.daily(user, datetime.now(UTC))}
+
+
+@router.get("/me/collection-insights")
+async def collection_insights(
+    request: Request,
+    user: TelegramUser = Depends(get_current_user),
+    store: Any = Depends(get_store),
+) -> dict[str, Any]:
+    """Only the session's actor can read their own collection statistics."""
+    if not request.app.state.settings.preview_mode:
+        await limit_action(request, user, "collection-insights", limit=30)
+    try:
+        return {"data": await store.users.collection_insights(user.id)}
+    except (InsightsDataError, PyMongoError, TimeoutError) as exc:
+        logger.warning("Collection insights unavailable (%s)", type(exc).__name__)
+        raise HTTPException(503, "Collection insights are temporarily unavailable") from None
 
 
 @router.get("/progression")

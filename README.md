@@ -55,6 +55,8 @@ Photos must be ordinary JPEGs up to 3 MiB and are transcoded with metadata remov
 
 `/check 01` and `/check 1` refer to numeric character 1. Numeric aliases are additive: existing catalog keys and inventory references remain unchanged. On first numeric lookup or catalog write, a transactional backfill numbers existing records deterministically by creation time and key, preserves compatible existing numbers, and rejects collisions or catalogs above 10,000 records for operator review. Rehearse and inspect the mapping on an authorized isolated copy before rollout; it is not a migration of external data.
 
+Private `/profile` and the Mini App profile share an actor-scoped, read-only snapshot report of owned copies, duplicates, favorites, rarity distribution and active-catalog completion. Retired and missing catalog records still count as owned, but only active owned characters count toward completion; missing or unknown rarity appears as Uncategorized. Collection goals reflect current ownership and can change after a trade or gift; they are not permanent rewards. The best recorded daily streak is preserved on future claims, including the last recorded legacy streak, but earlier streaks that were never stored cannot be reconstructed. Reports require MongoDB 5.0+ snapshot reads and may be temporarily unavailable on slow or unsupported databases; no collection data is changed.
+
 For HTTPS URLs, SUMMON does not fetch or verify the destination: Telegram and app clients fetch the URL, whose DNS or redirects can change. Operators must choose a trusted public host. The public image route rate-limits requests by the observed network host, so shared proxy egress can combine clients. Live Telegram, hosted proxy behavior, and production MongoDB transactions still need an authorized rehearsal.
 
 Run one `summon-bot` worker per bot token and one or more `summon-api` workers. Configure the same bot token, application MongoDB database, separate `SUMMON_TELEGRAM_SESSION_DATABASE`, and session secret consistently. The bot must have read/write/index permissions for its dedicated session database; API workers need read access to its `peers` collection, not the session auth-key collection. That database and its backups contain credential-bearing MTProto session data and sensitive peer metadata. Restrict and encrypt access; never share one MTProto auth session concurrently across workers.
@@ -85,7 +87,7 @@ mkdir -p backups
 .venv/bin/python backup.py restore backups/summon.sbak --target-database summon_restore_rehearsal --writers-stopped --confirm RESTORE-INTO-EMPTY
 ```
 
-Restore authenticates and validates the complete file before writes, requires a separate empty database whose name contains `_restore_`, and uses insert-only writes; it never overwrites the source. An interrupted/failed restore can leave a partial target requiring operator review. This backup and restore flow has not been rehearsed on real data or a production deployment; validate recovery on an authorized isolated database before relying on it.
+Restore authenticates and validates the complete file before writes, requires a separate empty database whose name contains `_restore_`, and uses insert-only writes; it never overwrites the source. An interrupted/failed restore can leave a partial target requiring operator review. A synthetic export/restore passed isolated MongoDB CI; the flow has not been rehearsed on production data or a production deployment. Validate recovery on an authorized isolated database before relying on it.
 
 ## Attribution and licenses
 

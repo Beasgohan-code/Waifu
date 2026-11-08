@@ -41,7 +41,12 @@ def test_daily_status_rejects_naive_timestamps():
 async def test_progression_uses_utc_day_and_bounded_catch_window():
     now = datetime(2026, 1, 2, 4, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
     activity = SimpleNamespace(find_one=AsyncMock(return_value=None))
-    repo = UserRepository(object(), SimpleNamespace(activity=activity))
+    repo = UserRepository(
+        object(),
+        SimpleNamespace(
+            activity=activity, inventory=SimpleNamespace(find_one=AsyncMock(return_value=None))
+        ),
+    )
     repo.profile = AsyncMock(
         return_value={
             "catch_count": 0,
@@ -128,3 +133,83 @@ async def test_collection_mode_save_updates_only_the_authenticated_user():
     with pytest.raises(ValueError):
         await repo.set_collection_mode(actor, "unsafe", now)
     assert users.update_one.await_count == 2
+
+
+async def test_recorded_best_streak_preserves_legacy_value_after_a_gap():
+    users = SimpleNamespace(
+        find_one=AsyncMock(return_value={"last_daily": "2026-01-01", "streak": 7}),
+        update_one=AsyncMock(),
+    )
+    history = SimpleNamespace(insert_one=AsyncMock())
+    repo = UserRepository(object(), SimpleNamespace(users=users, reward_history=history))
+    repo.touch = AsyncMock()
+
+    async def run_transaction(_client, callback):
+        return await callback("session")
+
+    with patch("summon.repositories.users.transaction", side_effect=run_transaction):
+        reward = await repo.daily(
+            TelegramUser(id=123, first_name="Test"), datetime(2026, 1, 3, tzinfo=UTC)
+        )
+    assert reward["streak"] == 1
+    changes = users.update_one.await_args.args[1]["$set"]
+    assert changes == {"last_daily": "2026-01-03", "streak": 1, "best_streak": 7}
+    assert users.update_one.await_args.kwargs["session"] == "session"
+    assert history.insert_one.await_args.kwargs["session"] == "session"
+
+
+async def test_first_collection_achievement_counts_free_claims_not_only_group_catches():
+    repo = UserRepository(
+        object(), SimpleNamespace(activity=SimpleNamespace(find_one=AsyncMock(return_value=None)))
+    )
+    repo.profile = AsyncMock(
+        return_value={
+            "catch_count": 0,
+            "unique_characters": 1,
+            "streak": 1,
+            "best_streak": 5,
+            "level": 1,
+            "last_daily": None,
+        }
+    )
+    progress = await repo.progression(123, datetime(2026, 1, 2, tzinfo=UTC))
+    achievements = {item["id"]: item for item in progress["achievements"]}
+    assert achievements["first-summon"]["completed"]
+    assert achievements["streak-three"]["completed"]
+
+
+def test_preview_collection_insights_are_derived_from_sample_collection():
+    with TestClient(create_app(settings=Settings(preview_mode=True, _env_file=None))) as client:
+        result = client.get("/api/me/collection-insights")
+        assert result.status_code == 200
+        data = result.json()["data"]
+        assert data["unique_characters"] == 2
+        assert data["total_copies"] == 3
+        assert data["duplicate_copies"] == 1
+        assert data["active_owned"] == 2 and data["catalog_size"] == 3
+        assert {item["rarity"] for item in data["rarity_breakdown"]} == {"legendary", "epic"}
+
+
+async def test_first_achievement_stays_recorded_after_last_copy_is_gifted():
+    inventory = SimpleNamespace(find_one=AsyncMock(return_value={"_id": "old-inventory-row"}))
+    repo = UserRepository(
+        object(),
+        SimpleNamespace(
+            activity=SimpleNamespace(find_one=AsyncMock(return_value=None)), inventory=inventory
+        ),
+    )
+    repo.profile = AsyncMock(
+        return_value={
+            "catch_count": 0,
+            "unique_characters": 0,
+            "streak": 0,
+            "best_streak": 0,
+            "level": 1,
+            "last_daily": None,
+        }
+    )
+    progress = await repo.progression(123, datetime(2026, 1, 2, tzinfo=UTC))
+    assert next(item for item in progress["achievements"] if item["id"] == "first-summon")[
+        "completed"
+    ]
+    inventory.find_one.assert_awaited_once_with({"user_id": 123}, {"_id": 1}, max_time_ms=2000)

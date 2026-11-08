@@ -10,6 +10,11 @@ from pymongo import DESCENDING
 from summon.auth import TelegramUser
 from summon.models import CollectionMode, player_level
 from summon.repositories.base import transaction
+from summon.repositories.collection_insights import (
+    MAX_SAFE_INTEGER,
+    CollectionInsights,
+    CollectionInsightsRepository,
+)
 
 
 class DailyAlreadyClaimed(ValueError):
@@ -24,6 +29,12 @@ def _as_utc(now: datetime) -> datetime:
     if now.utcoffset() is None:
         raise ValueError("A timezone-aware server timestamp is required")
     return now.astimezone(UTC)
+
+
+def _streak_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_SAFE_INTEGER:
+        raise DailyStatusUnavailable("Stored streak needs operator review")
+    return value
 
 
 def daily_status(last_daily: str | None, now: datetime) -> dict[str, str]:
@@ -87,6 +98,8 @@ class UserRepository:
         )
         total_characters = await self.db.characters.count_documents({"active": True})
         xp = doc.get("xp", 0)
+        streak = _streak_count(doc.get("streak", 0))
+        best_streak = max(streak, _streak_count(doc.get("best_streak", streak)))
         return {
             "id": user_id,
             "first_name": doc.get("first_name", "Collector"),
@@ -97,9 +110,13 @@ class UserRepository:
             "catch_count": doc.get("catch_count", 0),
             "unique_characters": unique,
             "catalog_size": total_characters,
-            "streak": doc.get("streak", 0),
+            "streak": streak,
+            "best_streak": best_streak,
             "last_daily": doc.get("last_daily"),
         }
+
+    async def collection_insights(self, user_id: int) -> CollectionInsights:
+        return await CollectionInsightsRepository(self.client, self.db).read(user_id)
 
     async def community_counts(self) -> dict[str, int]:
         """Bounded aggregate counts only; never return individual user or group data."""
@@ -141,12 +158,19 @@ class UserRepository:
                 {"_id": 1},
             )
         )
+        # Inventory rows are retained at quantity zero after a consensual gift or
+        # trade, so the first encounter remains recorded even if none are held now.
+        has_collected = bool(profile["unique_characters"] or profile["catch_count"])
+        if not has_collected:
+            has_collected = bool(
+                await self.db.inventory.find_one({"user_id": user_id}, {"_id": 1}, max_time_ms=2000)
+            )
         achievements = [
             {
                 "id": "first-summon",
                 "title": "First encounter",
                 "description": "Collect your first character",
-                "current": min(profile["catch_count"], 1),
+                "current": int(has_collected),
                 "target": 1,
             },
             {
@@ -160,7 +184,7 @@ class UserRepository:
                 "id": "streak-three",
                 "title": "A little ritual",
                 "description": "Reach a 3-day check-in streak",
-                "current": min(profile["streak"], 3),
+                "current": min(profile.get("best_streak", profile["streak"]), 3),
                 "target": 3,
             },
             {
@@ -209,12 +233,15 @@ class UserRepository:
                 raise DailyAlreadyClaimed("Today's reward has already been claimed")
             if state != "available":
                 raise DailyStatusUnavailable("Daily status is unavailable; contact support")
-            streak = doc.get("streak", 0) + 1 if doc.get("last_daily") == yesterday else 1
+            previous_streak = _streak_count(doc.get("streak", 0))
+            previous_best = _streak_count(doc.get("best_streak", previous_streak))
+            streak = _streak_count(previous_streak + 1) if doc.get("last_daily") == yesterday else 1
+            best_streak = max(previous_best, previous_streak, streak)
             points = 100 + min(streak - 1, 6) * 10
             await self.db.users.update_one(
                 {"_id": user.id},
                 {
-                    "$set": {"last_daily": today, "streak": streak},
+                    "$set": {"last_daily": today, "streak": streak, "best_streak": best_streak},
                     "$inc": {"points": points, "xp": 20},
                 },
                 session=session,

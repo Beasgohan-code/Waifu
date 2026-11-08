@@ -28,8 +28,21 @@ export interface Profile {
   unique_characters: number;
   catalog_size: number;
   streak: number;
+  best_streak?: number;
   last_daily: string | null;
   is_operator: boolean;
+}
+export interface CollectionGoal { id: string; title: string; current: number; target: number; completed: boolean }
+export interface CollectionInsights {
+  unique_characters: number;
+  total_copies: number;
+  duplicate_copies: number;
+  favorite_characters: number;
+  active_owned: number;
+  catalog_size: number;
+  completion_percent: number | null;
+  rarity_breakdown: { rarity: Rarity | 'unknown'; unique: number; copies: number }[];
+  goals: CollectionGoal[];
 }
 export interface Achievement { id: string; title: string; description: string; current: number; target: number; completed: boolean }
 export interface DailyQuest { id: string; title: string; description: string; completed: boolean; reward: string }

@@ -1330,3 +1330,60 @@ async def test_encrypted_snapshot_and_insert_only_restore_into_isolated_database
     finally:
         if os.environ.get("SUMMON_TEST_MONGO_DROP_CONFIRM") == "DROP_ISOLATED_TEST_DB":
             await client.drop_database(target_name)
+
+
+async def test_collection_insights_count_owned_active_favorites_rarities_and_orphans(
+    isolated_database,
+):
+    from summon.repositories.collection_insights import CollectionInsightsRepository
+
+    client, db = isolated_database
+    await db.characters.update_one({"_id": "ren"}, {"$set": {"active": False}})
+    await db.inventory.insert_many(
+        [
+            {"user_id": 701, "character_id": "aiko", "quantity": 3, "favorite": True},
+            {"user_id": 701, "character_id": "ren", "quantity": 1, "favorite": False},
+            {"user_id": 701, "character_id": "legacy-missing", "quantity": 2, "favorite": False},
+            {"user_id": 702, "character_id": "mira", "quantity": 9, "favorite": True},
+        ]
+    )
+    report = await CollectionInsightsRepository(client, db).read(701)
+    assert report["unique_characters"] == 3 and report["total_copies"] == 6
+    assert report["duplicate_copies"] == 3 and report["favorite_characters"] == 1
+    assert report["active_owned"] == 1 and report["catalog_size"] == 2
+    assert report["completion_percent"] == 50.0
+    breakdown = {item["rarity"]: item for item in report["rarity_breakdown"]}
+    assert breakdown["legendary"]["copies"] == 3
+    assert breakdown["epic"]["unique"] == 1
+    assert breakdown["unknown"]["copies"] == 2
+    other = await CollectionInsightsRepository(client, db).read(702)
+    assert other["unique_characters"] == 1 and other["total_copies"] == 9
+    assert await db.inventory.count_documents({"user_id": 701}) == 3
+
+
+async def test_legacy_best_streak_survives_first_new_daily_after_a_gap(isolated_database):
+    client, db = isolated_database
+    now = datetime(2026, 1, 10, tzinfo=UTC)
+    await db.users.insert_one(
+        {"_id": 701, "last_daily": "2026-01-01", "streak": 8, "points": 0, "xp": 0}
+    )
+    repo = UserRepository(client, db)
+    reward = await repo.daily(TelegramUser(id=701, first_name="Test"), now)
+    assert reward["streak"] == 1
+    row = await db.users.find_one({"_id": 701})
+    assert row["streak"] == 1 and row["best_streak"] == 8
+    await repo.daily(TelegramUser(id=701, first_name="Test"), now + timedelta(days=1))
+    row = await db.users.find_one({"_id": 701})
+    assert row["streak"] == 2 and row["best_streak"] == 8
+
+
+async def test_first_encounter_remains_after_historical_inventory_reaches_zero(isolated_database):
+    client, db = isolated_database
+    await db.inventory.insert_one(
+        {"user_id": 703, "character_id": "aiko", "quantity": 0, "favorite": False}
+    )
+    repo = UserRepository(client, db)
+    progress = await repo.progression(703, datetime(2026, 1, 10, tzinfo=UTC))
+    first = next(item for item in progress["achievements"] if item["id"] == "first-summon")
+    assert first["completed"] is True
+    assert await db.inventory.count_documents({"user_id": 703, "quantity": {"$gt": 0}}) == 0

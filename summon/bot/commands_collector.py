@@ -20,6 +20,7 @@ from summon.models import CollectionMode
 from summon.rarities import rarity_label
 from summon.repositories.character_numbers import CharacterNumberingUnavailable
 from summon.repositories.collection import DailyCharacterAlreadyClaimed, DailyCharacterUnavailable
+from summon.repositories.collection_insights import InsightsDataError
 from summon.repositories.rarity_weights import InvalidSpawnWeights
 from summon.repositories.users import DailyAlreadyClaimed, DailyStatusUnavailable, daily_status
 from summon.services.collection import CollectionService, GuessRateLimited
@@ -601,7 +602,7 @@ def register_collector_commands(
             return
         try:
             progress = await store.users.progression(user.id, datetime.now(UTC))
-        except PyMongoError:
+        except (PyMongoError, DailyStatusUnavailable):
             await collector_read_error(message)
             return
         fields = tuple(
@@ -626,35 +627,63 @@ def register_collector_commands(
         user = _user(message)
         if not user:
             return
-        if command and command.command in {"me", "hstats"} and command.args:
+        if command.args:
             await respond(
                 message,
                 Card("Your collector profile", "This command shows only your own profile."),
                 private=True,
             )
             return
-        await store.users.touch(user, datetime.now(UTC))
-        profile_data = await store.users.profile(user.id)
+        if not await collector_rate_allowed(message, user.id, "profile"):
+            return
+        try:
+            await store.users.touch(user, datetime.now(UTC))
+            profile_data = await store.users.profile(user.id)
+            insights = await store.users.collection_insights(user.id)
+        except (PyMongoError, InsightsDataError, DailyStatusUnavailable, TimeoutError):
+            await collector_read_error(message)
+            return
+        goal = next((item for item in insights["goals"] if not item["completed"]), None)
+        rarity_lines = [
+            f"{rarity_label(item['rarity'])}: {item['unique']} unique · {item['copies']} copies"
+            for item in insights["rarity_breakdown"]
+        ]
         await respond(
             message,
             Card(
                 "Collector profile",
-                user.first_name,
+                user.first_name + " · Collection goals reflect what you own now.",
                 emoji=Emoji.STATS,
                 fields=(
                     ("Level", str(profile_data["level"])),
                     ("Points", str(profile_data["points"])),
                     (
-                        "Collection",
-                        f"{profile_data['unique_characters']} / {profile_data['catalog_size']}",
+                        "Active catalogue",
+                        f"{insights['active_owned']} / {insights['catalog_size']}",
                     ),
-                    ("Total summons", str(profile_data["catch_count"])),
+                    ("Owned copies", str(insights["total_copies"])),
+                    ("Duplicate copies", str(insights["duplicate_copies"])),
+                    ("Favorites", str(insights["favorite_characters"])),
+                    ("Group catches", str(profile_data["catch_count"])),
+                    ("Best recorded streak", f"{profile_data['best_streak']} days"),
+                    (
+                        "Next goal",
+                        f"{goal['title']} · {goal['current']}/{goal['target']}"
+                        if goal
+                        else "Current collection goals complete",
+                    ),
                 ),
+                details=("Rarity distribution", "\n".join(rarity_lines) or "No characters yet."),
                 field_icons=(
                     Emoji.RARITY_STAR,
                     Emoji.REWARD_COIN,
                     Emoji.OPEN_COLLECTION,
+                    Emoji.OPEN_COLLECTION,
+                    Emoji.OPEN_COLLECTION,
+                    Emoji.HEART,
                     Emoji.SPARK,
+                    Emoji.HOURGLASS,
+                    Emoji.STAR,
                 ),
             ),
             private=True,
@@ -667,7 +696,7 @@ def register_collector_commands(
             return
         try:
             data = await store.users.profile(user.id)
-        except PyMongoError:
+        except (PyMongoError, DailyStatusUnavailable):
             await collector_read_error(message)
             return
         await respond(
@@ -692,7 +721,7 @@ def register_collector_commands(
             return
         try:
             data = await store.users.profile(user.id)
-        except PyMongoError:
+        except (PyMongoError, DailyStatusUnavailable):
             await collector_read_error(message)
             return
         status = daily_status(data.get("last_daily"), datetime.now(UTC))["state"]
@@ -707,7 +736,13 @@ def register_collector_commands(
                 "Daily streak",
                 f"{daily_message} The streak is recalculated on your next claim, using UTC.",
                 emoji=Emoji.SPARK,
-                fields=(("Last recorded streak", f"{data.get('streak', 0)} days"),),
+                fields=(
+                    ("Last recorded streak", f"{data.get('streak', 0)} days"),
+                    (
+                        "Best recorded streak",
+                        f"{data.get('best_streak', data.get('streak', 0))} days",
+                    ),
+                ),
             ),
             private=True,
         )

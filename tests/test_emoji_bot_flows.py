@@ -27,6 +27,18 @@ def make_store():
                     "unique_characters": 0,
                     "catalog_size": 3,
                     "catch_count": 0,
+                    "best_streak": 3,
+                }
+            ),
+            collection_insights=AsyncMock(
+                return_value={
+                    "active_owned": 0,
+                    "catalog_size": 3,
+                    "total_copies": 0,
+                    "duplicate_copies": 0,
+                    "favorite_characters": 0,
+                    "rarity_breakdown": [],
+                    "goals": [],
                 }
             ),
             daily=AsyncMock(return_value={"points": 100, "streak": 1}),
@@ -192,7 +204,20 @@ async def test_start_uses_new_summon_brand_and_collection_button():
 @pytest.mark.parametrize(
     ("handler_name", "expected"),
     [
-        ("profile", ("RARITY_STAR", "REWARD_COIN", "OPEN_COLLECTION", "SPARK")),
+        (
+            "profile",
+            (
+                "RARITY_STAR",
+                "REWARD_COIN",
+                "OPEN_COLLECTION",
+                "OPEN_COLLECTION",
+                "OPEN_COLLECTION",
+                "HEART",
+                "SPARK",
+                "HOURGLASS",
+                "STAR",
+            ),
+        ),
         ("daily", ("REWARD_COIN", "RARITY_STAR", "SPARK")),
     ],
 )
@@ -249,3 +274,52 @@ async def test_start_guide_rejects_another_actor_before_sending():
         await handler(app, callback)
     sent.assert_not_awaited()
     assert callback.answer.await_args.kwargs["show_alert"] is True
+
+
+async def test_profile_insights_are_private_and_always_scoped_to_the_sender():
+    store = make_store()
+    app = await native_app(store, Settings(_env_file=None))
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await find_handler(app, "profile")(make_message())
+    store.users.collection_insights.assert_awaited_once_with(42)
+    card = send.await_args.args[2]
+    assert dict(card.fields)["Best recorded streak"] == "3 days"
+
+    store.users.collection_insights.reset_mock()
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await find_handler(app, "profile")(make_message(), SimpleNamespace(args="999"))
+    store.users.collection_insights.assert_not_awaited()
+    assert "only your own profile" in send.await_args.args[2].body
+
+
+async def test_group_profile_uses_private_delivery_never_public_stats():
+    store = make_store()
+    app = await native_app(store, Settings(_env_file=None))
+    with (
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private_send,
+        patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public_send,
+    ):
+        await find_handler(app, "profile")(make_message("supergroup"))
+    private_send.assert_awaited_once()
+    assert private_send.await_args.args[1:3] == (-100, 42)
+    assert private_send.await_args.args[3].title == "Collector profile"
+    public_send.assert_not_awaited()
+
+
+async def test_profile_privacy_fallback_contains_no_collection_details():
+    from wzgram.errors import BadRequest
+
+    store = make_store()
+    app = await native_app(store, Settings(_env_file=None))
+    with (
+        patch(
+            "summon.bot.handlers.send_ephemeral_card",
+            new_callable=AsyncMock,
+            side_effect=BadRequest("unavailable"),
+        ),
+        patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public_send,
+    ):
+        await find_handler(app, "profile")(make_message("supergroup"))
+    card = public_send.await_args.args[2]
+    assert card.title == "Open your private chat" and not card.fields
+    assert "Start SUMMON privately" in card.body

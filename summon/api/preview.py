@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from summon.models import GroupSettings, InventorySort
+from summon.repositories.collection_insights import CollectionInsights, summarize_collection
 from summon.repositories.inventory_paging import CursorCodec, CursorState
 from summon.repositories.users import daily_status
 
@@ -213,8 +214,26 @@ class PreviewUsers:
             "unique_characters": 2,
             "catalog_size": 3,
             "streak": 3,
+            "best_streak": 5,
             "last_daily": None,
         }
+
+    async def collection_insights(self, user_id: int) -> CollectionInsights:
+        buckets: dict[str, dict[str, Any]] = {}
+        for item in _CHARACTERS:
+            if item["quantity"] <= 0:
+                continue
+            rarity = item["rarity"]
+            bucket = buckets.setdefault(
+                rarity, {"_id": rarity, "unique": 0, "copies": 0, "favorites": 0, "active_owned": 0}
+            )
+            bucket["unique"] += 1
+            bucket["copies"] += item["quantity"]
+            bucket["favorites"] += int(item["favorite"])
+            bucket["active_owned"] += int(item["active"])
+        return summarize_collection(
+            list(buckets.values()), sum(item["active"] for item in _CHARACTERS)
+        )
 
     async def leaderboard(self, limit: int = 20) -> list[dict[str, Any]]:
         return [
