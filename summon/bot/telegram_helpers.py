@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from wzgram.types import CallbackQuery, Message
+from wzgram.types import CallbackQuery, Message, User
 
 from summon.auth import TelegramUser
 
@@ -35,15 +35,8 @@ def callback_data(callback: CallbackQuery) -> str:
     return data if isinstance(data, str) else ""
 
 
-def _user(message: Message) -> TelegramUser | None:
-    user = message.from_user
-    if (
-        not message.chat
-        or not user
-        or user.is_bot
-        or message.sender_chat
-        or not 0 < user.id < 2**53
-    ):
+def telegram_user(user: User | None) -> TelegramUser | None:
+    if not user or user.is_bot or not 0 < user.id < 2**53:
         return None
     return TelegramUser(
         id=user.id,
@@ -51,6 +44,12 @@ def _user(message: Message) -> TelegramUser | None:
         last_name=user.last_name[:128] if user.last_name else None,
         username=user.username[:64] if user.username else None,
     )
+
+
+def _user(message: Message) -> TelegramUser | None:
+    if not message.chat or message.sender_chat:
+        return None
+    return telegram_user(message.from_user)
 
 
 def _group(message: Message) -> bool:

@@ -8,6 +8,7 @@ from wzgram.enums import ButtonStyle
 from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from summon.bot.presentation import Emoji, button_label
+from summon.models import CollectionMode
 
 
 def collection_keyboard(url: str, *, premium: bool) -> InlineKeyboardMarkup:
@@ -22,6 +23,46 @@ def collection_keyboard(url: str, *, premium: bool) -> InlineKeyboardMarkup:
                     style=ButtonStyle.PRIMARY,
                     icon_custom_emoji_id=Emoji.OPEN_COLLECTION.custom_id if premium else None,
                 )
+            ]
+        ]
+    )
+
+
+def operator_panel_keyboard(url: str, *, premium: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=button_label("Open the Mini App", Emoji.ADMIN_SHIELD, premium=premium),
+                    web_app=WebAppInfo(url=url),
+                    style=ButtonStyle.PRIMARY,
+                    icon_custom_emoji_id=Emoji.ADMIN_SHIELD.custom_id if premium else None,
+                )
+            ]
+        ]
+    )
+
+
+def collection_mode_keyboard(
+    actor_id: int, selected: CollectionMode, *, premium: bool
+) -> InlineKeyboardMarkup:
+    modes: tuple[tuple[CollectionMode, str, Emoji], ...] = (
+        ("recent", "Recent", Emoji.HOURGLASS),
+        ("copies", "Copies", Emoji.OPEN_COLLECTION),
+        ("favorites", "Favorites", Emoji.HEART),
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=button_label(
+                        f"{'✓ ' if selected == mode else ''}{label}", icon, premium=premium
+                    ),
+                    callback_data=f"hmode:{actor_id}:{mode}",
+                    icon_custom_emoji_id=icon.custom_id if premium else None,
+                    style=ButtonStyle.PRIMARY if selected == mode else ButtonStyle.DEFAULT,
+                )
+                for mode, label, icon in modes
             ]
         ]
     )

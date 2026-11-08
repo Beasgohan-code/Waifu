@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from typing import Any, Literal
 from unicodedata import category
@@ -55,17 +56,26 @@ def _browser_origin(parsed: SplitResult) -> str:
     return f"{parsed.scheme}://{host}{suffix}"
 
 
-# Aliases are intentionally limited to common, unambiguous scalar credentials.
 # Within one source, existing SUMMON_* names win, then aliases in this order.
+# Process environment values take precedence over values from .env.
 _ENV_ALIASES: dict[str, tuple[str, ...]] = {
-    "bot_token": ("BOT_TOKEN",),
+    "environment": ("ENVIRONMENT",),
+    "bot_token": ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
     "session_secret": ("SESSION_SECRET",),
-    "mongo_uri": ("MONGO_URL", "MONGO_URI", "MONGODB_URI"),
-    "mongo_database": ("MONGO_DB_NAME", "DATABASE_NAME"),
-    "webapp_url": ("WEBAPP_URL",),
-    "telegram_api_id": ("API_ID",),
-    "telegram_api_hash": ("API_HASH",),
-    "operator_ids": ("OWNER_ID",),
+    "mongo_uri": ("MONGO_URL", "MONGO_URI", "MONGODB_URI", "MONGODB_URL"),
+    "mongo_database": ("MONGO_DB_NAME", "DB_NAME", "DATABASE_NAME"),
+    "webapp_url": ("WEBAPP_URL", "WEB_APP_URL"),
+    "telegram_api_id": ("API_ID", "TELEGRAM_API_ID"),
+    "telegram_api_hash": ("API_HASH", "TELEGRAM_API_HASH"),
+    "telegram_session_database": ("TELEGRAM_SESSION_DB",),
+    "artwork_backend": ("ARTWORK_BACKEND",),
+    "imgbb_key": ("IMGBB_KEY", "IMGBB_API_KEY"),
+    "db_channel": ("DB_CHANNEL", "DB_CHANNEL_ID"),
+    "webhooks_disabled_confirmed": ("WEBHOOKS_DISABLED_CONFIRMED",),
+    "rich_enabled": ("RICH_ENABLED",),
+    "premium_emoji_enabled": ("PREMIUM_EMOJI_ENABLED",),
+    "operator_ids": ("OPERATOR_IDS", "OWNER_ID"),
+    "allowed_origins": ("ALLOWED_ORIGINS",),
 }
 
 
@@ -90,8 +100,23 @@ class _AliasedEnvironment(PydanticBaseSettingsSource):
                 key = alias if self.source.case_sensitive else alias.lower()
                 value = self.source.env_vars.get(key)
                 if value is not None:
-                    # OWNER_ID is one Telegram ID, not a JSON array.
-                    values[field] = [value] if field == "operator_ids" else value
+                    if field in {"operator_ids", "allowed_origins"}:
+                        text = value.strip()
+                        if not text:
+                            values[field] = []
+                        elif alias != "OWNER_ID" and text.startswith("["):
+                            try:
+                                values[field] = json.loads(text)
+                            except ValueError:
+                                raise ValueError(f"Invalid {alias} list") from None
+                        elif alias == "OWNER_ID":
+                            values[field] = [text]
+                        else:
+                            # Simple comma-separated lists are accepted in
+                            # addition to the existing SUMMON_* JSON lists.
+                            values[field] = [item.strip() for item in text.split(",")]
+                    else:
+                        values[field] = value
                     break
         return values
 
@@ -127,11 +152,14 @@ class Settings(BaseSettings):
     mongo_uri: SecretStr = SecretStr("")
     mongo_database: str = Field(default="summon", pattern=r"^[A-Za-z0-9_-]{1,63}$")
     webapp_url: str = ""
-    telegram_api_id: int | None = None
+    telegram_api_id: int | None = Field(default=None, gt=0, lt=2**31)
     telegram_api_hash: SecretStr = SecretStr("")
     telegram_session_database: str = Field(
         default="summon_telegram", pattern=r"^[A-Za-z0-9_-]{1,63}$"
     )
+    artwork_backend: Literal["mongo", "imgbb"] = "mongo"
+    imgbb_key: SecretStr = SecretStr("")
+    db_channel: int | None = Field(default=None, lt=0, gt=-(2**63))
     webhooks_disabled_confirmed: bool = False
     rich_enabled: bool = True
     bot_api_rich_enabled: bool = True
@@ -148,10 +176,17 @@ class Settings(BaseSettings):
     poller_status_max_age_seconds: int = Field(default=120, ge=60, le=900)
     web_dist: str = ""
 
-    @field_validator("telegram_api_id", mode="before")
+    @field_validator("telegram_api_id", "db_channel", mode="before")
     @classmethod
-    def empty_api_id(cls, value: object) -> object:
+    def empty_optional_id(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("operator_ids")
+    @classmethod
+    def valid_operator_ids(cls, value: list[int]) -> list[int]:
+        if any(not 0 < user_id < 2**53 for user_id in value):
+            raise ValueError("Operator IDs must be positive Telegram user IDs")
+        return list(dict.fromkeys(value))
 
     @field_validator("allowed_origins")
     @classmethod
@@ -216,6 +251,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security(self) -> Settings:
+        if self.artwork_backend == "imgbb" and not self.imgbb_key.get_secret_value().strip():
+            raise ValueError("IMGBB_KEY is required when ARTWORK_BACKEND is imgbb")
         if self.environment == "production":
             if self.preview_mode:
                 raise ValueError("Preview mode is not permitted in production")

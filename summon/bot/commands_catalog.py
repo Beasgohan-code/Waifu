@@ -12,16 +12,19 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any
 
 from pydantic import ValidationError
 from pymongo.errors import PyMongoError
 from wzgram import Client, filters
+from wzgram.enums import ChatType
 from wzgram.errors import RPCError
 from wzgram.types import Message
 
 from summon.auth import TelegramUser
-from summon.bot.presentation import Card, Emoji
+from summon.bot.keyboards import operator_panel_keyboard
+from summon.bot.presentation import Card, Emoji, send_photo_card
 from summon.bot.telegram_helpers import _user, command_input
 from summon.config import Settings
 from summon.models import CharacterBasics, CharacterChanges, CharacterInput
@@ -36,6 +39,7 @@ from summon.services.artwork import (
     normalize_photo,
     validate_external_url,
 )
+from summon.services.imgbb import ImageHostError, upload_imgbb
 
 logger = logging.getLogger(__name__)
 _CHARACTER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -49,6 +53,18 @@ class NewCharacter:
     category: str
     rarity: Rarity
     url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedArtwork:
+    url: str
+    stored_photo: Artwork | None = None
+    channel_photo: Artwork | None = None
+    external_hosted: bool = False
+
+
+class ImageHostAlreadyAttempted(Exception):
+    """Do not replay a command whose external upload may already exist."""
 
 
 def _event_id(bot_id: int, chat_id: int, message_id: int) -> str:
@@ -147,6 +163,7 @@ def _valid_private_message(message: Message, user: TelegramUser) -> bool:
 
 def register_catalog_commands(app: Client, store: Any, settings: Settings, respond: Any) -> None:
     photo_slots = asyncio.Semaphore(2)
+    host_slots = asyncio.Semaphore(2)
 
     async def authorize(message: Message) -> TelegramUser | None:
         user = _user(message)
@@ -189,14 +206,100 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             return None
         return user
 
-    async def artwork_for(message: Message, url: str | None) -> tuple[str, Artwork | None]:
+    @app.on_message(filters.incoming & filters.command(["owner", "panel"]))
+    async def operator_panel(_client: Client, message: Message) -> None:
+        if not await authorize(message):
+            return
+        configured = bool(settings.webapp_url)
+        await respond(
+            message,
+            Card(
+                "Operator panel",
+                (
+                    "Open the Mini App and select Catalogue admin. Telegram sign-in and "
+                    "server-side operator checks are required."
+                    if configured
+                    else "Set WEBAPP_URL to open the Mini App, or use the private catalog commands."
+                ),
+                emoji=Emoji.ADMIN_SHIELD,
+            ),
+            markup=(
+                operator_panel_keyboard(settings.webapp_url, premium=settings.premium_emoji_enabled)
+                if configured
+                else None
+            ),
+        )
+
+    @app.on_message(filters.incoming & filters.command(["sudolist"]))
+    async def operator_list(_client: Client, message: Message) -> None:
+        if not await authorize(message):
+            return
+        operators = settings.operator_ids
+        await respond(
+            message,
+            Card(
+                "Configured operators",
+                "Read-only server configuration; permissions cannot be changed in chat. "
+                f"Showing {min(len(operators), 20)} of {len(operators)}.",
+                emoji=Emoji.ADMIN_SHIELD,
+                fields=tuple(
+                    (f"Operator {i}", str(uid)) for i, uid in enumerate(operators[:20], 1)
+                ),
+            ),
+        )
+
+    async def artwork_for(message: Message, url: str | None, event_id: str) -> PreparedArtwork:
         photo_message = _photo_message(message)
         if bool(photo_message) == bool(url):
             raise InvalidArtwork("Choose either one Telegram photo or one HTTPS URL")
-        if photo_message:
-            artwork = await _read_photo(app, photo_message, photo_slots)
-            return artwork.path, artwork
-        return validate_external_url(url or ""), None
+        if not photo_message:
+            return PreparedArtwork(validate_external_url(url or ""))
+        artwork = await _read_photo(app, photo_message, photo_slots)
+        if settings.artwork_backend == "mongo":
+            return PreparedArtwork(artwork.path, stored_photo=artwork, channel_photo=artwork)
+        # An external provider has no transactional or idempotency API. A durable,
+        # majority-acknowledged claim prevents replay for seven days; the catalog
+        # audit also blocks successfully completed commands beyond that window.
+        if await store.catalog.catalog_event_exists(event_id):
+            raise ImageHostAlreadyAttempted
+        if not await store.limiter.claim_once(f"imgbb:{event_id}", seconds=7 * 86400):
+            raise ImageHostAlreadyAttempted
+        try:
+            async with asyncio.timeout(40):
+                async with host_slots:
+                    hosted_url = await upload_imgbb(artwork, settings.imgbb_key)
+        except TimeoutError:
+            raise ImageHostError("Image host result is unconfirmed") from None
+        return PreparedArtwork(hosted_url, channel_photo=artwork, external_hosted=True)
+
+    async def archive_photo(artwork: Artwork | None, character_id: str) -> bool:
+        if settings.db_channel is None or artwork is None:
+            return True
+        try:
+            async with asyncio.timeout(30):
+                channel = await app.get_chat(settings.db_channel)
+                if channel.type != ChatType.CHANNEL:
+                    logger.warning("Configured artwork archive is not a Telegram channel")
+                    return False
+                photo = BytesIO(artwork.content)
+                photo.name = "summon-artwork.jpg"
+                sent = await send_photo_card(
+                    app,
+                    settings.db_channel,
+                    photo,
+                    Card(
+                        "Catalog artwork archived",
+                        "A public catalog photo was saved by an operator.",
+                        emoji=Emoji.OPEN_COLLECTION,
+                        fields=(("ID", character_id),),
+                    ),
+                    premium=settings.premium_emoji_enabled,
+                )
+                return sent is not None
+        except (RPCError, OSError, TimeoutError) as exc:
+            # A timeout may have posted the copy. Never retry an ambiguous send.
+            logger.warning("Catalog archive delivery unconfirmed (%s)", type(exc).__name__)
+            return False
 
     @app.on_message(filters.incoming & filters.command(["upload", "addchar"]))
     async def create_character(_client: Client, message: Message) -> None:
@@ -212,6 +315,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             return
         command = command_input(message)
         event_id = _event_id(identity.id, message.chat.id, message.id)
+        prepared: PreparedArtwork | None = None
         try:
             parsed = _new_character(command.command, command.args or "", event_id)
             # Reject malformed metadata before consuming Telegram bandwidth or a
@@ -222,11 +326,39 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 category=parsed.category,
                 rarity=parsed.rarity,
             )
-            image_url, image = await artwork_for(message, parsed.url)
-            data = CharacterInput(**basics.model_dump(), image_url=image_url)
+            if (
+                settings.artwork_backend == "imgbb"
+                and _photo_message(message) is not None
+                and not parsed.url
+                and await store.catalog.character_exists(basics.id)
+            ):
+                raise CatalogConflict
+            prepared = await artwork_for(message, parsed.url, event_id)
+            data = CharacterInput(**basics.model_dump(), image_url=prepared.url)
             await store.catalog.create_character(
-                data, actor_id=user.id, event_id=event_id, artwork=image
+                data, actor_id=user.id, event_id=event_id, artwork=prepared.stored_photo
             )
+        except ImageHostAlreadyAttempted:
+            await respond(
+                message,
+                Card(
+                    "Upload already attempted",
+                    "Check the catalog and ImgBB before sending a new command.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        except ImageHostError:
+            await respond(
+                message,
+                Card(
+                    "Image host unconfirmed",
+                    "The catalog was not changed. A public ImgBB upload may exist; "
+                    "check ImgBB before trying again.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
         except (ValueError, ValidationError):
             await respond(
                 message,
@@ -245,7 +377,12 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 message,
                 Card(
                     "Already exists",
-                    "This ID exists or the command was already processed.",
+                    "This ID exists or the command was already processed."
+                    + (
+                        " An ImgBB image may already exist; check it before retrying."
+                        if prepared and prepared.external_hosted
+                        else ""
+                    ),
                     emoji=Emoji.WARNING,
                 ),
             )
@@ -256,16 +393,29 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 message,
                 Card(
                     "Result unconfirmed",
-                    "Check the catalog before sending another command.",
+                    "Check the catalog before sending another command."
+                    + (
+                        " The ImgBB image may also exist."
+                        if prepared and prepared.external_hosted
+                        else ""
+                    ),
                     emoji=Emoji.WARNING,
                 ),
             )
             return
+        if prepared is None:
+            raise RuntimeError("Catalog artwork was not prepared")
+        archived = await archive_photo(prepared.channel_photo, data.id)
         await respond(
             message,
             Card(
                 "Character added",
-                "Artwork is public. Ownership was not changed.",
+                "Artwork is public. Ownership was not changed."
+                + (
+                    " Channel copy unconfirmed; check the channel before reposting."
+                    if not archived
+                    else ""
+                ),
                 emoji=Emoji.DONE,
                 fields=(("ID", data.id), ("Rarity", rarity_label(data.rarity))),
             ),
@@ -285,6 +435,8 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             return
         args = command_input(message).args or ""
         parts = args.split(maxsplit=2)
+        event_id = _event_id(identity.id, message.chat.id, message.id)
+        prepared: PreparedArtwork | None = None
         try:
             if (
                 len(args) > _MAX_ARGUMENTS
@@ -299,9 +451,16 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             )
             if field not in {"name", "category", "rarity", "image_url", "description"}:
                 raise ValueError("Invalid metadata field")
-            image = None
             if field == "image_url":
-                value, image = await artwork_for(message, value or None)
+                if (
+                    settings.artwork_backend == "imgbb"
+                    and _photo_message(message) is not None
+                    and not value
+                    and not await store.catalog.character_exists(character_id)
+                ):
+                    raise CatalogNotFound
+                prepared = await artwork_for(message, value or None, event_id)
+                value = prepared.url
             elif not value or _photo_message(message) is not None:
                 raise ValueError("Metadata value required")
             elif field == "rarity":
@@ -310,10 +469,34 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                     raise ValueError("Invalid rarity")
                 value = parsed
             changes = CharacterChanges.model_validate({field: value})
-            event_id = _event_id(identity.id, message.chat.id, message.id)
             await store.catalog.update_character(
-                character_id, changes, actor_id=user.id, event_id=event_id, artwork=image
+                character_id,
+                changes,
+                actor_id=user.id,
+                event_id=event_id,
+                artwork=prepared.stored_photo if prepared else None,
             )
+        except ImageHostAlreadyAttempted:
+            await respond(
+                message,
+                Card(
+                    "Upload already attempted",
+                    "Check the catalog and ImgBB before sending a new command.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        except ImageHostError:
+            await respond(
+                message,
+                Card(
+                    "Image host unconfirmed",
+                    "The catalog was not changed. A public ImgBB upload may exist; "
+                    "check ImgBB before trying again.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
         except (ValueError, ValidationError):
             await respond(
                 message,
@@ -327,13 +510,32 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             return
         except CatalogNotFound:
             await respond(
-                message, Card("Not found", "That character ID does not exist.", emoji=Emoji.SEARCH)
+                message,
+                Card(
+                    "Not found",
+                    "That character ID does not exist."
+                    + (
+                        " An ImgBB image may already exist; check it before retrying."
+                        if prepared and prepared.external_hosted
+                        else ""
+                    ),
+                    emoji=Emoji.SEARCH,
+                ),
             )
             return
         except CatalogConflict:
             await respond(
                 message,
-                Card("Already processed", "This command was already applied.", emoji=Emoji.WARNING),
+                Card(
+                    "Already processed",
+                    "This command was already applied."
+                    + (
+                        " An ImgBB image may already exist; check it before retrying."
+                        if prepared and prepared.external_hosted
+                        else ""
+                    ),
+                    emoji=Emoji.WARNING,
+                ),
             )
             return
         except (PyMongoError, RPCError, ConnectionError, OSError, TimeoutError) as exc:
@@ -342,16 +544,27 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 message,
                 Card(
                     "Result unconfirmed",
-                    "Check the catalog before sending another command.",
+                    "Check the catalog before sending another command."
+                    + (
+                        " The ImgBB image may also exist."
+                        if prepared and prepared.external_hosted
+                        else ""
+                    ),
                     emoji=Emoji.WARNING,
                 ),
             )
             return
+        archived = await archive_photo(prepared.channel_photo if prepared else None, character_id)
         await respond(
             message,
             Card(
                 "Character updated",
-                "Ownership and character ID were not changed.",
+                "Ownership and character ID were not changed."
+                + (
+                    " Channel copy unconfirmed; check the channel before reposting."
+                    if not archived
+                    else ""
+                ),
                 emoji=Emoji.DONE,
                 fields=(("ID", character_id), ("Updated", field)),
             ),

@@ -97,6 +97,14 @@ class CatalogRepository:
                 session=session,
             )
 
+    async def catalog_event_exists(self, event_id: str) -> bool:
+        """Avoid repeating optional external uploads for an already-audited command."""
+        return bool(await self.db.activity.find_one({"_id": event_id}, {"_id": 1}))
+
+    async def character_exists(self, character_id: str) -> bool:
+        """Advisory preflight only; the write transaction remains authoritative."""
+        return bool(await self.db.characters.find_one({"_id": character_id}, {"_id": 1}))
+
     async def create_character(
         self,
         data: CharacterInput,

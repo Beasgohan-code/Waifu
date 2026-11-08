@@ -1471,6 +1471,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "itsdangerous" },
     { name = "pillow" },
     { name = "pydantic-settings" },
@@ -1482,7 +1483,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "mypy" },
     { name = "pip-audit" },
     { name = "pytest" },
@@ -1493,7 +1493,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = "==0.162.0" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = "==0.28.1" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "itsdangerous", specifier = "==2.2.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==2.4.1" },
     { name = "pillow", specifier = "==13.0.0" },

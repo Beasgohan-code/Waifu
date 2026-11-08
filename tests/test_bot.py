@@ -169,7 +169,7 @@ async def test_menu_registration_handles_native_rejection_without_repeated_write
 async def test_collection_passes_ephemeral_trigger_to_private_response():
     store = make_store(
         catalog=SimpleNamespace(inventory=AsyncMock(return_value={"items": [], "total": 0})),
-        users=SimpleNamespace(touch=AsyncMock()),
+        users=SimpleNamespace(touch=AsyncMock(), collection_mode=AsyncMock(return_value="recent")),
     )
     app = await registered(store)
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as send:

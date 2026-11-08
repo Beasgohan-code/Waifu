@@ -41,6 +41,9 @@ async def setup_spawn(image_url, *, premium=False):
             mark_delivery_failed=AsyncMock(),
         ),
         catalog=SimpleNamespace(choose=AsyncMock(return_value=character)),
+        limiter=SimpleNamespace(
+            allow=AsyncMock(return_value=True), claim_once=AsyncMock(return_value=True)
+        ),
         trades=object(),
         gifts=object(),
     )
@@ -63,7 +66,7 @@ async def setup_spawn(image_url, *, premium=False):
     return app, store
 
 
-async def dispatch_message(app):
+async def dispatch_message(app, text="Hello everyone"):
     """Use the native raw-update dispatcher and wait until all handler groups finish."""
     finished = asyncio.Event()
 
@@ -88,7 +91,7 @@ async def dispatch_message(app):
         peer_id=raw.types.PeerChat(chat_id=100),
         from_id=raw.types.PeerUser(user_id=42),
         date=int(datetime.now(UTC).timestamp()),
-        message="Hello everyone",
+        message=text,
         entities=[],
         restriction_reason=[],
     )
@@ -231,3 +234,154 @@ async def test_spawn_photo_contains_supplied_series_and_rarity_icons():
     assert Emoji.SERIES_TAG.value[1] in caption
     assert Emoji.RARITY_STAR.value[1] in caption
     assert "Sky" in caption and "Rare" in caption
+
+
+def group_admin():
+    return SimpleNamespace(status="administrator", privileges=SimpleNamespace(can_change_info=True))
+
+
+async def test_manual_spawn_uses_atomic_reservation_without_counting_a_message():
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    with (
+        patch.object(app, "send_photo", new_callable=AsyncMock) as photo,
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+    ):
+        await dispatch_message(app, "/spawn")
+    app.get_chat_member.assert_awaited_once_with(-100, 42)
+    store.catalog.choose.assert_awaited_once()
+    store.collection.reserve_spawn.assert_awaited_once()
+    store.collection.record_message.assert_not_awaited()
+    photo.assert_awaited_once()
+    private.assert_not_awaited()
+
+
+async def test_manual_spawn_denies_non_admin_before_any_reservation():
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=SimpleNamespace(status="member"))
+    with (
+        patch.object(app, "send_photo", new_callable=AsyncMock) as photo,
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+    ):
+        await dispatch_message(app, "/spawn")
+    store.limiter.allow.assert_not_awaited()
+    store.catalog.choose.assert_not_awaited()
+    store.collection.reserve_spawn.assert_not_awaited()
+    photo.assert_not_awaited()
+    assert private.await_args.args[3].title == "Admin access required"
+
+
+async def test_manual_spawn_respects_not_ready_and_rate_limit():
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    store.collection.reserve_spawn.return_value = None
+    with (
+        patch.object(app, "send_photo", new_callable=AsyncMock) as photo,
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+    ):
+        await dispatch_message(app, "/spawn")
+    store.collection.reserve_spawn.assert_awaited_once()
+    store.collection.record_message.assert_not_awaited()
+    photo.assert_not_awaited()
+    assert private.await_args.args[3].title == "No summon is ready"
+
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    store.limiter.allow.return_value = False
+    with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private:
+        await dispatch_message(app, "/spawn")
+    store.catalog.choose.assert_not_awaited()
+    store.collection.reserve_spawn.assert_not_awaited()
+    assert private.await_args.args[3].title == "Please slow down"
+
+
+async def test_manual_spawn_ambiguous_send_is_not_retried_or_released():
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    with (
+        patch.object(
+            app, "send_photo", new_callable=AsyncMock, side_effect=TimeoutError()
+        ) as photo,
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+    ):
+        await dispatch_message(app, "/spawn")
+    photo.assert_awaited_once()
+    store.collection.mark_delivery_failed.assert_not_awaited()
+    assert private.await_args.args[3].title == "Summon unconfirmed"
+
+
+async def test_manual_spawn_definite_photo_rejection_cancels_reservation():
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    with (
+        patch.object(
+            app, "send_photo", new_callable=AsyncMock, side_effect=BadRequest("IMAGE")
+        ) as photo,
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+    ):
+        await dispatch_message(app, "/spawn")
+    photo.assert_awaited_once()
+    store.collection.mark_delivery_failed.assert_awaited_once_with(-100, "spawn-one")
+    assert private.await_args.args[3].title == "Artwork unavailable"
+
+
+async def test_manual_spawn_rejects_ephemeral_command_before_permission_or_public_send():
+    from wzgram.enums import ChatType
+
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    await asyncio.sleep(0)
+    handler = next(
+        handler
+        for group in app.dispatcher.groups.values()
+        for handler in group
+        if getattr(handler.callback, "__name__", "") == "manual_spawn"
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type=ChatType.GROUP),
+        from_user=User(id=42, is_bot=False, first_name="Member"),
+        sender_chat=None,
+        ephemeral_message_id=12,
+        message_thread_id=None,
+        id=1,
+    )
+    with (
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+        patch.object(app, "send_photo", new_callable=AsyncMock) as photo,
+    ):
+        await handler.callback(app, message)
+    app.get_chat_member.assert_not_awaited()
+    store.collection.reserve_spawn.assert_not_awaited()
+    photo.assert_not_awaited()
+    assert private.await_args.args[3].title == "Use a normal group message"
+
+
+async def test_manual_spawn_replay_claim_blocks_second_public_reservation():
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    store.limiter.claim_once.return_value = False
+    with (
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+        patch.object(app, "send_photo", new_callable=AsyncMock) as photo,
+    ):
+        await dispatch_message(app, "/spawn")
+    store.limiter.claim_once.assert_awaited_once_with(
+        "group:-100:manual-spawn:message:9", seconds=7 * 86400
+    )
+    store.catalog.choose.assert_not_awaited()
+    store.collection.reserve_spawn.assert_not_awaited()
+    photo.assert_not_awaited()
+    assert private.await_args.args[3].title == "Already processed"
+
+
+async def test_manual_spawn_none_result_is_unconfirmed_and_not_cancelled():
+    app, store = await setup_spawn("https://example.com/aiko.webp")
+    app.get_chat_member = AsyncMock(return_value=group_admin())
+    with (
+        patch.object(app, "send_photo", new_callable=AsyncMock, return_value=None) as photo,
+        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
+    ):
+        await dispatch_message(app, "/spawn")
+    photo.assert_awaited_once()
+    store.collection.mark_delivery_failed.assert_not_awaited()
+    assert private.await_args.args[3].title == "Summon unconfirmed"

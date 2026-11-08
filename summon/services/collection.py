@@ -25,6 +25,10 @@ class CollectionService:
             return None
         if group["message_count"] < group["settings"]["spawn_every"]:
             return None
+        return await self.try_spawn(group_id, now)
+
+    async def try_spawn(self, group_id: int, now: datetime) -> dict[str, Any] | None:
+        """Reserve only if MongoDB's atomic cadence, cooldown and active-spawn gates pass."""
         character = await self.catalog.choose()
         if not character:
             return None

@@ -13,6 +13,7 @@ from summon.rarities import Rarity
 from summon.services.artwork import validate_external_url
 
 InventorySort = Literal["recent", "copies"]
+CollectionMode = Literal["recent", "copies", "favorites"]
 
 
 def normalize_name(value: str) -> str:

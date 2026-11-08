@@ -95,3 +95,36 @@ def test_preview_exposes_server_status_but_stays_read_only():
         assert status["state"] == "available"
         assert datetime.fromisoformat(status["server_time"]).utcoffset() == timedelta(0)
         assert client.post("/api/daily", headers={"X-Summon-Request": "1"}).status_code == 403
+
+
+@pytest.mark.parametrize(
+    "stored,expected",
+    [
+        (None, "recent"),
+        ({"collection_mode": "copies"}, "copies"),
+        ({"collection_mode": "favorites"}, "favorites"),
+        ({"collection_mode": ["corrupt"]}, "recent"),
+    ],
+)
+async def test_collection_mode_defaults_safely_for_new_or_bad_rows(stored, expected):
+    users = SimpleNamespace(find_one=AsyncMock(return_value=stored))
+    repo = UserRepository(object(), SimpleNamespace(users=users))
+    assert await repo.collection_mode(42) == expected
+    users.find_one.assert_awaited_once_with({"_id": 42}, {"collection_mode": 1})
+
+
+async def test_collection_mode_save_updates_only_the_authenticated_user():
+    users = SimpleNamespace(update_one=AsyncMock())
+    repo = UserRepository(object(), SimpleNamespace(users=users))
+    actor = TelegramUser(id=42, first_name="Test")
+    now = datetime(2026, 1, 2, tzinfo=UTC)
+    await repo.set_collection_mode(actor, "favorites", now)
+    assert users.update_one.await_count == 2
+    assert users.update_one.await_args.args == (
+        {"_id": 42},
+        {"$set": {"collection_mode": "favorites"}},
+    )
+    assert users.update_one.await_args_list[0].args[0] == {"_id": 42}
+    with pytest.raises(ValueError):
+        await repo.set_collection_mode(actor, "unsafe", now)
+    assert users.update_one.await_count == 2

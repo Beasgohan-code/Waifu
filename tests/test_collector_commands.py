@@ -23,7 +23,9 @@ def make_store():
         gifts=object(),
         groups=SimpleNamespace(db=object()),
         users=SimpleNamespace(
-            progression=AsyncMock(return_value={"achievements": [], "daily": []})
+            progression=AsyncMock(return_value={"achievements": [], "daily": []}),
+            collection_mode=AsyncMock(return_value="recent"),
+            set_collection_mode=AsyncMock(),
         ),
         limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
     )
@@ -161,3 +163,164 @@ async def test_achievements_reuse_progression_with_utc_server_time():
     actor, timestamp = store.users.progression.await_args.args
     assert actor == 42 and timestamp.tzinfo == UTC
     assert card.fields == (("First encounter", "1 / 1 · Complete"),)
+
+
+async def test_hmode_shows_private_current_mode_without_writing():
+    store = make_store()
+    store.users.collection_mode.return_value = "copies"
+    card = await invoke(store, "collection_display_mode")
+    assert card.fields == (("Current mode", "copies"),)
+    store.users.collection_mode.assert_awaited_once_with(42)
+    store.users.set_collection_mode.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "argument,expected", [("recent", "recent"), ("copies", "copies"), ("fav", "favorites")]
+)
+async def test_hmode_saves_only_the_telegram_actors_preference(argument, expected):
+    store = make_store()
+    card = await invoke(store, "collection_display_mode", args=argument)
+    actor, mode, now = store.users.set_collection_mode.await_args.args
+    assert actor.id == 42 and mode == expected and now.tzinfo == UTC
+    assert card.fields == (("Current mode", expected),)
+
+
+@pytest.mark.parametrize("argument", ["other", "rarity", "recent extra"])
+async def test_hmode_invalid_values_never_touch_storage(argument):
+    store = make_store()
+    card = await invoke(store, "collection_display_mode", args=argument)
+    assert "/hmode" in card.body
+    store.users.collection_mode.assert_not_awaited()
+    store.users.set_collection_mode.assert_not_awaited()
+    store.limiter.allow.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "mode,expected_options",
+    [("recent", {}), ("copies", {"sort": "copies"}), ("favorites", {"favorite": True})],
+)
+async def test_collection_uses_actor_scoped_display_preference(mode, expected_options):
+    store = make_store()
+    store.users.collection_mode.return_value = mode
+    await invoke(store, "show_collection")
+    store.users.collection_mode.assert_awaited_once_with(42)
+    store.catalog.inventory.assert_awaited_once_with(42, limit=12, **expected_options)
+
+
+async def test_hmode_database_error_is_safe_and_not_retried():
+    store = make_store()
+    store.users.set_collection_mode.side_effect = AutoReconnect("PRIVATE_MONGO_DETAIL")
+    card = await invoke(store, "collection_display_mode", args="copies")
+    assert store.users.set_collection_mode.await_count == 1
+    assert "check /hmode" in card.body.lower()
+    assert "PRIVATE_MONGO_DETAIL" not in card.body
+
+
+async def test_hmode_rate_limit_prevents_storage_access():
+    store = make_store()
+    store.limiter.allow.return_value = False
+    await invoke(store, "collection_display_mode", args="copies")
+    store.users.set_collection_mode.assert_not_awaited()
+    store.users.collection_mode.assert_not_awaited()
+
+
+async def test_private_hmode_keyboard_has_native_emoji_and_actor_bound_actions():
+    store = make_store()
+    app = Client("mode-test", api_id=123, api_hash="test", bot_token="123:fake", in_memory=True)
+    register_handlers(app, store, Settings(_env_file=None, premium_emoji_enabled=True))
+    await asyncio.sleep(0)
+    callback = next(
+        handler.callback
+        for handler in app.dispatcher.groups[0]
+        if handler.callback.__name__ == "collection_display_mode"
+    )
+    message = group_message()
+    message.chat = SimpleNamespace(id=42, type="private")
+    message.text = "/hmode"
+    message.command = ["hmode"]
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await callback(app, message)
+    markup = send.await_args.kwargs["reply_markup"]
+    buttons = markup.inline_keyboard[0]
+    assert [button.callback_data for button in buttons] == [
+        "hmode:42:recent",
+        "hmode:42:copies",
+        "hmode:42:favorites",
+    ]
+    assert all(button.icon_custom_emoji_id for button in buttons)
+    assert "✓" in buttons[0].text
+
+
+async def mode_callback(store, data, *, user_id=42, is_bot=False, edit=None):
+    app = Client("mode-test", api_id=123, api_hash="test", bot_token="123:fake", in_memory=True)
+    register_handlers(app, store, Settings(_env_file=None, premium_emoji_enabled=True))
+    await asyncio.sleep(0)
+    callback = next(
+        handler.callback
+        for handler in app.dispatcher.groups[0]
+        if handler.callback.__name__ == "collection_mode_callback"
+    )
+    query = SimpleNamespace(
+        data=data,
+        from_user=SimpleNamespace(
+            id=user_id, first_name="Test", last_name=None, username=None, is_bot=is_bot
+        ),
+        message=SimpleNamespace(edit_reply_markup=edit or AsyncMock()),
+        answer=AsyncMock(),
+    )
+    await callback(app, query)
+    return query
+
+
+async def test_hmode_callback_saves_actor_mode_and_updates_keyboard():
+    store = make_store()
+    query = await mode_callback(store, b"hmode:42:copies")
+    actor, mode, now = store.users.set_collection_mode.await_args.args
+    assert actor.id == 42 and mode == "copies" and now.tzinfo == UTC
+    assert query.answer.await_count == 1
+    assert "<tg-emoji" not in query.answer.await_args.args[0]
+    buttons = query.message.edit_reply_markup.await_args.kwargs["reply_markup"].inline_keyboard[0]
+    assert "✓" in buttons[1].text
+
+
+@pytest.mark.parametrize(
+    "data,user_id",
+    [
+        ("hmode:43:copies", 42),
+        ("hmode:42:invalid", 42),
+        ("hmode:x:copies", 42),
+        ("hmode:42:copies:extra", 42),
+    ],
+)
+async def test_hmode_callback_rejects_forged_or_invalid_actions(data, user_id):
+    store = make_store()
+    query = await mode_callback(store, data, user_id=user_id)
+    store.limiter.allow.assert_not_awaited()
+    store.users.set_collection_mode.assert_not_awaited()
+    query.message.edit_reply_markup.assert_not_awaited()
+    assert query.answer.await_args.kwargs["show_alert"] is True
+
+
+async def test_hmode_callback_falls_back_after_definite_emoji_rejection():
+    from wzgram.errors import BadRequest
+
+    store = make_store()
+    edit = AsyncMock(side_effect=[BadRequest("CUSTOM_EMOJI_INVALID"), True])
+    await mode_callback(store, "hmode:42:favorites", edit=edit)
+    assert store.users.set_collection_mode.await_count == 1
+    assert edit.await_count == 2
+    fallback = edit.await_args.kwargs["reply_markup"].inline_keyboard[0]
+    assert all(button.icon_custom_emoji_id is None for button in fallback)
+    assert [button.callback_data for button in fallback] == [
+        "hmode:42:recent",
+        "hmode:42:copies",
+        "hmode:42:favorites",
+    ]
+
+
+async def test_hmode_callback_does_not_retry_ambiguous_telegram_edit():
+    store = make_store()
+    edit = AsyncMock(side_effect=TimeoutError("unknown result"))
+    await mode_callback(store, "hmode:42:recent", edit=edit)
+    assert store.users.set_collection_mode.await_count == 1
+    assert edit.await_count == 1

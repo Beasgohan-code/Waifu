@@ -876,9 +876,13 @@ async def test_catalog_artwork_transactions_preserve_inventory_and_reject_replay
         rarity="rare",
         image_url=image.path,
     )
+    assert not await repository.character_exists(character.id)
+    assert not await repository.catalog_event_exists("synthetic-create")
     await repository.create_character(
         character, actor_id=42, event_id="synthetic-create", artwork=image
     )
+    assert await repository.character_exists(character.id)
+    assert await repository.catalog_event_exists("synthetic-create")
     assert (await db.characters.find_one({"_id": character.id}))["image_url"] == image.path
     assert await repository.artwork(image.digest) == image.content
     assert (await db.activity.find_one({"_id": "synthetic-create"}))["user_id"] == 42
@@ -946,3 +950,73 @@ async def test_native_ingress_lease_serializes_competitors_on_replica_set(isolat
     await loser.acquire()
     assert loser.valid()
     await loser.release()
+
+
+async def test_hmode_is_actor_scoped_and_preserves_existing_points(isolated_database):
+    client, db = isolated_database
+    repository = UserRepository(client, db)
+    actor = TelegramUser(id=987, first_name="Collector")
+    now = datetime.now(UTC)
+    await repository.touch(actor, now)
+    await db.users.update_one({"_id": actor.id}, {"$set": {"points": 120, "xp": 45}})
+    assert await repository.collection_mode(actor.id) == "recent"
+    await repository.set_collection_mode(actor, "favorites", now)
+    assert await repository.collection_mode(actor.id) == "favorites"
+    assert await repository.collection_mode(actor.id + 1) == "recent"
+    row = await db.users.find_one({"_id": actor.id})
+    assert row["points"] == 120 and row["xp"] == 45
+    assert await db.users.find_one({"_id": actor.id + 1}) is None
+
+
+@pytest.mark.parametrize("blocked_by", ["disabled", "threshold", "cooldown", "active"])
+async def test_manual_spawn_uses_same_atomic_group_gates(isolated_database, blocked_by):
+    client, db = isolated_database
+    now = datetime.now(UTC).replace(microsecond=0)
+    settings = GroupSettings(spawn_enabled=True).model_dump()
+    group = {
+        "_id": -400,
+        "title": "Isolated group",
+        "settings": settings,
+        "message_count": settings["spawn_every"],
+        "next_spawn_at": now,
+        "active_spawn": None,
+    }
+    if blocked_by == "disabled":
+        settings["spawn_enabled"] = False
+    elif blocked_by == "threshold":
+        group["message_count"] -= 1
+    elif blocked_by == "cooldown":
+        group["next_spawn_at"] = now + timedelta(minutes=1)
+    else:
+        group["active_spawn"] = {"id": "existing", "expires_at": now + timedelta(minutes=1)}
+    await db.groups.insert_one(group)
+    character = await db.characters.find_one({"_id": "aiko"})
+    assert character is not None
+    repo = CollectionRepository(client, db)
+    assert await repo.reserve_spawn(-400, character, now) is None
+    stored = await db.groups.find_one({"_id": -400})
+    assert stored["message_count"] == group["message_count"]
+    assert stored["active_spawn"] == group["active_spawn"]
+    assert await db.spawns.count_documents({"group_id": -400}) == 0
+
+
+async def test_concurrent_manual_spawn_reservations_only_create_one(isolated_database):
+    client, db = isolated_database
+    now = datetime.now(UTC)
+    settings = GroupSettings(spawn_enabled=True).model_dump()
+    await db.groups.insert_one(
+        {
+            "_id": -400,
+            "title": "Isolated group",
+            "settings": settings,
+            "message_count": settings["spawn_every"],
+            "next_spawn_at": now,
+            "active_spawn": None,
+        }
+    )
+    character = await db.characters.find_one({"_id": "aiko"})
+    assert character is not None
+    repo = CollectionRepository(client, db)
+    results = await asyncio.gather(*(repo.reserve_spawn(-400, character, now) for _ in range(5)))
+    assert sum(result is not None for result in results) == 1
+    assert await db.spawns.count_documents({"group_id": -400, "status": "active"}) == 1

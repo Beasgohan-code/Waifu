@@ -106,3 +106,16 @@ async def test_guess_cooldown_is_enforced_before_claim():
         await CollectionService(repo, FakeCatalog()).guess(
             -100, {"id": 1, "first_name": "A"}, "Mika", datetime.now(UTC)
         )
+
+
+@pytest.mark.asyncio
+async def test_manual_try_spawn_does_not_count_activity_and_only_one_can_reserve():
+    repo = FakeCollection()
+    service = CollectionService(repo, FakeCatalog())
+    now = datetime.now(UTC)
+    assert await service.try_spawn(-100, now) is None
+    assert repo.group["message_count"] == 0
+    repo.group["message_count"] = 2
+    results = await asyncio.gather(*(service.try_spawn(-100, now) for _ in range(5)))
+    assert sum(result is not None for result in results) == 1
+    assert repo.group["message_count"] == 0

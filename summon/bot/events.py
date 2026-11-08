@@ -20,6 +20,7 @@ from summon.config import Settings
 from summon.models import GroupSettings
 from summon.rarities import rarity_label
 from summon.services.collection import CollectionService
+from summon.services.moderation import PermissionDenied, require_group_admin
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,47 @@ def register_group_events(
     respond: Any,
     send_photo_card: Any,
 ) -> None:
+    async def deliver_spawn(message: Message, event: dict[str, Any]) -> bool | None:
+        character = event["character"]
+        card = Card(
+            "A character appears",
+            "A new companion is nearby. Guess their name with /summon name before they disappear!",
+            emoji=Emoji.SPARK,
+            fields=(
+                ("Series", character["category"]),
+                ("Rarity", rarity_label(character["rarity"])),
+            ),
+            field_icons=(Emoji.SERIES_TAG, Emoji.RARITY_STAR),
+        )
+        image = character.get("image_url", "")
+        if image.startswith(("/art/", "/api/artwork/")):
+            image = urljoin(settings.webapp_url, image) if settings.webapp_url else ""
+        if not image:
+            await store.collection.mark_delivery_failed(message.chat.id, event["spawn"]["id"])
+            logger.warning("Spawn has no public artwork URL; spawn marked failed")
+            return False
+        try:
+            sent = await send_photo_card(
+                app,
+                message.chat.id,
+                image,
+                card,
+                premium=settings.premium_emoji_enabled,
+                message_thread_id=message.message_thread_id,
+            )
+        except (BadRequest, Forbidden):
+            # A text-only challenge is not guessable. Only a definite rejection
+            # cancels the reservation; an ambiguous failure may have delivered.
+            await store.collection.mark_delivery_failed(message.chat.id, event["spawn"]["id"])
+            logger.warning("Spawn artwork rejected; spawn marked failed")
+            return False
+        if sent is None:
+            # Wzgram documents None when an upload was stopped. Treat the
+            # public result as unknown rather than claiming success or retrying.
+            logger.warning("Spawn artwork delivery was not confirmed")
+            return None
+        return True
+
     @app.on_message(filters.incoming & filters.new_chat_members)
     async def welcome(_client: Client, message: Message) -> None:
         if not _group(message):
@@ -72,6 +114,129 @@ def register_group_events(
             message,
             Card(f"Goodbye, {departed.first_name}", config.goodbye_text, emoji=Emoji.MOON),
         )
+
+    @app.on_message(filters.incoming & filters.command(["spawn"]))
+    async def manual_spawn(_client: Client, message: Message) -> None:
+        user = _user(message)
+        if not user:
+            return
+        if not _group(message):
+            await respond(message, Card("Group summons", "Use /spawn in a group you administer."))
+            return
+        if message.ephemeral_message_id is not None:
+            await respond(
+                message,
+                Card("Use a normal group message", "A summon is posted publicly to the group."),
+                private=True,
+            )
+            return
+        if (
+            message.id <= 0
+            or message.forward_origin
+            or message.automatic_forward
+            or message.via_bot
+            or message.sender_business_bot
+        ):
+            return
+        try:
+            await require_group_admin(app, message.chat.id, user.id, "can_change_info")
+        except PermissionDenied:
+            await respond(
+                message,
+                Card(
+                    "Admin access required",
+                    "A current group administrator with change-info permission is required.",
+                    emoji=Emoji.ADMIN_SHIELD,
+                ),
+                private=True,
+            )
+            return
+        except (RPCError, OSError, TimeoutError):
+            await respond(
+                message,
+                Card("Cannot verify access", "Try again later.", emoji=Emoji.WARNING),
+                private=True,
+            )
+            return
+        try:
+            allowed = await store.limiter.allow(
+                f"group:{message.chat.id}:manual-spawn", limit=10, seconds=60
+            )
+            # A replayed update must not trigger another public spawn, even if
+            # fresh activity meets the cadence after an earlier one expires.
+            claimed = allowed and await store.limiter.claim_once(
+                f"group:{message.chat.id}:manual-spawn:message:{message.id}", seconds=7 * 86400
+            )
+            # Never increment message counts or bypass the existing transaction's
+            # enablement, cadence, cooldown, and active-spawn checks.
+            event = (
+                await collection.try_spawn(message.chat.id, datetime.now(UTC)) if claimed else None
+            )
+        except (PyMongoError, OSError, TimeoutError) as exc:
+            logger.warning("Manual summon reservation unconfirmed (%s)", type(exc).__name__)
+            await respond(
+                message,
+                Card(
+                    "Summon unconfirmed",
+                    "Check the group before trying again.",
+                    emoji=Emoji.WARNING,
+                ),
+                private=True,
+            )
+            return
+        if not allowed:
+            await respond(message, Card("Please slow down", "Try again shortly."), private=True)
+            return
+        if not claimed:
+            await respond(
+                message,
+                Card("Already processed", "Send a new /spawn command when the group is ready."),
+                private=True,
+            )
+            return
+        if not event:
+            await respond(
+                message,
+                Card(
+                    "No summon is ready",
+                    "Summons must be enabled and meet the activity and cooldown limits; "
+                    "an active summon or empty catalog can also prevent a new one.",
+                    emoji=Emoji.HOURGLASS,
+                ),
+                private=True,
+            )
+            return
+        try:
+            delivered = await deliver_spawn(message, event)
+        except (PyMongoError, RPCError, OSError, TimeoutError) as exc:
+            # An ambiguous send may have delivered. Do not release or resend it.
+            logger.warning("Manual summon delivery unconfirmed (%s)", type(exc).__name__)
+            await respond(
+                message,
+                Card(
+                    "Summon unconfirmed",
+                    "Check the group before trying again.",
+                    emoji=Emoji.WARNING,
+                ),
+                private=True,
+            )
+            return
+        if delivered is None:
+            await respond(
+                message,
+                Card(
+                    "Summon unconfirmed",
+                    "Check the group before trying again.",
+                    emoji=Emoji.WARNING,
+                ),
+                private=True,
+            )
+        elif not delivered:
+            await respond(
+                message,
+                Card("Artwork unavailable", "The summon was cancelled.", emoji=Emoji.WARNING),
+                private=True,
+            )
 
     @app.on_message(filters.incoming & filters.group)
     async def group_activity(_client: Client, message: Message) -> None:
@@ -127,41 +292,7 @@ def register_group_events(
         )
         if not event:
             return
-        character = event["character"]
-        card = Card(
-            "A character appears",
-            "A new companion is nearby. Guess their name with /summon name before they disappear!",
-            emoji=Emoji.SPARK,
-            fields=(
-                ("Series", character["category"]),
-                ("Rarity", rarity_label(character["rarity"])),
-            ),
-            field_icons=(Emoji.SERIES_TAG, Emoji.RARITY_STAR),
-        )
-        image = character.get("image_url", "")
-        if image.startswith(("/art/", "/api/artwork/")):
-            # Public art paths are rooted at the frontend origin even when the
-            # Mini App URL itself contains a path.
-            image = urljoin(settings.webapp_url, image) if settings.webapp_url else ""
-        if not image:
-            await store.collection.mark_delivery_failed(message.chat.id, event["spawn"]["id"])
-            logger.warning("Spawn has no public artwork URL; spawn marked failed")
-            return
-        try:
-            await send_photo_card(
-                app,
-                message.chat.id,
-                image,
-                card,
-                premium=settings.premium_emoji_enabled,
-                message_thread_id=message.message_thread_id,
-            )
-        except (BadRequest, Forbidden):
-            # A text-only challenge provides no character artwork to guess.
-            # Cancel only after a definite rejection; an ambiguous network
-            # failure may have delivered, so leave that reservation to expire.
-            await store.collection.mark_delivery_failed(message.chat.id, event["spawn"]["id"])
-            logger.warning("Spawn artwork rejected; spawn marked failed")
+        await deliver_spawn(message, event)
 
     @app.on_edited_message(filters.incoming)
     async def ignore_edited_message(_client: Client, message: Message) -> None:

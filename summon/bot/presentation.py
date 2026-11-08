@@ -13,7 +13,7 @@ import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, BinaryIO
 
 from wzgram.enums import ButtonStyle, ParseMode
 from wzgram.errors import BadRequest
@@ -279,10 +279,20 @@ async def send_card(
         return await client.send_message(**kwargs)
 
 
+async def edit_keyboard(message: Any, markup: Any, *, premium: bool) -> Any:
+    """Retry an edited keyboard only after a definite custom-emoji rejection."""
+    try:
+        return await message.edit_reply_markup(reply_markup=markup)
+    except BadRequest as exc:
+        if not premium or not _emoji_rejected(exc):
+            raise
+        return await message.edit_reply_markup(reply_markup=fallback_keyboard(markup))
+
+
 async def send_photo_card(
     client: Any,
     chat_id: int,
-    photo: str,
+    photo: str | BinaryIO,
     card: Card,
     *,
     premium: bool = True,

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from pymongo import DESCENDING
 
 from summon.auth import TelegramUser
-from summon.models import player_level
+from summon.models import CollectionMode, player_level
 from summon.repositories.base import transaction
 
 
@@ -64,6 +64,21 @@ class UserRepository:
             },
             upsert=True,
         )
+
+    async def collection_mode(self, user_id: int) -> CollectionMode:
+        row = await self.db.users.find_one({"_id": user_id}, {"collection_mode": 1})
+        value = row.get("collection_mode") if row else None
+        if isinstance(value, str) and value in {"recent", "copies", "favorites"}:
+            return cast(CollectionMode, value)
+        return "recent"
+
+    async def set_collection_mode(
+        self, user: TelegramUser, mode: CollectionMode, now: datetime
+    ) -> None:
+        if mode not in {"recent", "copies", "favorites"}:
+            raise ValueError("Unsupported collection mode")
+        await self.touch(user, now)
+        await self.db.users.update_one({"_id": user.id}, {"$set": {"collection_mode": mode}})
 
     async def profile(self, user_id: int) -> dict[str, Any]:
         doc = await self.db.users.find_one({"_id": user_id}) or {"_id": user_id}

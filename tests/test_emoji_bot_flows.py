@@ -19,6 +19,7 @@ def make_store():
         catalog=SimpleNamespace(inventory=AsyncMock(return_value={"items": [], "total": 0})),
         users=SimpleNamespace(
             touch=AsyncMock(),
+            collection_mode=AsyncMock(return_value="recent"),
             profile=AsyncMock(
                 return_value={
                     "level": 1,

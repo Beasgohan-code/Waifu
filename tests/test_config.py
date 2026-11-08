@@ -243,3 +243,106 @@ def test_bad_alias_values_are_not_exposed_in_errors(monkeypatch):
     with pytest.raises(ValueError) as error:
         Settings(_env_file=None)
     assert "FAKE_SECRET_OWNER_SENTINEL" not in str(error.value)
+
+
+def test_simple_mixed_case_names_and_multiple_operators(monkeypatch):
+    monkeypatch.setenv("Api_Id", "1234")
+    monkeypatch.setenv("API_Hash", "synthetic-hash")
+    monkeypatch.setenv("MONGODB_URL", "mongodb://example.invalid/summon")
+    monkeypatch.setenv("DB_NAME", "collection")
+    monkeypatch.setenv("TELEGRAM_SESSION_DB", "separate_sessions")
+    monkeypatch.setenv("OPERATOR_IDS", "42, 101,42")
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://app.example, https://other.example")
+    settings = Settings(_env_file=None)
+    assert settings.telegram_api_id == 1234
+    assert settings.telegram_api_hash.get_secret_value() == "synthetic-hash"
+    assert settings.mongo_uri.get_secret_value() == "mongodb://example.invalid/summon"
+    assert settings.mongo_database == "collection"
+    assert settings.telegram_session_database == "separate_sessions"
+    assert settings.operator_ids == [42, 101]
+    assert settings.allowed_origins == ["https://app.example", "https://other.example"]
+
+
+def test_simple_lists_allow_json_empty_and_single_owner(monkeypatch):
+    monkeypatch.setenv("OPERATOR_IDS", '[7, "8"]')
+    monkeypatch.setenv("OWNER_ID", "42")
+    monkeypatch.setenv("ALLOWED_ORIGINS", '["https://app.example"]')
+    assert Settings(_env_file=None).operator_ids == [7, 8]
+    assert Settings(_env_file=None).allowed_origins == ["https://app.example"]
+    monkeypatch.delenv("OPERATOR_IDS")
+    assert Settings(_env_file=None).operator_ids == [42]
+    monkeypatch.setenv("OWNER_ID", "")
+    assert Settings(_env_file=None).operator_ids == []
+
+
+@pytest.mark.parametrize("value", ["0", "-1", str(2**53), "42,,43"])
+def test_invalid_operator_aliases_are_rejected_without_reflecting_values(monkeypatch, value):
+    monkeypatch.setenv("OPERATOR_IDS", value)
+    with pytest.raises(ValueError) as error:
+        Settings(_env_file=None)
+    assert "42,,43" not in str(error.value)
+
+
+def test_invalid_alias_list_never_echoes_the_input(monkeypatch):
+    monkeypatch.setenv("OPERATOR_IDS", "[PRIVATE_TEST_SENTINEL")
+    with pytest.raises(ValueError) as error:
+        Settings(_env_file=None)
+    assert "PRIVATE_TEST_SENTINEL" not in str(error.value)
+
+
+def test_short_and_prefixed_aliases_keep_per_source_precedence(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("SUMMON_TELEGRAM_API_HASH=dotenv-hash\nSUMMON_OPERATOR_IDS=[5]\n")
+    monkeypatch.setenv("API_Hash", "environment-hash")
+    monkeypatch.setenv("OWNER_ID", "99")
+    settings = Settings(_env_file=dotenv)
+    assert settings.telegram_api_hash.get_secret_value() == "environment-hash"
+    assert settings.operator_ids == [99]
+    monkeypatch.setenv("SUMMON_TELEGRAM_API_HASH", "")
+    monkeypatch.setenv("SUMMON_OPERATOR_IDS", "[]")
+    settings = Settings(_env_file=dotenv)
+    assert settings.telegram_api_hash.get_secret_value() == ""
+    assert settings.operator_ids == []
+
+
+def test_example_env_loads_without_credentials_or_an_operator():
+    import os
+    from pathlib import Path
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(_env_file=Path(__file__).resolve().parents[1] / ".env.example")
+    assert settings.environment == "development"
+    assert settings.operator_ids == [] and settings.telegram_api_id is None
+    assert settings.bot_token.get_secret_value() == ""
+    assert settings.mongo_uri.get_secret_value() == ""
+    assert settings.telegram_session_database != settings.mongo_database
+
+
+def test_imgbb_and_channel_aliases_are_optional_and_mixed_case(monkeypatch):
+    monkeypatch.setenv("Imgbb_key", "FAKE_IMG_HOST_KEY")
+    monkeypatch.setenv("DB_CHANNEL", "-1001234567890")
+    settings = Settings(_env_file=None)
+    assert settings.artwork_backend == "mongo"  # A key alone never opts into third-party upload.
+    assert settings.imgbb_key.get_secret_value() == "FAKE_IMG_HOST_KEY"
+    assert settings.db_channel == -1001234567890
+    assert "FAKE_IMG_HOST_KEY" not in repr(settings)
+    monkeypatch.setenv("ARTWORK_BACKEND", "imgbb")
+    assert Settings(_env_file=None).artwork_backend == "imgbb"
+    monkeypatch.setenv("SUMMON_IMGBB_KEY", "")
+    with pytest.raises(ValueError, match="IMGBB_KEY") as error:
+        Settings(_env_file=None)
+    assert "FAKE_IMG_HOST_KEY" not in str(error.value)
+
+
+def test_channel_and_host_configuration_fail_closed(monkeypatch):
+    monkeypatch.setenv("ARTWORK_BACKEND", "imgbb")
+    with pytest.raises(ValueError, match="IMGBB_KEY"):
+        Settings(_env_file=None)
+    monkeypatch.setenv("IMGBB_API_KEY", "test-key")
+    for bad in ("0", "123", str(-(2**63)), "not-an-id"):
+        monkeypatch.setenv("DB_CHANNEL_ID", bad)
+        with pytest.raises(ValueError):
+            Settings(_env_file=None)
+    monkeypatch.setenv("DB_CHANNEL_ID", "")
+    assert Settings(_env_file=None).db_channel is None

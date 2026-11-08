@@ -86,8 +86,10 @@ def test_catalog_accepts_public_https_and_content_addressed_paths():
 
 def fake_db():
     return SimpleNamespace(
-        activity=SimpleNamespace(insert_one=AsyncMock()),
-        characters=SimpleNamespace(insert_one=AsyncMock(), update_one=AsyncMock()),
+        activity=SimpleNamespace(insert_one=AsyncMock(), find_one=AsyncMock(return_value=None)),
+        characters=SimpleNamespace(
+            insert_one=AsyncMock(), update_one=AsyncMock(), find_one=AsyncMock(return_value=None)
+        ),
         character_artworks=SimpleNamespace(update_one=AsyncMock(), find_one=AsyncMock()),
         inventory=SimpleNamespace(update_one=AsyncMock(), delete_one=AsyncMock()),
     )
@@ -195,3 +197,163 @@ def test_public_artwork_endpoint_is_bounded_cacheable_and_rate_limited():
         catalog.artwork.return_value = None
         assert client.get(f"/api/artwork/{'a' * 64}").status_code == 404
         assert limiter.allow.await_count == 3  # Hits, blocked requests, and valid-hash misses.
+
+
+async def test_imgbb_upload_uses_fixed_https_post_and_keeps_key_out_of_url(caplog):
+    import httpx
+    from pydantic import SecretStr
+
+    from summon.services.imgbb import upload_imgbb
+
+    image = await normalize_photo(photo_bytes())
+    requests = []
+
+    async def receive(request):
+        requests.append(request)
+        body = await request.aread()
+        assert request.method == "POST"
+        assert str(request.url) == "https://api.imgbb.com/1/upload"
+        assert b"TEST_HOST_KEY_DO_NOT_LOG" in body
+        assert image.content in body
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "url": "https://i.ibb.co/abc/image.jpg",
+                    "delete_url": "PRIVATE_DELETE_URL",
+                },
+            },
+        )
+
+    result = await upload_imgbb(
+        image, SecretStr("TEST_HOST_KEY_DO_NOT_LOG"), transport=httpx.MockTransport(receive)
+    )
+    assert result == "https://i.ibb.co/abc/image.jpg"
+    assert len(requests) == 1
+    assert "TEST_HOST_KEY_DO_NOT_LOG" not in caplog.text
+    assert "PRIVATE_DELETE_URL" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status_code": 301, "headers": {"location": "https://other.example"}},
+        {"status_code": 403, "text": "PRIVATE_PROVIDER_DETAIL"},
+        {"status_code": 200, "text": "x" * (32 * 1024 + 1)},
+        {"status_code": 200, "json": {"success": False}},
+        {
+            "status_code": 200,
+            "json": {"success": True, "data": {"url": "http://127.0.0.1/private"}},
+        },
+        {
+            "status_code": 200,
+            "json": {"success": True, "data": {"url": "https://elsewhere.example/image"}},
+        },
+        {
+            "status_code": 200,
+            "json": {"success": True, "data": {"url": "https://i.ibb.co/a?token=secret"}},
+        },
+    ],
+)
+async def test_imgbb_untrusted_results_are_bounded_redacted_and_never_retried(response, caplog):
+    import httpx
+    from pydantic import SecretStr
+
+    from summon.services.imgbb import ImageHostError, upload_imgbb
+
+    image = await normalize_photo(photo_bytes())
+    calls = []
+
+    async def receive(request):
+        calls.append(request)
+        return httpx.Response(**response)
+
+    with pytest.raises(ImageHostError) as error:
+        await upload_imgbb(
+            image, SecretStr("PRIVATE_HOST_KEY"), transport=httpx.MockTransport(receive)
+        )
+    assert len(calls) == 1
+    assert "PRIVATE_HOST_KEY" not in str(error.value) + caplog.text
+    assert "PRIVATE_PROVIDER_DETAIL" not in str(error.value) + caplog.text
+    assert "token=secret" not in str(error.value) + caplog.text
+
+
+async def test_imgbb_transport_timeout_is_uncertain_and_not_retried():
+    import httpx
+    from pydantic import SecretStr
+
+    from summon.services.imgbb import ImageHostError, upload_imgbb
+
+    image = await normalize_photo(photo_bytes())
+    calls = []
+
+    async def receive(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("PRIVATE_NETWORK_DETAIL", request=request)
+
+    with pytest.raises(ImageHostError) as error:
+        await upload_imgbb(
+            image, SecretStr("PRIVATE_HOST_KEY"), transport=httpx.MockTransport(receive)
+        )
+    assert len(calls) == 1
+    assert "PRIVATE_NETWORK_DETAIL" not in str(error.value)
+
+
+async def test_imgbb_preflight_queries_only_ids_and_does_not_mutate_storage():
+    db = fake_db()
+    repository = CatalogRepository(db)
+    assert not await repository.catalog_event_exists("synthetic-event")
+    assert not await repository.character_exists("aiko")
+    db.activity.find_one.assert_awaited_once_with({"_id": "synthetic-event"}, {"_id": 1})
+    db.characters.find_one.assert_awaited_once_with({"_id": "aiko"}, {"_id": 1})
+    db.activity.insert_one.assert_not_awaited()
+    db.characters.update_one.assert_not_awaited()
+
+
+async def test_imgbb_rejects_encoded_response_before_reading_or_decompressing():
+    import httpx
+    from pydantic import SecretStr
+
+    from summon.services.imgbb import ImageHostError, upload_imgbb
+
+    image = await normalize_photo(photo_bytes())
+    stream_read = False
+
+    class EncodedResponse(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal stream_read
+            stream_read = True
+            yield b"untrusted compressed bytes"
+
+    async def receive(_request):
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=EncodedResponse())
+
+    with pytest.raises(ImageHostError, match="encoded response"):
+        await upload_imgbb(image, SecretStr("PRIVATE_KEY"), transport=httpx.MockTransport(receive))
+    assert not stream_read
+
+
+async def test_imgbb_stream_errors_are_sanitized_and_not_retried():
+    import httpx
+    from pydantic import SecretStr
+
+    from summon.services.imgbb import ImageHostError, upload_imgbb
+
+    image = await normalize_photo(photo_bytes())
+    calls = 0
+
+    class BrokenResponse(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.StreamConsumed("PRIVATE_STREAM_DETAIL")
+            yield b"never reached"
+
+    async def receive(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, stream=BrokenResponse())
+
+    with pytest.raises(ImageHostError) as error:
+        await upload_imgbb(image, SecretStr("PRIVATE_KEY"), transport=httpx.MockTransport(receive))
+    assert calls == 1
+    assert "PRIVATE_STREAM_DETAIL" not in str(error.value)
