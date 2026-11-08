@@ -16,7 +16,8 @@ from summon.bot.presentation import Card, Emoji, callback_text, edit_keyboard
 from summon.bot.telegram_helpers import _group, _user, callback_data, command_input, telegram_user
 from summon.config import Settings
 from summon.models import CollectionMode
-from summon.rarities import RARITY_WEIGHTS, rarity_label
+from summon.rarities import rarity_label
+from summon.repositories.rarity_weights import InvalidSpawnWeights
 from summon.repositories.users import DailyAlreadyClaimed, DailyStatusUnavailable, daily_status
 from summon.services.collection import CollectionService, GuessRateLimited
 
@@ -401,17 +402,20 @@ def register_collector_commands(
         user = _user(message)
         if not user or not await collector_rate_allowed(message, user.id, "rarity_weights"):
             return
+        try:
+            weights = await store.catalog.spawn_weights()
+        except (PyMongoError, InvalidSpawnWeights, OSError, TimeoutError):
+            await collector_read_error(message)
+            return
         await respond(
             message,
             Card(
                 "Summon rarity weights",
-                "Base weights apply only to rarities with active characters; "
+                "Configured weights apply only to rarities with active characters; "
                 "the resulting odds change when a rarity has no active characters. "
                 "Legacy Epic shares the Special Edition bucket.",
                 emoji=Emoji.RARITY_STAR,
-                fields=tuple(
-                    (rarity_label(name), str(weight)) for name, weight in RARITY_WEIGHTS.items()
-                ),
+                fields=tuple((rarity_label(name), str(weight)) for name, weight in weights.items()),
             ),
             private=True,
         )

@@ -28,8 +28,9 @@ from summon.bot.presentation import Card, Emoji, send_photo_card
 from summon.bot.telegram_helpers import _user, command_input
 from summon.config import Settings
 from summon.models import CharacterBasics, CharacterChanges, CharacterInput
-from summon.rarities import Rarity, parse_rarity, rarity_label
+from summon.rarities import MAX_SPAWN_WEIGHT, RARITY_WEIGHTS, Rarity, parse_rarity, rarity_label
 from summon.repositories.catalog import CatalogConflict, CatalogNotFound
+from summon.repositories.rarity_weights import InvalidSpawnWeights, SpawnWeightConflict
 from summon.services.artwork import (
     MAX_ARTWORK_BYTES,
     MAX_ARTWORK_DIMENSION,
@@ -245,6 +246,86 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 fields=tuple(
                     (f"Operator {i}", str(uid)) for i, uid in enumerate(operators[:20], 1)
                 ),
+            ),
+        )
+
+    @app.on_message(filters.incoming & filters.command(["chance"]))
+    async def change_spawn_weight(_client: Client, message: Message) -> None:
+        user = await authorize(message)
+        if user is None:
+            return
+        parts = (command_input(message).args or "").split()
+        rarity = parse_rarity(parts[0]) if len(parts) == 2 else None
+        if (
+            rarity is None
+            or rarity not in RARITY_WEIGHTS
+            or len(parts) != 2
+            or re.fullmatch(r"[0-9]{1,7}", parts[1]) is None
+            or int(parts[1]) > MAX_SPAWN_WEIGHT
+        ):
+            await respond(
+                message,
+                Card(
+                    "Set a summon weight",
+                    "Use /chance rarity-number weight, for example /chance 14 10. "
+                    f"Weights range from 0 to {MAX_SPAWN_WEIGHT}; 0 disables a bucket. "
+                    "Legacy Epic shares Special Edition's weight.",
+                    emoji=Emoji.RARITY_STAR,
+                ),
+            )
+            return
+        identity = getattr(app, "me", None)
+        if not identity or not isinstance(identity.id, int) or identity.id <= 0:
+            await respond(
+                message,
+                Card("Catalog unavailable", "Bot identity is not ready.", emoji=Emoji.WARNING),
+            )
+            return
+        weight = int(parts[1])
+        event_id = _event_id(identity.id, message.chat.id, message.id)
+        try:
+            old, new = await store.catalog.set_spawn_weight(
+                rarity, weight, actor_id=user.id, event_id=event_id
+            )
+        except SpawnWeightConflict:
+            await respond(
+                message,
+                Card(
+                    "Weight update not applied",
+                    "The command was already processed or conflicted. Check /chancelist.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        except InvalidSpawnWeights:
+            await respond(
+                message,
+                Card(
+                    "Weight configuration invalid",
+                    "An operator must inspect the saved data.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        except (PyMongoError, OSError, TimeoutError) as exc:
+            logger.warning("Spawn-weight change unconfirmed (%s)", type(exc).__name__)
+            await respond(
+                message,
+                Card(
+                    "Result unconfirmed",
+                    "Check /chancelist before trying again.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        await respond(
+            message,
+            Card(
+                "Summon weight saved",
+                "Weights apply to enabled group spawns. In-flight selections may use prior values; "
+                "empty buckets are skipped. This does not change ownership.",
+                emoji=Emoji.DONE,
+                fields=(("Rarity", rarity_label(rarity)), ("Weight", f"{old} → {new}")),
             ),
         )
 

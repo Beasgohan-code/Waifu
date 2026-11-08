@@ -12,8 +12,9 @@ from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 
 from summon.models import CharacterChanges, CharacterInput, InventorySort, normalize_name
-from summon.rarities import RARITY_WEIGHTS, spawn_values
+from summon.rarities import spawn_values
 from summon.repositories.base import transaction, utcnow
+from summon.repositories.rarity_weights import SpawnWeightsRepository
 from summon.services.artwork import MAX_ARTWORK_BYTES, Artwork
 
 
@@ -51,6 +52,7 @@ class CatalogRepository:
     def __init__(self, database: Any, *, client: Any | None = None) -> None:
         self.db = database
         self.client = client
+        self.spawn_weight_store = SpawnWeightsRepository(database, client=client)
         self.rng = secrets.SystemRandom()
 
     async def upsert_character(self, data: CharacterInput, *, actor_id: int) -> dict[str, Any]:
@@ -205,6 +207,16 @@ class CatalogRepository:
             return None
         return data
 
+    async def spawn_weights(self) -> dict[str, int]:
+        return await self.spawn_weight_store.read()
+
+    async def set_spawn_weight(
+        self, rarity: str, weight: int, *, actor_id: int, event_id: str
+    ) -> tuple[int, int]:
+        return await self.spawn_weight_store.set_weight(
+            rarity, weight, actor_id=actor_id, event_id=event_id
+        )
+
     async def choose(self) -> dict[str, Any] | None:
         """Weight nonempty rarities, then uniformly choose one stable-catalog offset.
 
@@ -213,8 +225,9 @@ class CatalogRepository:
         edit can invalidate the offset, in which case selection is retried, not biased
         toward an arbitrary fallback record.
         """
+        configured = await self.spawn_weights()
         for _ in range(3):
-            remaining = dict(RARITY_WEIGHTS)
+            remaining = {name: weight for name, weight in configured.items() if weight > 0}
             while remaining:
                 rarity = self.rng.choices(list(remaining), weights=list(remaining.values()), k=1)[0]
                 accepted = spawn_values(rarity)

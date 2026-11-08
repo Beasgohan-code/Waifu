@@ -1020,3 +1020,75 @@ async def test_concurrent_manual_spawn_reservations_only_create_one(isolated_dat
     results = await asyncio.gather(*(repo.reserve_spawn(-400, character, now) for _ in range(5)))
     assert sum(result is not None for result in results) == 1
     assert await db.spawns.count_documents({"group_id": -400, "status": "active"}) == 1
+
+
+async def test_spawn_weight_changes_and_audits_are_atomic_and_replay_safe(isolated_database):
+    from pymongo.errors import WriteError
+
+    from summon.rarities import RARITY_WEIGHTS
+    from summon.repositories.catalog import CatalogRepository
+    from summon.repositories.rarity_weights import SpawnWeightConflict
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    assert await repo.spawn_weights() == RARITY_WEIGHTS
+    await db.inventory.insert_one({"user_id": 101, "character_id": "ren", "quantity": 3})
+    assert await repo.set_spawn_weight(
+        "special-edition", 0, actor_id=42, event_id="weight-one"
+    ) == (RARITY_WEIGHTS["special-edition"], 0)
+    with pytest.raises(SpawnWeightConflict):
+        await repo.set_spawn_weight("rare", 99, actor_id=42, event_id="weight-one")
+    assert (await repo.spawn_weights())["rare"] == RARITY_WEIGHTS["rare"]
+    assert await db.spawn_weights.find_one({"_id": "rare"}) is None
+    assert await db.activity.count_documents({"_id": "weight-one"}) == 1
+    assert (await db.characters.find_one({"_id": "ren"}))["rarity"] == "epic"
+    assert (await db.inventory.find_one({"user_id": 101, "character_id": "ren"}))["quantity"] == 3
+
+    # Direct malformed writes cannot bypass the installed MongoDB schema.
+    with pytest.raises(WriteError):
+        await db.spawn_weights.insert_one(
+            {"_id": "rare", "weight": -1, "updated_by": 42, "updated_at": datetime.now(UTC)}
+        )
+    with pytest.raises(WriteError):
+        await db.spawn_weights.insert_one(
+            {"_id": "epic", "weight": 1, "updated_by": 42, "updated_at": datetime.now(UTC)}
+        )
+
+
+async def test_concurrent_spawn_weight_changes_preserve_independent_buckets(isolated_database):
+    from summon.repositories.catalog import CatalogRepository
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    results = await asyncio.gather(
+        repo.set_spawn_weight("rare", 77, actor_id=42, event_id="rare-event"),
+        repo.set_spawn_weight("legendary", 88, actor_id=43, event_id="legendary-event"),
+    )
+    assert [result[1] for result in results] == [77, 88]
+    weights = await repo.spawn_weights()
+    assert weights["rare"] == 77 and weights["legendary"] == 88
+    assert await db.activity.count_documents({"kind": "spawn_weight_changed"}) == 2
+
+
+async def test_real_spawn_selection_uses_overrides_and_preserves_legacy_epic(isolated_database):
+    from summon.rarities import RARITY_WEIGHTS
+    from summon.repositories.catalog import CatalogRepository
+
+    client, db = isolated_database
+    now = datetime.now(UTC)
+    await db.spawn_weights.insert_many(
+        [
+            {
+                "_id": name,
+                "weight": 1 if name == "special-edition" else 0,
+                "updated_by": 42,
+                "updated_at": now,
+            }
+            for name in RARITY_WEIGHTS
+        ]
+    )
+    repo = CatalogRepository(db, client=client)
+    assert (await repo.choose())["_id"] == "ren"
+    await db.spawn_weights.update_one({"_id": "special-edition"}, {"$set": {"weight": 0}})
+    assert await repo.choose() is None
+    assert (await db.characters.find_one({"_id": "ren"}))["rarity"] == "epic"

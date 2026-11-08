@@ -66,6 +66,7 @@ RARITIES: tuple[RarityDefinition, ...] = (
 
 RARITY_VALUES = get_args(Rarity)
 RARITY_WEIGHTS = {rarity.value: rarity.weight for rarity in RARITIES}
+MAX_SPAWN_WEIGHT = 1_000_000
 _LABELS: dict[str, str] = {str(rarity.value): rarity.label for rarity in RARITIES} | {
     "epic": "Epic (legacy)"
 }

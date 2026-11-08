@@ -20,7 +20,7 @@ from summon.auto_replies import (
 )
 from summon.config import Settings
 from summon.group_notes import MAX_NOTE_LENGTH, MAX_NOTES, NOTE_NAME_PATTERN, NOTE_REVISION_PATTERN
-from summon.rarities import RARITY_VALUES
+from summon.rarities import MAX_SPAWN_WEIGHT, RARITY_VALUES, RARITY_WEIGHTS
 
 _NUMBER = ["int", "long"]
 COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -35,6 +35,17 @@ COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "rarity": {"enum": list(RARITY_VALUES)},
             "active": {"bsonType": "bool"},
             "random_key": {"bsonType": "double", "minimum": 0, "maximum": 1},
+        },
+    },
+    "spawn_weights": {
+        "bsonType": "object",
+        "required": ["_id", "weight", "updated_by", "updated_at"],
+        "additionalProperties": False,
+        "properties": {
+            "_id": {"enum": list(RARITY_WEIGHTS)},
+            "weight": {"bsonType": _NUMBER, "minimum": 0, "maximum": MAX_SPAWN_WEIGHT},
+            "updated_by": {"bsonType": _NUMBER, "minimum": 1, "maximum": 2**53 - 1},
+            "updated_at": {"bsonType": "date"},
         },
     },
     "character_artworks": {

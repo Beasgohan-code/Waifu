@@ -35,6 +35,7 @@ async def setup(*, operators=(42,), **settings_overrides):
             update_character=AsyncMock(),
             catalog_event_exists=AsyncMock(return_value=False),
             character_exists=AsyncMock(return_value=False),
+            set_spawn_weight=AsyncMock(return_value=(10, 500)),
         ),
         trades=object(),
         gifts=object(),
@@ -708,5 +709,94 @@ async def test_operator_list_caps_response_fields():
         card = sent.await_args.args[2]
         assert len(card.fields) == 20
         assert "Showing 20 of 30" in card.body
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_chance_updates_one_weight_as_private_audited_operator_action():
+    app, store = await setup()
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet("/chance 14 500"))
+        store.catalog.set_spawn_weight.assert_awaited_once_with(
+            "amv-edition", 500, actor_id=42, event_id=_event_id(123, 42, 50)
+        )
+        card = sent.await_args.args[2]
+        assert card.title == "Summon weight saved"
+        assert card.fields == (("Rarity", "AMV Edition"), ("Weight", "10 → 500"))
+        assert "does not change ownership" in card.body
+    finally:
+        await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/chance",
+        "/chance 1",
+        "/chance 19 5",
+        "/chance epic 5",
+        "/chance 1 -1",
+        "/chance 1 1000001",
+        "/chance 1 1e3",
+        "/chance 1 2 extra",
+        "/chance 1 " + "9" * 100,
+    ],
+)
+async def test_chance_rejects_invalid_values_without_changing_weights(text):
+    app, store = await setup()
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet(text))
+        store.catalog.set_spawn_weight.assert_not_awaited()
+        assert sent.await_args.args[2].title == "Set a summon weight"
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_chance_refuses_group_and_non_operator_without_a_write():
+    app, store = await setup()
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet("/chance 1 100", user_id=7))
+        assert sent.await_args.args[2].title == "Operator access required"
+        with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private:
+            await dispatch(app, packet("/chance 1 100", group=True))
+        assert private.await_args.args[3].title == "Use a private chat"
+        store.catalog.set_spawn_weight.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_chance_conflicts_and_uncertain_database_results_are_not_retried():
+    from summon.repositories.rarity_weights import SpawnWeightConflict
+
+    for failure, title in (
+        (SpawnWeightConflict("already processed"), "Weight update not applied"),
+        (AutoReconnect("PRIVATE_DATABASE_DETAIL"), "Result unconfirmed"),
+    ):
+        app, store = await setup()
+        store.catalog.set_spawn_weight.side_effect = failure
+        try:
+            with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+                await dispatch(app, packet("/chance 1 100"))
+            store.catalog.set_spawn_weight.assert_awaited_once()
+            card = sent.await_args.args[2]
+            assert card.title == title
+            assert "PRIVATE_DATABASE_DETAIL" not in card.body
+            assert "/chancelist" in card.body
+        finally:
+            await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize("value", [0, 1_000_000])
+async def test_chance_accepts_bounded_zero_and_upper_limit(value):
+    app, store = await setup()
+    store.catalog.set_spawn_weight.return_value = (1200, value)
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet(f"/chance 3 {value}"))
+        assert store.catalog.set_spawn_weight.await_args.args == ("special-edition", value)
+        assert sent.await_args.args[2].title == "Summon weight saved"
     finally:
         await app.dispatcher.stop()

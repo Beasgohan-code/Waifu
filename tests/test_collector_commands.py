@@ -9,6 +9,7 @@ from wzgram import Client
 
 from summon.bot.handlers import COMMANDS, group_commands, register_handlers
 from summon.config import Settings
+from summon.rarities import RARITY_WEIGHTS
 
 
 def make_store():
@@ -18,6 +19,7 @@ def make_store():
             list=AsyncMock(return_value={"items": [], "total": 0}),
             inventory=AsyncMock(return_value={"items": [], "total": 0}),
             set_favorite=AsyncMock(return_value=True),
+            spawn_weights=AsyncMock(return_value=dict(RARITY_WEIGHTS)),
         ),
         trades=object(),
         gifts=object(),
@@ -324,3 +326,20 @@ async def test_hmode_callback_does_not_retry_ambiguous_telegram_edit():
     await mode_callback(store, "hmode:42:recent", edit=edit)
     assert store.users.set_collection_mode.await_count == 1
     assert edit.await_count == 1
+
+
+async def test_chancelist_displays_current_weights_and_legacy_bucket():
+    store = make_store()
+    store.catalog.spawn_weights.return_value = dict(RARITY_WEIGHTS) | {"rare": 0}
+    card = await invoke(store, "rarity_weights")
+    store.catalog.spawn_weights.assert_awaited_once()
+    assert ("Rare", "0") in card.fields
+    assert "Legacy Epic shares the Special Edition bucket" in card.body
+
+
+async def test_chancelist_fails_closed_when_the_weight_read_fails():
+    store = make_store()
+    store.catalog.spawn_weights.side_effect = AutoReconnect("PRIVATE_DATABASE_DETAIL")
+    card = await invoke(store, "rarity_weights")
+    assert card.title == "Collector tools unavailable"
+    assert "PRIVATE_DATABASE_DETAIL" not in card.body
