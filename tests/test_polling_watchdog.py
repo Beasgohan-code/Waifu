@@ -476,6 +476,16 @@ async def test_embedded_supervisor_refuses_missing_confirmation_or_credentials(
         embedded_settings(**overrides), object(), object(), status
     )
     assert status.state == "configuration_required"
+    assert (
+        status.reason
+        == {
+            "webhook": "webhook_confirmation_required",
+            "token": "telegram_credentials_required",
+            "api_id": "telegram_credentials_required",
+            "api_hash": "telegram_credentials_required",
+            "bad_token": "bot_token_invalid_format",
+        }[reason]
+    )
     worker.assert_not_awaited()
     assert "PRIVATE_BAD_TOKEN" not in caplog.text
     if reason == "webhook":
@@ -508,7 +518,7 @@ async def test_embedded_supervisor_retries_busy_lease_and_starts_one_native_work
         supervisor.supervise_embedded_worker(settings, mongo, database, status)
     )
     await asyncio.wait_for(entered.wait(), 1)
-    assert status.state == "running"
+    assert status.state == "running" and status.reason is None
     assert len(attempts) == 2
     assert all(a["embedded"] and a["shared_database"] == (mongo, database) for a in attempts)
     retry.assert_awaited_once_with(5)
@@ -540,6 +550,14 @@ async def test_embedded_supervisor_does_not_retry_permanent_or_uncertain_failure
     await supervisor.supervise_embedded_worker(embedded_settings(), object(), object(), status)
     assert status.state == (
         "restart_required" if failure == "uncertain" else "configuration_required"
+    )
+    assert (
+        status.reason
+        == {
+            "rejected": "telegram_startup_rejected",
+            "session": "worker_configuration_or_session",
+            "uncertain": "shutdown_unconfirmed",
+        }[failure]
     )
     worker.assert_awaited_once()
     retry.assert_not_awaited()
@@ -578,3 +596,32 @@ async def test_embedded_supervisor_caps_retries_and_respects_telegram_flood_wait
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.parametrize("failure", ["lease", "flood", "network"])
+async def test_embedded_supervisor_reports_fixed_retry_reason(monkeypatch, failure):
+    from wzgram.errors import FloodWait
+
+    from summon.bot import supervisor
+
+    errors = {
+        "lease": IngressLeaseLost("PRIVATE_LEASE_DETAIL"),
+        "flood": FloodWait(180),
+        "network": ConnectionError("PRIVATE_NETWORK_DETAIL"),
+    }
+    expected = {
+        "lease": "lease_unavailable",
+        "flood": "telegram_rate_limit",
+        "network": "transient_failure",
+    }
+    status = supervisor.WorkerStatus()
+    monkeypatch.setattr(supervisor, "run", AsyncMock(side_effect=errors[failure]))
+
+    async def inspect_retry(_seconds):
+        assert status.state == "retrying"
+        assert status.reason == expected[failure]
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(supervisor, "_wait_before_retry", inspect_retry)
+    with pytest.raises(asyncio.CancelledError):
+        await supervisor.supervise_embedded_worker(embedded_settings(), object(), object(), status)

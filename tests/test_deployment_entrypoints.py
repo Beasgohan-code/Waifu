@@ -152,6 +152,46 @@ async def test_combined_api_waits_for_database_then_starts_and_stops_one_bot_wor
     mongo.close.assert_awaited_once()
 
 
+@pytest.mark.parametrize("failure", ["webhook", "session"])
+async def test_bot_health_exposes_only_fixed_actionable_reason_codes(failure):
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from httpx import ASGITransport, AsyncClient
+
+    settings = Settings(
+        run_bot_worker=True,
+        bot_token="123:synthetic-token",
+        telegram_api_id=123,
+        telegram_api_hash="synthetic-hash",
+        webhooks_disabled_confirmed=failure != "webhook",
+        _env_file=None,
+    )
+    mongo = MagicMock(close=AsyncMock())
+    app = create_app(settings=settings, telegram_bot=object())
+    with (
+        patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
+        patch("summon.api.app.Store", return_value=object()),
+        patch("summon.bot.supervisor.run", AsyncMock(side_effect=RuntimeError("PRIVATE_DETAIL"))),
+    ):
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(app.state.startup_task, 1)
+            await asyncio.wait_for(app.state.worker_task, 1)
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://testserver"
+            ) as http:
+                response = await http.get("/health/bot")
+                expected = (
+                    "webhook_confirmation_required"
+                    if failure == "webhook"
+                    else "worker_configuration_or_session"
+                )
+                assert response.status_code == 503
+                assert response.json() == {"status": "configuration_required", "reason": expected}
+                assert "PRIVATE_DETAIL" not in response.text
+                assert (await http.get("/")).json()["bot_reason"] == expected
+
+
 @pytest.mark.parametrize("injected", [False, True])
 def test_preview_never_starts_embedded_bot_even_when_image_default_is_enabled(injected):
     from unittest.mock import AsyncMock

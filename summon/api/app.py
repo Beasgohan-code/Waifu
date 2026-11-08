@@ -114,6 +114,7 @@ def create_app(
                     def report_worker_failure(task: asyncio.Task[None]) -> None:
                         if not task.cancelled() and (failure := task.exception()) is not None:
                             worker_status.state = "failed"
+                            worker_status.reason = "supervisor_failure"
                             logger.error("Bot supervision failed (%s)", type(failure).__name__)
 
                     worker_task.add_done_callback(report_worker_failure)
@@ -200,6 +201,7 @@ def create_app(
                 await asyncio.gather(startup_task, return_exceptions=True)
             if worker_task is not None:
                 worker_status.state = "stopping"
+                worker_status.reason = None
                 worker_task.cancel()
                 await asyncio.gather(worker_task, return_exceptions=True)
                 worker_status.state = "stopped"
@@ -378,13 +380,14 @@ def create_app(
 
     @app.get("/health/bot")
     async def bot_health(request: Request) -> JSONResponse:
-        status = getattr(request.app.state, "worker_status", WorkerStatus()).state
+        worker = getattr(request.app.state, "worker_status", WorkerStatus())
         # Running means this process completed native worker startup, not that
-        # Telegram delivered an update or every handler is responsive.
-        return JSONResponse(
-            status_code=200 if status == "running" else 503,
-            content={"status": status},
-        )
+        # Telegram delivered an update or every handler is responsive. Reasons
+        # are fixed codes, never exception messages or credentials.
+        content = {"status": worker.state}
+        if worker.reason is not None:
+            content["reason"] = worker.reason
+        return JSONResponse(status_code=200 if worker.state == "running" else 503, content=content)
 
     @app.get("/health/poller", include_in_schema=False)
     async def poller_health(request: Request) -> JSONResponse:
@@ -501,14 +504,16 @@ def create_app(
 
         @app.get("/", include_in_schema=False)
         async def backend_index(request: Request) -> dict[str, str]:
-            status = getattr(request.app.state, "worker_status", WorkerStatus()).state
+            worker = getattr(request.app.state, "worker_status", WorkerStatus())
             result = {
                 "service": "SUMMON bot and API backend",
-                "bot_status": status,
+                "bot_status": worker.state,
                 "health": "/health",
                 "database_readiness": "/health/ready",
                 "bot_health": "/health/bot",
             }
+            if worker.reason is not None:
+                result["bot_reason"] = worker.reason
             # Render exposes the deployed Git SHA as a non-secret system env.
             # Publish only a valid SHA, never an arbitrary environment value.
             revision = os.environ.get("RENDER_GIT_COMMIT", "")
