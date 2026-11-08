@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import secrets
 import time
@@ -35,6 +36,7 @@ from summon.auth import (
 )
 from summon.bot.emoji_palette import palette_icon
 from summon.bot.session_storage import APIStorage, bot_id_from_token, start_verified_client
+from summon.bot.supervisor import WorkerStatus, supervise_embedded_worker
 from summon.config import Settings
 from summon.database import (
     DatabaseTopologyError,
@@ -81,14 +83,19 @@ def create_app(
         owned_bot = None
         candidate = None
         startup_task: asyncio.Task[None] | None = None
+        worker_task: asyncio.Task[None] | None = None
+        embedded_worker = settings.run_bot_worker and not settings.preview_mode and store is None
+        worker_status = WorkerStatus("waiting_for_database" if embedded_worker else "disabled")
         app.state.settings = settings
         app.state.store = None
         app.state.database = None
         app.state.telegram_bot = telegram_bot
         app.state.startup_task = None
+        app.state.worker_task = None
+        app.state.worker_status = worker_status
 
         async def initialize_runtime() -> None:
-            nonlocal client, owned_bot, candidate
+            nonlocal client, owned_bot, candidate, worker_task
             try:
                 # Only the read-only ping continues in the background; topology,
                 # schema and index initialization are still performed once.
@@ -97,14 +104,33 @@ def create_app(
                 app.state.database = database
                 app.state.store = initialized_store
                 logger.info("MongoDB initialized; API database operations are available")
+                if embedded_worker:
+                    worker_task = asyncio.create_task(
+                        supervise_embedded_worker(settings, client, database, worker_status),
+                        name="summon-embedded-bot",
+                    )
+                    app.state.worker_task = worker_task
+
+                    def report_worker_failure(task: asyncio.Task[None]) -> None:
+                        if not task.cancelled() and (failure := task.exception()) is not None:
+                            worker_status.state = "failed"
+                            logger.error("Bot supervision failed (%s)", type(failure).__name__)
+
+                    worker_task.add_done_callback(report_worker_failure)
             except PyMongoError as exc:
                 # Never log the driver exception: it may contain hosts or credentials.
+                if embedded_worker:
+                    worker_status.state = "database_unavailable"
                 logger.error("%s", safe_startup_error(exc))
                 return
             except DatabaseTopologyError:
+                if embedded_worker:
+                    worker_status.state = "database_unavailable"
                 logger.error("MongoDB is not a supported writable transaction topology")
                 return
             except Exception as exc:
+                if embedded_worker:
+                    worker_status.state = "database_unavailable"
                 logger.error("API database initialization failed (%s)", type(exc).__name__)
                 return
             finally:
@@ -172,6 +198,11 @@ def create_app(
             if startup_task is not None:
                 startup_task.cancel()
                 await asyncio.gather(startup_task, return_exceptions=True)
+            if worker_task is not None:
+                worker_status.state = "stopping"
+                worker_task.cancel()
+                await asyncio.gather(worker_task, return_exceptions=True)
+                worker_status.state = "stopped"
             try:
                 if candidate is not None:
                     await candidate.stop()
@@ -217,7 +248,11 @@ def create_app(
             # Content-addressed public artwork is immutable. Avoid making every
             # catalog view re-download multi-megabyte photos from MongoDB.
             response.headers["Cache-Control"] = "public, max-age=3600, immutable"
-        elif request.url.path.startswith("/api/") or request.url.path.startswith("/health"):
+        elif (
+            request.url.path == "/"
+            or request.url.path.startswith("/api/")
+            or request.url.path.startswith("/health")
+        ):
             response.headers["Cache-Control"] = "no-store"
         route = request.scope.get("route")
         logger.info(
@@ -341,6 +376,16 @@ def create_app(
             raise HTTPException(503, "Database readiness check timed out") from None
         return {"status": "ready"}
 
+    @app.get("/health/bot")
+    async def bot_health(request: Request) -> JSONResponse:
+        status = getattr(request.app.state, "worker_status", WorkerStatus()).state
+        # Running means this process completed native worker startup, not that
+        # Telegram delivered an update or every handler is responsive.
+        return JSONResponse(
+            status_code=200 if status == "running" else 503,
+            content={"status": status},
+        )
+
     @app.get("/health/poller", include_in_schema=False)
     async def poller_health(request: Request) -> JSONResponse:
         candidates = request.headers.getlist("X-Summon-Monitor-Token")
@@ -452,6 +497,25 @@ def create_app(
         # Only the explicitly configured build directory is public. API and
         # health routes above take precedence, including for unknown API paths.
         app.mount("/", PublicWebFiles(directory=settings.web_dist, html=True), name="web")
+    else:
+
+        @app.get("/", include_in_schema=False)
+        async def backend_index(request: Request) -> dict[str, str]:
+            status = getattr(request.app.state, "worker_status", WorkerStatus()).state
+            result = {
+                "service": "SUMMON bot and API backend",
+                "bot_status": status,
+                "health": "/health",
+                "database_readiness": "/health/ready",
+                "bot_health": "/health/bot",
+            }
+            # Render exposes the deployed Git SHA as a non-secret system env.
+            # Publish only a valid SHA, never an arbitrary environment value.
+            revision = os.environ.get("RENDER_GIT_COMMIT", "")
+            if re.fullmatch(r"[0-9a-f]{40}", revision):
+                result["revision"] = revision
+            return result
+
     return app
 
 

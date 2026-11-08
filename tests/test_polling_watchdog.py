@@ -268,7 +268,7 @@ async def test_registered_lease_guards_stop_messages_edits_and_callbacks():
     assert not lease.valid()
 
 
-async def make_worker(monkeypatch, *, stop_mode="normal"):
+async def make_worker(monkeypatch, *, stop_mode="normal", embedded=False):
     from importlib import import_module
 
     module = import_module("summon.bot.main")
@@ -320,9 +320,13 @@ async def make_worker(monkeypatch, *, stop_mode="normal"):
         await asyncio.Event().wait()
 
     factory = MagicMock(return_value=bot)
+    database = object()
+    connect = AsyncMock(return_value=(mongo, database))
+    started = MagicMock()
+    idle_mock = AsyncMock(side_effect=idle)
     monkeypatch.setattr(module, "Settings", lambda: settings)
     monkeypatch.setattr(module, "validate_runtime", lambda: None)
-    monkeypatch.setattr(module, "connect_database", AsyncMock(return_value=(mongo, object())))
+    monkeypatch.setattr(module, "connect_database", connect)
     monkeypatch.setattr(module, "IngressLease", lambda *_args: lease)
     monkeypatch.setattr(module, "worker_storage", lambda *_args: object())
     monkeypatch.setattr(module, "Client", factory)
@@ -333,8 +337,14 @@ async def make_worker(monkeypatch, *, stop_mode="normal"):
     monkeypatch.setattr(module, "start_verified_client", AsyncMock())
     monkeypatch.setattr(module, "register_command_menus", AsyncMock())
     monkeypatch.setattr(module, "monitor_connection", monitor)
-    monkeypatch.setattr(module, "idle", idle)
-    task = asyncio.create_task(module.run())
+    monkeypatch.setattr(module, "idle", idle_mock)
+    task = asyncio.create_task(
+        module.run(
+            shared_database=(mongo, database) if embedded else None,
+            embedded=embedded,
+            on_started=started,
+        )
+    )
     await asyncio.wait_for(monitor_started.wait(), 1)
     return SimpleNamespace(
         task=task,
@@ -342,6 +352,9 @@ async def make_worker(monkeypatch, *, stop_mode="normal"):
         lease=lease,
         mongo=mongo,
         factory=factory,
+        connect=connect,
+        started=started,
+        idle=idle_mock,
         fail_monitor=fail_monitor,
         fail_lease=fail_lease,
     )
@@ -385,6 +398,33 @@ async def test_external_worker_cancellation_closes_client_before_releasing_lease
     worker.mongo.close.assert_awaited_once()
 
 
+async def test_embedded_worker_uses_shared_mongo_and_does_not_install_signal_handlers(monkeypatch):
+    worker = await make_worker(monkeypatch, embedded=True)
+    worker.started.assert_called_once()
+    worker.connect.assert_not_awaited()
+    worker.idle.assert_not_awaited()
+    assert worker.factory.call_args.kwargs["no_updates"] is False
+    worker.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker.task
+    worker.bot.stop.assert_awaited_once()
+    worker.lease.release.assert_awaited_once()
+    worker.mongo.close.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stop_mode", ["error", "still-initialized"])
+async def test_embedded_worker_never_restarts_after_uncertain_shutdown(monkeypatch, stop_mode):
+    from summon.bot.main import EmbeddedBotShutdownUncertain
+
+    worker = await make_worker(monkeypatch, stop_mode=stop_mode, embedded=True)
+    worker.fail_monitor.set()
+    with pytest.raises(EmbeddedBotShutdownUncertain):
+        await asyncio.wait_for(worker.task, 1)
+    worker.bot.stop.assert_awaited_once()
+    worker.lease.release.assert_not_awaited()
+    worker.mongo.close.assert_not_awaited()
+
+
 async def test_missing_webhook_confirmation_fails_before_connecting_database(monkeypatch):
     from importlib import import_module
 
@@ -403,3 +443,138 @@ async def test_missing_webhook_confirmation_fails_before_connecting_database(mon
     with pytest.raises(RuntimeError, match="webhook"):
         await module.run()
     connect.assert_not_awaited()
+
+
+def embedded_settings(**overrides):
+    values = {
+        "bot_token": "123:synthetic-worker-token",
+        "telegram_api_id": 123,
+        "telegram_api_hash": "synthetic-api-hash",
+        "webhooks_disabled_confirmed": True,
+        "_env_file": None,
+    }
+    return Settings(**{**values, **overrides})
+
+
+@pytest.mark.parametrize("reason", ["webhook", "token", "api_id", "api_hash", "bad_token"])
+async def test_embedded_supervisor_refuses_missing_confirmation_or_credentials(
+    monkeypatch, reason, caplog
+):
+    from summon.bot import supervisor
+
+    overrides = {
+        "webhook": {"webhooks_disabled_confirmed": False},
+        "token": {"bot_token": ""},
+        "api_id": {"telegram_api_id": None},
+        "api_hash": {"telegram_api_hash": ""},
+        "bad_token": {"bot_token": "PRIVATE_BAD_TOKEN"},
+    }[reason]
+    worker = AsyncMock()
+    monkeypatch.setattr(supervisor, "run", worker)
+    status = supervisor.WorkerStatus()
+    await supervisor.supervise_embedded_worker(
+        embedded_settings(**overrides), object(), object(), status
+    )
+    assert status.state == "configuration_required"
+    worker.assert_not_awaited()
+    assert "PRIVATE_BAD_TOKEN" not in caplog.text
+    if reason == "webhook":
+        assert "WEBHOOKS_DISABLED_CONFIRMED=true" in caplog.text
+
+
+async def test_embedded_supervisor_retries_busy_lease_and_starts_one_native_worker(
+    monkeypatch, caplog
+):
+    from summon.bot import supervisor
+
+    settings = embedded_settings()
+    mongo, database = object(), object()
+    status = supervisor.WorkerStatus()
+    entered = asyncio.Event()
+    attempts = []
+
+    async def worker(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise IngressLeaseLost("PRIVATE_LEASE_DETAIL")
+        kwargs["on_started"]()
+        entered.set()
+        await asyncio.Event().wait()
+
+    retry = AsyncMock()
+    monkeypatch.setattr(supervisor, "run", worker)
+    monkeypatch.setattr(supervisor, "_wait_before_retry", retry)
+    task = asyncio.create_task(
+        supervisor.supervise_embedded_worker(settings, mongo, database, status)
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    assert status.state == "running"
+    assert len(attempts) == 2
+    assert all(a["embedded"] and a["shared_database"] == (mongo, database) for a in attempts)
+    retry.assert_awaited_once_with(5)
+    assert "PRIVATE_LEASE_DETAIL" not in caplog.text
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize("failure", ["rejected", "session", "uncertain"])
+async def test_embedded_supervisor_does_not_retry_permanent_or_uncertain_failure(
+    monkeypatch, failure, caplog
+):
+    from wzgram.errors import AccessTokenInvalid
+
+    from summon.bot import supervisor
+    from summon.bot.main import EmbeddedBotShutdownUncertain
+
+    error = {
+        "rejected": AccessTokenInvalid("PRIVATE_REJECTED"),
+        "session": RuntimeError("PRIVATE_SESSION_DETAIL"),
+        "uncertain": EmbeddedBotShutdownUncertain("PRIVATE_STOP_DETAIL"),
+    }[failure]
+    worker = AsyncMock(side_effect=error)
+    retry = AsyncMock()
+    monkeypatch.setattr(supervisor, "run", worker)
+    monkeypatch.setattr(supervisor, "_wait_before_retry", retry)
+    status = supervisor.WorkerStatus()
+    await supervisor.supervise_embedded_worker(embedded_settings(), object(), object(), status)
+    assert status.state == (
+        "restart_required" if failure == "uncertain" else "configuration_required"
+    )
+    worker.assert_awaited_once()
+    retry.assert_not_awaited()
+    assert "PRIVATE_" not in caplog.text
+
+
+async def test_embedded_supervisor_caps_retries_and_respects_telegram_flood_wait(monkeypatch):
+    from unittest.mock import call
+
+    from wzgram.errors import FloodWait
+
+    from summon.bot import supervisor
+
+    entered = asyncio.Event()
+    attempts = 0
+
+    async def worker(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 9:
+            entered.set()
+            await asyncio.Event().wait()
+        if attempts == 2:
+            raise FloodWait(180)
+        raise ConnectionError("PRIVATE_NETWORK_DETAIL")
+
+    retry = AsyncMock()
+    monkeypatch.setattr(supervisor, "run", worker)
+    monkeypatch.setattr(supervisor, "_wait_before_retry", retry)
+    status = supervisor.WorkerStatus()
+    task = asyncio.create_task(
+        supervisor.supervise_embedded_worker(embedded_settings(), object(), object(), status)
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    assert retry.await_args_list == [call(s) for s in (5, 180, 30, 60, 120, 300, 300, 300)]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

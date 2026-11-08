@@ -87,6 +87,18 @@ async def test_api_wzgram_client_is_outbound_only_and_in_memory():
     mongo.close.assert_awaited_once()
 
 
+async def test_worker_session_storage_does_not_close_shared_mongo_client():
+    from summon.bot.session_storage import worker_storage
+
+    mongo = MagicMock(close=AsyncMock())
+    storage = worker_storage(mongo, "synthetic_sessions")
+    # Exercise Wzgram's actual storage close path without opening a database.
+    storage._client = mongo
+    storage._opened = True
+    await storage.close()
+    mongo.close.assert_not_awaited()
+
+
 async def test_native_handlers_are_registered_once_with_unique_callbacks():
     app = await registered(make_store())
     callbacks = [item.callback.__name__ for item in app.dispatcher.groups[0]]

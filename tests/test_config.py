@@ -238,6 +238,15 @@ def test_simple_environment_aliases_and_prefixed_precedence(monkeypatch, tmp_pat
     assert explicit.mongo_uri.get_secret_value() == "mongodb://explicit.invalid/db"
 
 
+def test_embedded_bot_worker_is_opt_in_outside_the_docker_image(monkeypatch):
+    monkeypatch.delenv("SUMMON_RUN_BOT_WORKER", raising=False)
+    assert Settings(_env_file=None).run_bot_worker is False
+    monkeypatch.setenv("SUMMON_RUN_BOT_WORKER", "true")
+    assert Settings(_env_file=None).run_bot_worker is True
+    monkeypatch.setenv("SUMMON_RUN_BOT_WORKER", "false")
+    assert Settings(_env_file=None).run_bot_worker is False
+
+
 def test_reference_mongo_db_url_alias_and_existing_precedence(monkeypatch):
     from summon.config import BackupConnectionSettings
 

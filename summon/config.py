@@ -171,6 +171,8 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = []
     operator_ids: list[int] = []
     preview_mode: bool = False
+    # Opt-in in ordinary Python installs; enabled by the Render Docker image.
+    run_bot_worker: bool = False
     session_max_age: int = Field(default=3600, ge=60, le=86400)
     init_data_max_age: int = Field(default=3600, ge=60, le=86400)
     mongo_max_pool_size: int = Field(default=50, ge=1, le=500)

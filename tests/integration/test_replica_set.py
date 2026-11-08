@@ -111,6 +111,53 @@ async def test_api_becomes_ready_after_delayed_real_database_initialization(isol
                 assert (await http.get("/api/me")).status_code == 401
 
 
+async def test_combined_api_worker_uses_initialized_isolated_database(isolated_database):
+    from unittest.mock import patch
+
+    from httpx import ASGITransport, AsyncClient
+
+    from summon.api.app import create_app
+
+    _, existing = isolated_database
+    settings = Settings(
+        mongo_uri=os.environ["SUMMON_TEST_MONGO_URI"],
+        mongo_database=existing.name,
+        bot_token="123:synthetic-token",
+        telegram_api_id=123,
+        telegram_api_hash="synthetic-api-hash",
+        webhooks_disabled_confirmed=True,
+        run_bot_worker=True,
+        _env_file=None,
+    )
+    started, stopped = asyncio.Event(), asyncio.Event()
+    app = create_app(settings=settings, telegram_bot=object())
+
+    async def synthetic_worker(*, settings, shared_database, on_started, embedded):
+        assert embedded is True and settings is not None
+        mongo, database = shared_database
+        assert database.name == existing.name and database.client is mongo
+        assert (await database.command("ping"))["ok"] == 1
+        on_started()
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    with patch("summon.bot.supervisor.run", side_effect=synthetic_worker) as worker:
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://testserver"
+            ) as http:
+                await asyncio.wait_for(started.wait(), timeout=30)
+                assert (await http.get("/health/ready")).json() == {"status": "ready"}
+                response = await http.get("/health/bot")
+                assert response.status_code == 200 and response.json() == {"status": "running"}
+                assert (await http.get("/")).json()["bot_status"] == "running"
+        worker.assert_awaited_once()
+    assert stopped.is_set()
+
+
 async def test_concurrent_spawn_claim_awards_exactly_one_player(isolated_database):
     client, db = isolated_database
     now = datetime.now(UTC)

@@ -13,5 +13,11 @@ def main() -> None:
     # The application logs route templates; Uvicorn's default access log would
     # also emit raw paths/query strings containing member and warning IDs.
     uvicorn.run(
-        "summon.api.app:app", host="0.0.0.0", port=port, proxy_headers=True, access_log=False
+        "summon.api.app:app",
+        host="0.0.0.0",
+        port=port,
+        proxy_headers=True,
+        access_log=False,
+        # One API process also means one embedded bot supervisor per instance.
+        workers=1,
     )

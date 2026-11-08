@@ -168,7 +168,7 @@ jobs:
           RUN test ! -e /context/.git && test ! -e /context/.env && test ! -e /context/web/.env.local \
               && test ! -e /context/summon/synthetic.session && test ! -e /context/private-export.txt \
               && test ! -e /context/migration-data && test -f /context/summon/bot/main.py \
-              && test -f /context/web/src/App.tsx && test -f /context/web/tests/setup.ts
+              && test ! -e /context/web
           DOCKERFILE
           docker build --file "$RUNNER_TEMP/context-check.Dockerfile" --tag summon-ci-context .
       - name: Build the pinned runtime image
@@ -190,11 +190,11 @@ jobs:
             docker logs --tail 30 summon-ci-web
             exit 1
           fi
-          docker exec summon-ci-web sh -c 'test "$(id -u)" -eq 10001 && test -r /app/web/dist/index.html && test ! -e /app/.env && test ! -d /app/web/node_modules'
+          docker exec summon-ci-web sh -c 'test "$(id -u)" -eq 10001 && test ! -e /app/.env && test ! -d /app/web/dist && test ! -d /app/web/node_modules'
           docker exec summon-ci-web python -c 'from summon.bot.main import main; assert callable(main)'
           docker exec summon-ci-web python -c 'import ssl; c = ssl.create_default_context(); assert c.verify_mode == ssl.CERT_REQUIRED and c.check_hostname and c.get_ca_certs()'
-          curl --fail --silent http://127.0.0.1:19090/ | grep -q '<div id="root">'
-          curl --fail --silent http://127.0.0.1:19090/art/aiko.webp > /dev/null
+          curl --fail --silent http://127.0.0.1:19090/ | python -c 'import json,sys; assert json.load(sys.stdin)["bot_status"] == "disabled"'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19090/health/bot)" = 503
           curl --fail --silent http://127.0.0.1:19090/api/bootstrap | python -c 'import json,sys; assert json.load(sys.stdin)["data"]["preview"] is True'
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19090/api/not-a-route)" = 404
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST http://127.0.0.1:19090/api/auth/session)" = 403
@@ -215,6 +215,8 @@ jobs:
           if [[ "$live" != true ]]; then docker logs --tail 30 summon-ci-offline; exit 1; fi
           test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/health/ready)" = 503
           test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/api/me)" = 503
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/health/bot)" = 503
+          curl --fail --silent --max-time 2 http://127.0.0.1:19091/ | python -c 'import json,sys; d=json.load(sys.stdin); assert d["bot_status"] == "waiting_for_database"'
           curl --fail --silent --max-time 2 http://127.0.0.1:19091/api/bootstrap > /dev/null
           # A failed selection/retry must not close the listening service.
           sleep 7
