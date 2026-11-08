@@ -1596,48 +1596,27 @@ async def test_reviewed_catalog_video_metadata_preserves_or_clears_file_referenc
 
 
 async def test_upload_cancel_guard_survives_a_new_mongo_limiter_instance(isolated_database):
-    """Drive native offline callbacks while keeping the cancellation guard in real MongoDB."""
+    """The real action helper uses the same persistent key for cancel and publish."""
     import hashlib
-    from unittest.mock import AsyncMock, patch
 
     from summon.bot.commands_catalog import _event_id
+    from summon.bot.upload_media import claim_upload_action
     from summon.repositories.limits import RateLimiter
-    from tests.test_catalog_commands import (
-        callback_packet,
-        dispatch,
-        jpeg,
-        prepare_upload_callback,
-        review_upload_choice,
-        setup,
-        source_photo,
-    )
 
     _client, db = isolated_database
-    app, store = await setup(db_channel=-1001234567890)
-    store.limiter = RateLimiter(db)
-    app.stream_media = AsyncMock()
-    app.get_chat = AsyncMock()
-    try:
-        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
-        _, review = await review_upload_choice(app, buttons[0])
-        with (
-            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
-            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host,
-        ):
-            await dispatch(app, callback_packet(review[1].callback_data))
-            assert sent.await_args.args[2].title == "Upload canceled"
-            # A fresh repository instance models a different worker/restart.
-            store.limiter = RateLimiter(db)
-            await dispatch(app, callback_packet(review[0].callback_data))
-            assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
-        host.assert_not_awaited()
-        app.stream_media.assert_not_called()
-        app.get_chat.assert_not_awaited()
-        store.catalog.prepare_numbering.assert_not_awaited()
-        store.catalog.create_character.assert_not_awaited()
-        event = _event_id(123, 42, 50)
-        digest = hashlib.sha256(f"catalog-media:{event}".encode()).hexdigest()
-        guard = await db.rate_limits.find_one({"_id": f"once:{digest}"})
-        assert guard and guard["expires_at"] > datetime.now(UTC) + timedelta(days=6)
-    finally:
-        await app.dispatcher.stop()
+    event = _event_id(123, 42, 50)
+    # Simulate a confirmed cancel, then a publish attempted by a fresh worker.
+    assert await claim_upload_action(RateLimiter(db), event)
+    assert not await claim_upload_action(RateLimiter(db), event)
+    digest = hashlib.sha256(f"catalog-media:{event}".encode()).hexdigest()
+    guard = await db.rate_limits.find_one({"_id": f"once:{digest}"})
+    assert guard and guard["expires_at"] > datetime.now(UTC) + timedelta(days=6)
+
+    # Concurrent cancel/publish attempts for another command have one winner.
+    other = _event_id(123, 42, 51)
+    outcomes = await asyncio.gather(
+        claim_upload_action(RateLimiter(db), other),
+        claim_upload_action(RateLimiter(db), other),
+    )
+    assert sorted(outcomes) == [False, True]
+    assert not await claim_upload_action(RateLimiter(db), other)

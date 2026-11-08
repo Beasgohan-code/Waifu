@@ -17,6 +17,7 @@ from wzgram.types import Message
 
 from summon.models import CharacterBasics
 from summon.rarities import RARITIES, Rarity, parse_rarity
+from summon.repositories.limits import RateLimiter
 from summon.services.artwork import MAX_ARTWORK_BYTES, InvalidArtwork
 from summon.services.catbox import MAX_MEDIA_BYTES, valid_media_signature
 
@@ -159,6 +160,11 @@ def menu_token(
 
 def valid_token(expected: str, actual: str) -> bool:
     return hmac.compare_digest(expected, actual)
+
+
+async def claim_upload_action(limiter: RateLimiter, event_id: str) -> bool:
+    """Make publish and cancel contend for one durable command-level claim."""
+    return await limiter.claim_once(f"catalog-media:{event_id}", seconds=7 * 86400)
 
 
 async def read_motion(

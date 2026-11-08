@@ -34,6 +34,7 @@ from summon.bot.telegram_helpers import _user, callback_data, command_input, tel
 from summon.bot.upload_media import (
     Provider,
     UploadPurpose,
+    claim_upload_action,
     menu_token,
     parse_upload,
     read_motion,
@@ -773,9 +774,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 # confirmed cancel prevents every older review for this command
                 # from publishing; it cannot undo an already claimed upload.
                 claim_started = True
-                if not await store.limiter.claim_once(
-                    f"catalog-media:{event_id}", seconds=7 * 86400
-                ):
+                if not await claim_upload_action(store.limiter, event_id):
                     raise ImageHostAlreadyAttempted
             if purpose == "publish":
                 # Do not run even the numbering backfill for a canceled or
