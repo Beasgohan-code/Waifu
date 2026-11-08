@@ -328,6 +328,8 @@ async def make_worker(monkeypatch, *, stop_mode="normal"):
     monkeypatch.setattr(module, "Client", factory)
     monkeypatch.setattr(module, "Store", lambda *_args: object())
     monkeypatch.setattr(module, "register_handlers", lambda *_args: None)
+    # This harness isolates worker supervision; the real manifest has dedicated tests.
+    monkeypatch.setattr(module, "validate_handler_registration", lambda *_args: None)
     monkeypatch.setattr(module, "start_verified_client", AsyncMock())
     monkeypatch.setattr(module, "register_command_menus", AsyncMock())
     monkeypatch.setattr(module, "monitor_connection", monitor)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from pymongo.errors import PyMongoError
 from wzgram import Client, idle
 from wzgram.errors import RPCError
 from wzgram.types import BotCommandScopeAllGroupChats
@@ -13,10 +14,11 @@ from summon.api.context import Store
 from summon.bot.compat import validate_runtime
 from summon.bot.handlers import COMMANDS, group_commands, register_handlers
 from summon.bot.ingress import IngressLease
+from summon.bot.registration import validate_handler_registration
 from summon.bot.session_storage import bot_id_from_token, start_verified_client, worker_storage
 from summon.bot.watchdog import monitor_connection
 from summon.config import Settings
-from summon.database import connect_database
+from summon.database import connect_database, safe_startup_error
 from summon.repositories.poller_health import PollerHealthRepository
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,10 @@ async def run() -> None:
             "setting SUMMON_WEBHOOKS_DISABLED_CONFIRMED=true"
         )
 
-    mongo, database = await connect_database(settings)
+    try:
+        mongo, database = await connect_database(settings)
+    except PyMongoError as exc:
+        raise safe_startup_error(exc) from None
     lease = IngressLease(database, bot_id)
     bot: Client | None = None
     lease_task: asyncio.Task[None] | None = None
@@ -74,13 +79,7 @@ async def run() -> None:
         # Wzgram schedules registration on the current event loop. Let the
         # registration tasks finish and verify them BEFORE connecting Telegram.
         await asyncio.sleep(0)
-        groups = bot.dispatcher.groups
-        if (
-            len(groups.get(-1000, ())) < 3
-            or len(groups.get(-100, ())) < 2
-            or len(groups.get(0, ())) < 40
-        ):
-            raise RuntimeError("Wzgram handlers did not finish registering")
+        validate_handler_registration(bot)
 
         async def start_bot() -> None:
             if bot is None:

@@ -35,7 +35,12 @@ from summon.auth import (
 from summon.bot.emoji_palette import palette_icon
 from summon.bot.session_storage import APIStorage, bot_id_from_token, start_verified_client
 from summon.config import Settings
-from summon.database import DatabaseTopologyError, connect_database, require_transaction_topology
+from summon.database import (
+    DatabaseTopologyError,
+    connect_database,
+    require_transaction_topology,
+    safe_startup_error,
+)
 from summon.repositories.poller_health import PollerHealthRepository
 
 logger = logging.getLogger(__name__)
@@ -65,60 +70,74 @@ def create_app(
     async def lifespan(app: FastAPI):
         client = None
         owned_bot = None
-        app.state.settings = settings
-        if settings.preview_mode:
-            app.state.preview_cursor_secret = secrets.token_urlsafe(32)
-        if store is not None:
-            app.state.store = store
-        elif settings.preview_mode:
-            from summon.api.preview import PreviewStore
-
-            app.state.store = PreviewStore()
-        else:
-            client, database = await connect_database(settings)
-            app.state.database = database
-            app.state.store = Store(client, database)
-        if telegram_bot is not None:
-            app.state.telegram_bot = telegram_bot
-        elif (
-            store is None
-            and not settings.preview_mode
-            and client is not None
-            and settings.bot_token.get_secret_value()
-            and settings.telegram_api_id
-            and settings.telegram_api_hash.get_secret_value()
-        ):
-            # Each API process has its own in-memory, no-updates MTProto session.
-            # Only peer records, never auth keys or update state, are shared with
-            # the persistent worker session.
-            token = settings.bot_token.get_secret_value()
-            candidate = Client(
-                "summon-api",
-                api_id=settings.telegram_api_id,
-                api_hash=settings.telegram_api_hash.get_secret_value(),
-                bot_token=token,
-                storage_engine=APIStorage(client[settings.telegram_session_database]),
-                no_updates=True,
-            )
-            try:
-                async with asyncio.timeout(30):
-                    await start_verified_client(candidate, token, bot_id_from_token(token))
-            except Exception as exc:
-                logger.warning("Telegram group management unavailable (%s)", type(exc).__name__)
-                await candidate.stop()
-                app.state.telegram_bot = None
-            else:
-                owned_bot = candidate
-                app.state.telegram_bot = candidate
-        else:
-            app.state.telegram_bot = None
+        candidate = None
         try:
+            app.state.settings = settings
+            if settings.preview_mode:
+                app.state.preview_cursor_secret = secrets.token_urlsafe(32)
+            if store is not None:
+                app.state.store = store
+            elif settings.preview_mode:
+                from summon.api.preview import PreviewStore
+
+                app.state.store = PreviewStore()
+            else:
+                try:
+                    client, database = await connect_database(settings)
+                except PyMongoError as exc:
+                    # Driver exceptions can contain hosts or connection details.
+                    raise safe_startup_error(exc) from None
+                app.state.database = database
+                app.state.store = Store(client, database)
+            if telegram_bot is not None:
+                app.state.telegram_bot = telegram_bot
+            elif (
+                store is None
+                and not settings.preview_mode
+                and client is not None
+                and settings.bot_token.get_secret_value()
+                and settings.telegram_api_id
+                and settings.telegram_api_hash.get_secret_value()
+            ):
+                # Each API process has its own in-memory, no-updates MTProto session.
+                # Only peer records, never auth keys or update state, are shared with
+                # the persistent worker session.
+                token = settings.bot_token.get_secret_value()
+                candidate = Client(
+                    "summon-api",
+                    api_id=settings.telegram_api_id,
+                    api_hash=settings.telegram_api_hash.get_secret_value(),
+                    bot_token=token,
+                    storage_engine=APIStorage(client[settings.telegram_session_database]),
+                    no_updates=True,
+                )
+                try:
+                    async with asyncio.timeout(30):
+                        await start_verified_client(candidate, token, bot_id_from_token(token))
+                except Exception as exc:
+                    logger.warning("Telegram group management unavailable (%s)", type(exc).__name__)
+                    await candidate.stop()
+                    candidate = None
+                    app.state.telegram_bot = None
+                else:
+                    owned_bot = candidate
+                    app.state.telegram_bot = candidate
+                    candidate = None
+            else:
+                app.state.telegram_bot = None
             yield
         finally:
-            if owned_bot is not None:
-                await owned_bot.stop()
-            if client is not None:
-                await client.close()
+            # Startup can fail or be cancelled after MongoDB connects but
+            # before the lifespan yields. Always close the no-updates
+            # client and MongoDB in that case, too.
+            try:
+                if candidate is not None:
+                    await candidate.stop()
+                if owned_bot is not None:
+                    await owned_bot.stop()
+            finally:
+                if client is not None:
+                    await client.close()
 
     app = FastAPI(title="SUMMON API", version="0.1.0", lifespan=lifespan)
     if settings.allowed_origins:

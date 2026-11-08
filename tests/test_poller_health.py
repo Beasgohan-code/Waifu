@@ -471,6 +471,8 @@ async def test_worker_passes_optional_health_repository_and_cleans_up(enabled, m
     monkeypatch.setattr(bot_main, "Client", lambda *_args, **_kwargs: bot)
     monkeypatch.setattr(bot_main, "Store", lambda *_args: object())
     monkeypatch.setattr(bot_main, "register_handlers", lambda *_args: None)
+    # This synthetic worker isolates heartbeat behavior, not handler registration.
+    monkeypatch.setattr(bot_main, "validate_handler_registration", lambda *_args: None)
     monkeypatch.setattr(bot_main, "start_verified_client", AsyncMock())
     monkeypatch.setattr(bot_main, "register_command_menus", AsyncMock())
     monkeypatch.setattr(bot_main, "PollerHealthRepository", lambda *_args: repository)

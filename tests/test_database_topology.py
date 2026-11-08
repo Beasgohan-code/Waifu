@@ -257,3 +257,100 @@ async def test_enabled_polling_health_is_explicitly_forwarded_to_schema_initiali
     ):
         _, db = await connect_database(settings)
     initialize.assert_awaited_once_with(db, include_poller_health=True)
+
+
+@pytest.mark.parametrize("driver_error", ["selection", "authentication", "configuration"])
+async def test_api_startup_redacts_mongo_driver_details(driver_error):
+    import traceback
+
+    from pymongo.errors import ConfigurationError, ServerSelectionTimeoutError
+
+    from summon.api.app import create_app
+    from summon.database import DatabaseStartupError
+
+    error_type = {
+        "selection": ServerSelectionTimeoutError,
+        "authentication": OperationFailure,
+        "configuration": ConfigurationError,
+    }[driver_error]
+    error = error_type("PRIVATE_HOST PRIVATE_CONNECTION_STRING PRIVATE_PASSWORD")
+    app = create_app(settings=Settings(_env_file=None))
+    with (
+        patch("summon.api.app.connect_database", AsyncMock(side_effect=error)),
+        pytest.raises(DatabaseStartupError) as raised,
+    ):
+        async with app.router.lifespan_context(app):
+            pytest.fail("startup must not continue without MongoDB")
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "MongoDB" in rendered and "PRIVATE_" not in rendered
+    assert raised.value.__suppress_context__ is True
+    if driver_error == "selection":
+        assert "outbound IP access list" in rendered
+        assert "cannot be determined" in rendered
+
+
+async def test_bot_startup_redacts_mongo_driver_details(monkeypatch):
+    import traceback
+    from importlib import import_module
+
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    from summon.database import DatabaseStartupError
+
+    module = import_module("summon.bot.main")
+    settings = Settings(
+        bot_token="123:synthetic",
+        telegram_api_id=12345,
+        telegram_api_hash="synthetic",
+        webhooks_disabled_confirmed=True,
+        _env_file=None,
+    )
+    monkeypatch.setattr(module, "Settings", lambda: settings)
+    monkeypatch.setattr(module, "validate_runtime", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "connect_database",
+        AsyncMock(side_effect=ServerSelectionTimeoutError("PRIVATE_HOST")),
+    )
+    with pytest.raises(DatabaseStartupError) as raised:
+        await module.run()
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "outbound IP access list" in rendered
+    assert "PRIVATE_HOST" not in rendered
+    assert raised.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize(
+    ("error", "hint"),
+    [
+        (
+            "SSL handshake failed: PRIVATE_HOST TLSV1_ALERT_INTERNAL_ERROR PRIVATE_CREDENTIAL",
+            "TLS handshake failed",
+        ),
+        (
+            "SSL handshake failed: PRIVATE_HOST CERTIFICATE_VERIFY_FAILED PRIVATE_CREDENTIAL",
+            "certificate verification failed",
+        ),
+        ("PRIVATE_HOST PRIVATE_CREDENTIAL", "server selection timed out"),
+    ],
+)
+def test_mongo_startup_hints_are_specific_but_never_include_driver_details(error, hint):
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    from summon.database import safe_startup_error
+
+    message = str(safe_startup_error(ServerSelectionTimeoutError(error)))
+    assert hint in message
+    assert "PRIVATE_" not in message
+    if "handshake failed" in hint:
+        assert "outbound IP" in message and "cannot be determined" in message
+        assert "do not disable TLS verification" in message
+
+
+@pytest.mark.parametrize("code", [13, 18])
+def test_mongo_startup_authentication_hint_never_reveals_server_message(code):
+    from summon.database import safe_startup_error
+
+    message = str(safe_startup_error(OperationFailure("PRIVATE_CREDENTIAL", code=code)))
+    assert "authentication or authorization" in message
+    assert "PRIVATE_CREDENTIAL" not in message

@@ -8,12 +8,12 @@ from wzgram import Client
 from wzgram.errors import BadRequest, Forbidden
 from wzgram.types import Message
 
-from summon.bot.commands_catalog import register_catalog_commands
 from summon.bot.commands_collector import register_collector_commands
-from summon.bot.commands_exchange import register_exchange_commands
-from summon.bot.commands_groups import register_group_commands
-from summon.bot.events import register_group_events
 from summon.bot.menu import COMMANDS, group_commands
+from summon.bot.modules.catalog_admin import register_catalog_commands
+from summon.bot.modules.exchange import register_exchange_commands
+from summon.bot.modules.group_events import register_group_events
+from summon.bot.modules.groups import register_group_commands
 from summon.bot.presentation import Card, Emoji, send_card, send_ephemeral_card, send_photo_card
 from summon.bot.protection import GroupProtection
 from summon.bot.telegram_helpers import _group

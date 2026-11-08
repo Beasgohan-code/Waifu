@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from wzgram import Client
 from wzgram.errors import BadRequest
 
@@ -205,3 +206,233 @@ async def test_trade_proposal_is_rate_limited_before_creating_offer():
     trades.create.assert_not_awaited()
     assert "too many" in response.await_args.args[3].body.lower()
     assert limiter.allow.await_args.args[0] == "user:42:trade"
+
+
+async def bot_with_real_registration():
+    """Create a native Wzgram dispatcher without connecting to Telegram."""
+    from summon.bot.ingress import IngressLease
+
+    class StubDatabase:
+        def __getitem__(self, _key):
+            return self
+
+        def with_options(self, **_kwargs):
+            return self
+
+    app = Client(
+        "offline-manifest", api_id=123, api_hash="test", bot_token="123:fake", in_memory=True
+    )
+    IngressLease(StubDatabase(), 123).register(app)
+    register_handlers(app, make_store(), Settings(_env_file=None))
+    await asyncio.sleep(0)
+    return app
+
+
+async def test_real_feature_modules_match_the_ordered_native_manifest():
+    from summon.bot.registration import validate_handler_registration
+
+    app = await bot_with_real_registration()
+    validate_handler_registration(app)
+    origins = {
+        handler.callback.__name__: handler.callback.__module__
+        for handler in app.dispatcher.groups[0]
+    }
+    assert origins["start"] == "summon.bot.modules.start"
+    assert origins["search_characters"] == "summon.bot.modules.search"
+    assert origins["show_favorites"] == "summon.bot.modules.favorites"
+    assert origins["create_character"] == "summon.bot.modules.catalog_admin"
+    assert origins["propose_trade"] == "summon.bot.modules.exchange"
+    assert origins["group_activity"] == "summon.bot.modules.group_events"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing-guard",
+        "duplicate-guard",
+        "missing-command",
+        "reordered",
+        "filter",
+        "extra-group",
+        "wrong-kind",
+    ],
+)
+async def test_registration_fails_closed_for_incomplete_or_unexpected_handlers(change):
+    from wzgram.handlers import MessageHandler
+
+    from summon.bot.registration import validate_handler_registration
+
+    app = await bot_with_real_registration()
+    groups = app.dispatcher.groups
+    if change == "missing-guard":
+        groups[-1000].pop()
+    elif change == "duplicate-guard":
+        groups[-1000][0] = groups[-1000][1]  # The old count-only check would pass.
+    elif change == "missing-command":
+        groups[0].pop(0)
+    elif change == "reordered":
+        observer = next(h for h in groups[0] if h.callback.__name__ == "group_activity")
+        groups[0].remove(observer)
+        groups[0].insert(0, observer)
+    elif change == "filter":
+        groups[0][0].filters = None
+    elif change == "extra-group":
+        groups[100] = []
+    elif change == "wrong-kind":
+        callback = groups[-1000][-1]
+        groups[-1000][-1] = MessageHandler(callback.callback, callback.filters)
+    with pytest.raises(RuntimeError, match="handler"):
+        validate_handler_registration(app)
+
+
+def test_module_entrypoint_calls_the_same_worker_main():
+    import runpy
+
+    with patch("summon.bot.main.main") as main:
+        runpy.run_module("summon.bot", run_name="__main__")
+    main.assert_called_once_with()
+
+
+async def test_worker_refuses_incomplete_registration_before_connecting(monkeypatch):
+    from importlib import import_module
+
+    module = import_module("summon.bot.main")
+    settings = Settings(
+        bot_token="123:fake",
+        session_secret="s" * 40,
+        telegram_api_id=123,
+        telegram_api_hash="fake",
+        webhooks_disabled_confirmed=True,
+        _env_file=None,
+    )
+    mongo = SimpleNamespace(close=AsyncMock())
+    bot = SimpleNamespace(
+        dispatcher=SimpleNamespace(groups={-1000: [object(), object()], -100: [], 0: []}),
+        is_connected=False,
+        is_initialized=False,
+        stop=AsyncMock(),
+    )
+
+    async def maintain():
+        await asyncio.Event().wait()
+
+    lease = SimpleNamespace(
+        acquire=AsyncMock(),
+        maintain=maintain,
+        register=MagicMock(),
+        valid=MagicMock(return_value=True),
+        invalidate=MagicMock(),
+        release=AsyncMock(),
+    )
+    start = AsyncMock()
+    monkeypatch.setattr(module, "Settings", lambda: settings)
+    monkeypatch.setattr(module, "validate_runtime", lambda: None)
+    monkeypatch.setattr(module, "connect_database", AsyncMock(return_value=(mongo, object())))
+    monkeypatch.setattr(module, "IngressLease", lambda *_args: lease)
+    monkeypatch.setattr(module, "worker_storage", lambda *_args: object())
+    monkeypatch.setattr(module, "Client", lambda *_args, **_kwargs: bot)
+    monkeypatch.setattr(module, "Store", lambda *_args: object())
+    monkeypatch.setattr(module, "register_handlers", lambda *_args: None)
+    monkeypatch.setattr(module, "start_verified_client", start)
+    with pytest.raises(RuntimeError, match="registration"):
+        await module.run()
+    start.assert_not_awaited()
+    bot.stop.assert_awaited_once()
+    lease.release.assert_awaited_once()
+    mongo.close.assert_awaited_once()
+
+
+async def test_api_lifespan_closes_mongo_if_store_initialization_fails():
+    from summon.api.app import create_app
+
+    mongo = MagicMock(close=AsyncMock())
+    app = create_app(settings=Settings(_env_file=None))
+    with (
+        patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
+        patch("summon.api.app.Store", side_effect=RuntimeError("synthetic setup failure")),
+        pytest.raises(RuntimeError, match="synthetic setup failure"),
+    ):
+        async with app.router.lifespan_context(app):
+            pytest.fail("startup must not finish")
+    mongo.close.assert_awaited_once()
+
+
+async def test_api_lifespan_closes_resources_if_startup_is_cancelled():
+    from summon.api.app import create_app
+
+    settings = Settings(
+        bot_token="123:fake", telegram_api_id=12345, telegram_api_hash="hash", _env_file=None
+    )
+    mongo = MagicMock(close=AsyncMock())
+    bot = MagicMock(stop=AsyncMock())
+    started = asyncio.Event()
+
+    async def interrupted(*_args):
+        started.set()
+        await asyncio.Event().wait()
+
+    app = create_app(settings=settings)
+
+    async def boot():
+        async with app.router.lifespan_context(app):
+            pytest.fail("startup must not finish")
+
+    with (
+        patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
+        patch("summon.api.app.Store", return_value=object()),
+        patch("summon.api.app.Client", return_value=bot),
+        patch("summon.api.app.start_verified_client", side_effect=interrupted),
+    ):
+        task = asyncio.create_task(boot())
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    bot.stop.assert_awaited_once()
+    mongo.close.assert_awaited_once()
+
+
+async def test_api_lifespan_closes_mongo_even_if_telegram_shutdown_fails():
+    from summon.api.app import create_app
+
+    settings = Settings(
+        bot_token="123:fake", telegram_api_id=12345, telegram_api_hash="hash", _env_file=None
+    )
+    mongo = MagicMock(close=AsyncMock())
+    bot = MagicMock(stop=AsyncMock(side_effect=RuntimeError("synthetic shutdown failure")))
+    app = create_app(settings=settings)
+    with (
+        patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
+        patch("summon.api.app.Store", return_value=object()),
+        patch("summon.api.app.Client", return_value=bot),
+        patch("summon.api.app.start_verified_client", AsyncMock()),
+        pytest.raises(RuntimeError, match="synthetic shutdown failure"),
+    ):
+        async with app.router.lifespan_context(app):
+            assert app.state.telegram_bot is bot
+    mongo.close.assert_awaited_once()
+
+
+async def test_api_reports_telegram_unavailable_without_echoing_startup_error(caplog):
+    from summon.api.app import create_app
+
+    settings = Settings(
+        bot_token="123:fake", telegram_api_id=12345, telegram_api_hash="hash", _env_file=None
+    )
+    mongo = MagicMock(close=AsyncMock())
+    bot = MagicMock(stop=AsyncMock())
+    app = create_app(settings=settings)
+    with (
+        patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
+        patch("summon.api.app.Store", return_value=object()),
+        patch("summon.api.app.Client", return_value=bot),
+        patch(
+            "summon.api.app.start_verified_client",
+            AsyncMock(side_effect=ValueError("PRIVATE_SENTINEL")),
+        ),
+    ):
+        async with app.router.lifespan_context(app):
+            assert app.state.telegram_bot is None
+    bot.stop.assert_awaited_once()
+    mongo.close.assert_awaited_once()
+    assert "PRIVATE_SENTINEL" not in caplog.text

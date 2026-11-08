@@ -9,7 +9,12 @@ from __future__ import annotations
 from typing import Any
 
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
-from pymongo.errors import CollectionInvalid, OperationFailure
+from pymongo.errors import (
+    CollectionInvalid,
+    OperationFailure,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 from summon.auto_replies import (
     AUTO_REPLY_NAME_PATTERN,
@@ -338,6 +343,47 @@ async def initialize_database(database: Any, *, include_poller_health: bool = Fa
 
 class DatabaseTopologyError(RuntimeError):
     """The connected deployment cannot be used for transactional writes."""
+
+
+class DatabaseStartupError(RuntimeError):
+    """A redacted runtime-startup failure; server details stay out of logs."""
+
+
+def safe_startup_error(exc: PyMongoError) -> DatabaseStartupError:
+    """Provide guidance without echoing driver messages, hosts or credentials.
+
+    The driver may include server addresses and other sensitive connection
+    details in its message. Inspect fixed markers only; callers must raise the
+    resulting error with `from None` to suppress the original exception chain.
+    """
+    if isinstance(exc, ServerSelectionTimeoutError):
+        detail = str(exc)[:16384].upper()
+        if "CERTIFICATE_VERIFY_FAILED" in detail:
+            return DatabaseStartupError(
+                "MongoDB TLS certificate verification failed. Check the cluster's certificate "
+                "and the runtime's trusted CA configuration; do not disable TLS verification."
+            )
+        if "SSL HANDSHAKE FAILED" in detail or "TLSV1_ALERT_INTERNAL_ERROR" in detail:
+            return DatabaseStartupError(
+                "MongoDB TLS handshake failed during server selection. Check the cluster is "
+                "active, its project IP access list includes all hosting-service outbound IP "
+                "ranges, and routing and TLS settings are correct. The cause cannot be "
+                "determined from this alert alone; do not disable TLS verification."
+            )
+        return DatabaseStartupError(
+            "MongoDB server selection timed out. Check the cluster is running, the "
+            "service's outbound IP access list, network routing, URI and TLS settings. "
+            "The cause cannot be determined from the timeout alone."
+        )
+    if isinstance(exc, OperationFailure) and exc.code in {13, 18}:
+        return DatabaseStartupError(
+            "MongoDB authentication or authorization failed. Check the configured database "
+            "user and permissions, without sharing credentials."
+        )
+    return DatabaseStartupError(
+        "MongoDB startup failed. Check the URI, network access, TLS, cluster status "
+        "and database-user permissions."
+    )
 
 
 async def require_transaction_topology(client: Any) -> None:

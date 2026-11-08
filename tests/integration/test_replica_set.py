@@ -1599,7 +1599,7 @@ async def test_upload_cancel_guard_survives_a_new_mongo_limiter_instance(isolate
     """The real action helper uses the same persistent key for cancel and publish."""
     import hashlib
 
-    from summon.bot.commands_catalog import _event_id
+    from summon.bot.modules.catalog_admin import _event_id
     from summon.bot.upload_media import claim_upload_action
     from summon.repositories.limits import RateLimiter
 

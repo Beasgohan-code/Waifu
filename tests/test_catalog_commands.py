@@ -14,8 +14,8 @@ from wzgram.enums import ChatType
 from wzgram.handlers import RawUpdateHandler
 from wzgram.types import Chat, Message, Photo, User
 
-from summon.bot.commands_catalog import _event_id
 from summon.bot.handlers import register_handlers
+from summon.bot.modules.catalog_admin import _event_id
 from summon.config import Settings
 from summon.rarities import RARITY_WEIGHTS
 from summon.services.artwork import MAX_ARTWORK_BYTES
@@ -238,7 +238,7 @@ async def test_reply_to_photo_updates_image_without_touching_other_metadata():
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 return_value="https://i.ibb.co/test/photo.jpg",
             ),
@@ -389,7 +389,7 @@ async def test_imgbb_photo_upload_is_opt_in_claimed_once_and_used_as_catalog_url
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 return_value="https://i.ibb.co/abc/image.jpg",
             ) as hosted,
@@ -428,7 +428,9 @@ async def test_imgbb_duplicate_or_replayed_upload_never_contacts_host(blocked_by
     try:
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
-            patch("summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock) as hosted,
+            patch(
+                "summon.bot.modules.catalog_admin.upload_imgbb", new_callable=AsyncMock
+            ) as hosted,
         ):
             await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         hosted.assert_not_awaited()
@@ -455,7 +457,7 @@ async def test_imgbb_timeout_is_unconfirmed_and_does_not_modify_catalog(caplog):
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 side_effect=ImageHostError("PRIVATE_HOST_DETAIL"),
             ) as hosted,
@@ -483,7 +485,7 @@ async def test_imgbb_success_then_database_failure_warns_about_possible_orphan()
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 return_value="https://i.ibb.co/abc/image.jpg",
             ) as hosted,
@@ -525,7 +527,7 @@ async def test_configured_channel_receives_sanitized_photo_only_after_catalog_sa
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 return_value="https://i.ibb.co/test/photo.jpg",
             ),
@@ -554,7 +556,7 @@ async def test_db_channel_never_posts_to_a_group_and_warns_after_catalog_save():
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 return_value="https://i.ibb.co/test/photo.jpg",
             ),
@@ -583,7 +585,7 @@ async def test_db_channel_timeout_does_not_retry_or_undo_confirmed_catalog():
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 return_value="https://i.ibb.co/test/photo.jpg",
             ),
@@ -626,7 +628,7 @@ async def test_imgbb_photo_update_requires_existing_id_and_never_changes_ownersh
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
             patch(
-                "summon.bot.commands_catalog.upload_imgbb",
+                "summon.bot.modules.catalog_admin.upload_imgbb",
                 new_callable=AsyncMock,
                 return_value="https://i.ibb.co/abc/image.jpg",
             ),
@@ -649,7 +651,9 @@ async def test_imgbb_key_alone_does_not_write_new_photo_blobs_to_mongo():
     try:
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
-            patch("summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock) as hosted,
+            patch(
+                "summon.bot.modules.catalog_admin.upload_imgbb", new_callable=AsyncMock
+            ) as hosted,
         ):
             await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         hosted.assert_not_awaited()
@@ -666,7 +670,9 @@ async def test_imgbb_mode_still_rejects_protected_media_before_network():
     try:
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
-            patch("summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock) as hosted,
+            patch(
+                "summon.bot.modules.catalog_admin.upload_imgbb", new_callable=AsyncMock
+            ) as hosted,
         ):
             await dispatch(
                 app,
@@ -1061,7 +1067,9 @@ async def test_native_photo_provider_choice_saves_host_url_and_archived_file_id(
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock, side_effect=host
+                "summon.bot.modules.catalog_admin.upload_imgbb",
+                new_callable=AsyncMock,
+                side_effect=host,
             ) as hosted,
         ):
             await dispatch(app, callback_packet(review_buttons[0].callback_data))
@@ -1128,7 +1136,7 @@ async def test_native_video_upload_uses_catbox_and_forces_amv():
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/example.mp4",
             ) as hosted,
@@ -1176,7 +1184,9 @@ async def test_native_upload_menu_rejects_other_actor_or_changed_signed_inputs(c
             source.photo.file_size += 1
         else:
             source.photo.file_unique_id = "different-photo"
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as hosted:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as hosted:
             await dispatch(app, callback_packet(callback, user_id=user_id))
         hosted.assert_not_awaited()
         app.stream_media.assert_not_called()
@@ -1205,7 +1215,7 @@ async def test_native_channel_timeout_keeps_original_file_id_and_warns_without_r
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/example.jpg",
             ),
@@ -1259,7 +1269,7 @@ async def test_native_gif_upload_uses_animation_file_id_and_amv_rarity():
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/example.gif",
             ),
@@ -1295,7 +1305,9 @@ async def test_upload_action_tokens_cannot_be_reused_for_another_phase(button, r
             "cancel": review_buttons[1].callback_data,
         }[button]
         forged = original.replace(original.split(":", 1)[0], replacement, 1)
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(app, callback_packet(forged))
         assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
         app.stream_media.assert_not_called()
@@ -1327,8 +1339,10 @@ async def test_cancel_blocks_every_provider_review_without_external_side_effects
         _, imgbb_review = await review_upload_choice(app, buttons[1])
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
-            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as catbox,
-            patch("summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock) as imgbb,
+            patch(
+                "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+            ) as catbox,
+            patch("summon.bot.modules.catalog_admin.upload_imgbb", new_callable=AsyncMock) as imgbb,
         ):
             await dispatch(app, callback_packet(imgbb_review[1].callback_data))
             assert sent.await_args.args[2].title == "Upload canceled"
@@ -1359,7 +1373,9 @@ async def test_expired_review_never_claims_or_publishes():
         )
         _, review = await review_upload_choice(app, buttons[0])
         command.date = datetime.now(UTC) - timedelta(minutes=16)
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(app, callback_packet(review[0].callback_data))
         assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
         host.assert_not_awaited()
@@ -1378,7 +1394,9 @@ async def test_uncertain_upload_claim_never_starts_external_io(phase):
     try:
         buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
         _, review = await review_upload_choice(app, buttons[0])
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(
                 app, callback_packet(review[0 if phase == "publish" else 1].callback_data)
             )
@@ -1403,7 +1421,9 @@ async def test_upload_conflict_after_review_stops_before_claim_or_external_io():
     try:
         buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
         _, review = await review_upload_choice(app, buttons[0])
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(app, callback_packet(review[0].callback_data))
         assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
         assert "already exists" in app.answer_callback_query.await_args.kwargs["text"]
@@ -1425,7 +1445,9 @@ async def test_numbering_failure_after_claim_cannot_start_media_upload():
     try:
         buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
         _, review = await review_upload_choice(app, buttons[0])
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(app, callback_packet(review[0].callback_data))
         args = app.answer_callback_query.await_args.kwargs
         assert args["show_alert"] is True and "No upload started" in args["text"]
@@ -1478,7 +1500,7 @@ async def test_refreshed_telegram_file_reference_keeps_review_valid():
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/example.jpg",
             ) as host,
@@ -1520,7 +1542,9 @@ async def test_operator_revocation_after_review_prevents_publication():
         buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
         _, review = await review_upload_choice(app, buttons[0])
         app._test_settings.operator_ids = []
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(app, callback_packet(review[0].callback_data))
         assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
         store.limiter.claim_once.assert_not_awaited()
@@ -1593,7 +1617,9 @@ async def test_reviewed_photo_replacement_preserves_id_and_waits_for_confirmatio
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock, side_effect=host
+                "summon.bot.modules.catalog_admin.upload_imgbb",
+                new_callable=AsyncMock,
+                side_effect=host,
             ) as hosted,
         ):
             await dispatch(app, callback_packet(review[0].callback_data))
@@ -1658,7 +1684,7 @@ async def test_reviewed_video_replacement_shows_amv_and_keeps_original_id_on_arc
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/new.mp4",
             ) as host,
@@ -1688,7 +1714,9 @@ async def test_replacement_stale_before_upload_requires_new_review_without_claim
             app, "/updatechar aiko media", source_photo(jpeg())
         )
         _, review = await review_upload_choice(app, buttons[0])
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(app, callback_packet(review[0].callback_data))
         args = app.answer_callback_query.await_args.kwargs
         assert args["show_alert"] is True and "review" in args["text"].lower()
@@ -1724,7 +1752,7 @@ async def test_replacement_stale_after_hosting_warns_about_public_orphans_and_ne
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/new.jpg",
             ) as host,
@@ -1755,7 +1783,7 @@ async def test_canceling_replacement_ignores_later_catalog_edits_and_blocks_old_
         store.catalog.edit_state.return_value = replacement_state("b" * 64)
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
-            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host,
+            patch("summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock) as host,
         ):
             await dispatch(app, callback_packet(review[1].callback_data))
             assert sent.await_args.args[2].title == "Upload canceled"
@@ -1793,7 +1821,7 @@ async def test_replacement_unavailable_for_missing_or_invalid_catalog_record(bro
         )
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
-            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host,
+            patch("summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock) as host,
         ):
             await dispatch(app, callback_packet(buttons[0].callback_data))
         assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
@@ -1844,7 +1872,7 @@ async def test_reviewed_gif_replacement_publishes_animation_reference_as_amv():
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/new.gif",
             ) as host,
@@ -1872,7 +1900,7 @@ async def test_replacement_deleted_after_review_can_still_be_canceled_without_io
         store.catalog.edit_state.return_value = {"revision": "b" * 64, "character": None}
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
-            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host,
+            patch("summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock) as host,
         ):
             await dispatch(app, callback_packet(review[0].callback_data))
             assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
@@ -1901,7 +1929,9 @@ async def test_tampered_replacement_review_cannot_claim_or_upload():
         _, review = await review_upload_choice(app, buttons[0])
         data = review[0].callback_data
         forged = data[:-1] + ("A" if data[-1] != "A" else "B")
-        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+        with patch(
+            "summon.bot.modules.catalog_admin.upload_catbox", new_callable=AsyncMock
+        ) as host:
             await dispatch(app, callback_packet(forged))
         assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
         store.limiter.claim_once.assert_not_awaited()
@@ -1931,7 +1961,7 @@ async def test_replacement_host_timeout_is_unconfirmed_and_button_is_not_retried
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 side_effect=TimeoutError("synthetic provider detail"),
             ) as host,
@@ -1981,7 +2011,7 @@ async def test_stale_replacement_can_be_reviewed_again_before_its_command_expire
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
-                "summon.bot.commands_catalog.upload_catbox",
+                "summon.bot.modules.catalog_admin.upload_catbox",
                 new_callable=AsyncMock,
                 return_value="https://files.catbox.moe/new.jpg",
             ) as host,
@@ -2027,7 +2057,7 @@ async def test_native_wzgram_reference_search_aliases_offer_actor_bound_pages(co
         )
         app.get_messages = AsyncMock(return_value=original)
         app.answer_callback_query = AsyncMock(return_value=True)
-        with patch("summon.bot.commands_collector.edit_text_card", new_callable=AsyncMock) as edit:
+        with patch("summon.bot.modules.search.edit_text_card", new_callable=AsyncMock) as edit:
             await dispatch(app, callback_packet(buttons[0].callback_data))
         assert store.catalog.list.await_args.kwargs == {"search": "Aiko", "page": 2, "limit": 10}
         assert edit.await_args.args[1].title == "Character search"
