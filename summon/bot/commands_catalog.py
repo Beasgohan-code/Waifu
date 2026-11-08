@@ -24,11 +24,16 @@ from wzgram.errors import RPCError
 from wzgram.types import CallbackQuery, Message
 
 from summon.auth import TelegramUser
-from summon.bot.keyboards import operator_panel_keyboard, upload_provider_keyboard
+from summon.bot.keyboards import (
+    operator_panel_keyboard,
+    upload_provider_keyboard,
+    upload_review_keyboard,
+)
 from summon.bot.presentation import Card, Emoji, callback_text, send_media_card, send_photo_card
 from summon.bot.telegram_helpers import _user, callback_data, command_input, telegram_user
 from summon.bot.upload_media import (
     Provider,
+    UploadPurpose,
     menu_token,
     parse_upload,
     read_motion,
@@ -473,10 +478,10 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             message,
             Card(
                 "Choose a media host",
-                "The selected file becomes public. Catbox accepts photos and moving media; "
-                "ImgBB is available for photos when its key is configured. "
-                "Videos and GIFs may retain embedded metadata. "
-                "The channel copy and provider upload cannot be undone automatically.",
+                "Choose a host to review the details; nothing is uploaded yet. "
+                "Catbox accepts photos and moving media; ImgBB is available for photos "
+                "when its key is configured. Publishing makes the file public. "
+                "Videos and GIFs may retain embedded metadata.",
                 emoji=Emoji.OPEN_COLLECTION,
                 fields=(
                     ("Character", parsed.name),
@@ -673,8 +678,11 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             logger.warning("Catalog archive delivery unconfirmed (%s)", type(exc).__name__)
             return original_file_id, False
 
-    @app.on_callback_query(filters.regex("^catalog-upload:") | filters.regex(b"^catalog-upload:"))
-    async def upload_choice(_client: Client, callback: CallbackQuery) -> None:
+    @app.on_callback_query(
+        filters.regex(r"^catalog-(?:upload|publish|cancel):")
+        | filters.regex(rb"^catalog-(?:upload|publish|cancel):")
+    )
+    async def upload_workflow(_client: Client, callback: CallbackQuery) -> None:
         actor = telegram_user(callback.from_user)
         parts = callback_data(callback).split(":")
         identity = getattr(app, "me", None)
@@ -685,10 +693,12 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             or actor.id not in settings.operator_ids
             or not identity
             or not isinstance(identity.id, int)
+            or identity.id <= 0
             or chat is None
             or chat.id != actor.id
             or getattr(kind, "value", kind) != "private"
             or len(parts) != 4
+            or parts[0] not in {"catalog-upload", "catalog-publish", "catalog-cancel"}
             or not re.fullmatch(r"[1-9][0-9]{0,9}", parts[1])
             or parts[2] not in {"c", "i"}
             or not re.fullmatch(r"[a-zA-Z0-9_-]{16}", parts[3])
@@ -698,6 +708,14 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             )
             return
         provider: Provider = "catbox" if parts[2] == "c" else "imgbb"
+        purpose: UploadPurpose
+        if parts[0] == "catalog-upload":
+            purpose = "choose"
+        elif parts[0] == "catalog-publish":
+            purpose = "publish"
+        else:
+            purpose = "cancel"
+        claim_started = False
         try:
             command_message = await app.get_messages(actor.id, message_ids=int(parts[1]), replies=1)
             if not isinstance(command_message, Message) or command_message.empty:
@@ -727,30 +745,44 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             )
             source = await upload_source(command_message)
             media = reply_media(source)
-            expected = menu_token(menu_key, identity.id, actor.id, command_message, media, provider)
+            expected = menu_token(
+                menu_key, identity.id, actor.id, command_message, media, provider, purpose=purpose
+            )
             if not valid_token(expected, parts[3]):
                 raise ValueError("Original command or media changed")
-            if provider == "imgbb" and (
-                media.kind != "photo" or not settings.imgbb_key.get_secret_value().strip()
-            ):
-                raise ValueError("Provider is unavailable")
-            if settings.db_channel is None:
-                raise ValueError("Archive channel is unavailable")
+            if purpose != "cancel":
+                if provider == "imgbb" and (
+                    media.kind != "photo" or not settings.imgbb_key.get_secret_value().strip()
+                ):
+                    raise ValueError("Provider is unavailable")
+                if settings.db_channel is None:
+                    raise ValueError("Archive channel is unavailable")
             if not await store.limiter.allow(
-                f"catalog:{actor.id}:upload-choice", limit=10, seconds=60
+                f"catalog:{actor.id}:upload-{purpose}", limit=10, seconds=60
             ):
                 await callback.answer(
                     callback_text("Try again shortly.", emoji=Emoji.HOURGLASS), show_alert=True
                 )
                 return
-            await store.catalog.prepare_numbering()
-            if await store.catalog.character_exists(parsed.character_id):
+            if purpose != "cancel" and await store.catalog.character_exists(parsed.character_id):
                 raise CatalogConflict
-            if await store.catalog.catalog_event_exists(event_id):
-                raise ImageHostAlreadyAttempted
-            if not await store.limiter.claim_once(f"catalog-media:{event_id}", seconds=7 * 86400):
-                raise ImageHostAlreadyAttempted
-        except (ValueError, ValidationError, RPCError, OSError, TimeoutError):
+            if purpose != "choose":
+                if await store.catalog.catalog_event_exists(event_id):
+                    raise ImageHostAlreadyAttempted
+                # Publish and cancel compete for the same durable claim. A
+                # confirmed cancel prevents every older review for this command
+                # from publishing; it cannot undo an already claimed upload.
+                claim_started = True
+                if not await store.limiter.claim_once(
+                    f"catalog-media:{event_id}", seconds=7 * 86400
+                ):
+                    raise ImageHostAlreadyAttempted
+            if purpose == "publish":
+                # Do not run even the numbering backfill for a canceled or
+                # previously claimed confirmation. Preflight still occurs
+                # before downloading, hosting or archiving any media.
+                await store.catalog.prepare_numbering()
+        except (ValueError, ValidationError):
             await callback.answer(
                 callback_text(
                     "This menu expired or its original message changed. Send /upload again.",
@@ -759,20 +791,90 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 show_alert=True,
             )
             return
-        except (CharacterNumberingUnavailable, CatalogConflict, ImageHostAlreadyAttempted):
+        except CharacterNumberingUnavailable:
             await callback.answer(
                 callback_text(
-                    "Already attempted or catalog numbering needs review. Check the catalog.",
+                    "Numbering needs review. No upload started; use a new /upload after review.",
                     emoji=Emoji.WARNING,
                 ),
                 show_alert=True,
             )
             return
-        except PyMongoError as exc:
-            logger.warning("Catalog upload preflight unavailable (%s)", type(exc).__name__)
+        except CatalogConflict:
             await callback.answer(
-                callback_text("Catalog unavailable; try later.", emoji=Emoji.WARNING),
+                callback_text("This ID already exists. Check the catalog.", emoji=Emoji.WARNING),
                 show_alert=True,
+            )
+            return
+        except ImageHostAlreadyAttempted:
+            await callback.answer(
+                callback_text(
+                    "Already canceled or attempted. Check the catalog, host and DB_CHANNEL.",
+                    emoji=Emoji.WARNING,
+                ),
+                show_alert=True,
+            )
+            return
+        except (PyMongoError, RPCError, OSError, TimeoutError) as exc:
+            logger.warning("Catalog upload preflight unavailable (%s)", type(exc).__name__)
+            message = (
+                "No new upload started; confirmation is unconfirmed. Check the catalog, host "
+                "and DB_CHANNEL before retrying."
+                if claim_started
+                else "Catalog or original message unavailable. No new upload was started."
+            )
+            await callback.answer(callback_text(message, emoji=Emoji.WARNING), show_alert=True)
+            return
+
+        if purpose == "choose":
+            publish_token = menu_token(
+                menu_key, identity.id, actor.id, command_message, media, provider, purpose="publish"
+            )
+            cancel_token = menu_token(
+                menu_key, identity.id, actor.id, command_message, media, provider, purpose="cancel"
+            )
+            publish_data = f"catalog-publish:{command_message.id}:{parts[2]}:{publish_token}"
+            cancel_data = f"catalog-cancel:{command_message.id}:{parts[2]}:{cancel_token}"
+            rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+            media_label = {"photo": "Photo", "video": "Video", "animation": "GIF / animation"}[
+                media.kind
+            ]
+            await callback.answer(callback_text("Review before publishing.", emoji=Emoji.NOTE))
+            await respond(
+                callback.message,
+                Card(
+                    "Review before publishing",
+                    "Check the original media above and these details. Publishing uploads a "
+                    "public file, attempts a DB_CHANNEL copy and creates the character. "
+                    "Neither external copy can be automatically undone. For different details, "
+                    "cancel and send a new /upload. This review expires 15 minutes after the "
+                    "original command.",
+                    emoji=Emoji.OPEN_COLLECTION,
+                    fields=(
+                        ("ID", parsed.character_id),
+                        ("Character", parsed.name),
+                        ("Series", parsed.category),
+                        ("Rarity", rarity_label(rarity)),
+                        ("Media", f"{media_label} · {media.size:,} bytes"),
+                        ("Host", "Catbox" if provider == "catbox" else "ImgBB"),
+                    ),
+                ),
+                markup=upload_review_keyboard(
+                    publish_data, cancel_data, premium=settings.premium_emoji_enabled
+                ),
+            )
+            return
+
+        if purpose == "cancel":
+            await callback.answer(callback_text("Upload canceled.", emoji=Emoji.CHECK))
+            await respond(
+                callback.message,
+                Card(
+                    "Upload canceled",
+                    "No media was uploaded by this command. Older reviews for this command "
+                    "cannot publish; send a new /upload to start again.",
+                    emoji=Emoji.DONE,
+                ),
             )
             return
 

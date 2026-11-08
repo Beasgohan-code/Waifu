@@ -108,7 +108,14 @@ def register_collector_commands(
     async def help_command(_client: Client, message: Message) -> None:
         user = _user(message)
         operator_fields = (
-            (("Catalog operator", "/upload · /addchar · /updatechar (private chat)"),)
+            (
+                ("Catalog operator", "/upload · /addchar · /updatechar (private chat)"),
+                (
+                    "Media upload",
+                    'Reply with /upload "Name" "Anime" 1; choose a host, '
+                    "review, then publish or cancel.",
+                ),
+            )
             if user and user.id in settings.operator_ids and not _group(message)
             else ()
         )

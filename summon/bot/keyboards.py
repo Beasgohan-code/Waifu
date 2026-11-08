@@ -75,6 +75,30 @@ def upload_provider_keyboard(
     )
 
 
+def upload_review_keyboard(
+    publish_data: str, cancel_data: str, *, premium: bool
+) -> InlineKeyboardMarkup:
+    """Explicitly publish or durably cancel a reviewed, actor-bound upload."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=button_label("Publish publicly", Emoji.CHECK, premium=premium),
+                    callback_data=publish_data,
+                    icon_custom_emoji_id=Emoji.CHECK.custom_id if premium else None,
+                    style=ButtonStyle.SUCCESS,
+                ),
+                InlineKeyboardButton(
+                    text=button_label("Cancel upload", Emoji.CANCEL, premium=premium),
+                    callback_data=cancel_data,
+                    icon_custom_emoji_id=Emoji.CANCEL.custom_id if premium else None,
+                    style=ButtonStyle.DANGER,
+                ),
+            ]
+        ]
+    )
+
+
 def operator_panel_keyboard(url: str, *, premium: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

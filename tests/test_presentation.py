@@ -379,3 +379,22 @@ def test_callback_and_menu_surfaces_use_plain_unicode_not_telegram_html():
     assert len(callback_text("x" * 1000, emoji=Emoji.DONE)) <= 200
     assert all("<tg-emoji" not in item.description for item in COMMANDS)
     assert all(item.description[0] != "<" for item in COMMANDS)
+
+
+async def test_upload_review_keyboard_falls_back_without_changing_signed_actions():
+    from summon.bot.keyboards import upload_review_keyboard
+
+    publish, cancel = "catalog-publish:50:c:example-token", "catalog-cancel:50:c:example-token"
+    markup = upload_review_keyboard(publish, cancel, premium=True)
+    bot = AsyncMock()
+    bot.send_message.side_effect = [BadRequest("CUSTOM_EMOJI_INVALID"), "sent"]
+    await send_card(bot, 42, Card("Review"), reply_markup=markup, rich=False)
+    primary, fallback = bot.send_message.await_args_list
+    assert [
+        button.callback_data for button in primary.kwargs["reply_markup"].inline_keyboard[0]
+    ] == [publish, cancel]
+    buttons = fallback.kwargs["reply_markup"].inline_keyboard[0]
+    assert [button.callback_data for button in buttons] == [publish, cancel]
+    assert all(button.icon_custom_emoji_id is None for button in buttons)
+    assert buttons[0].text.startswith(Emoji.CHECK.value[0])
+    assert buttons[1].text.startswith(Emoji.CANCEL.value[0])

@@ -69,7 +69,8 @@ async def setup(*, operators=(42,), **settings_overrides):
         "_env_file": None,
     }
     settings.update(settings_overrides)
-    register_handlers(app, store, Settings(**settings))
+    app._test_settings = Settings(**settings)
+    register_handlers(app, store, app._test_settings)
     app._test_complete = asyncio.Queue()
 
     async def finished(_client, update, _users, _chats):
@@ -984,6 +985,15 @@ async def prepare_upload_callback(app, text, source):
     return buttons, command
 
 
+async def review_upload_choice(app, button):
+    """Choose a host and return the separately signed review controls."""
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+        await dispatch(app, callback_packet(button.callback_data))
+    card = sent.await_args.args[2]
+    assert card.title == "Review before publishing"
+    return card, sent.await_args.kwargs["reply_markup"].inline_keyboard[0]
+
+
 def source_photo(content):
     return Message(
         id=49,
@@ -1029,20 +1039,33 @@ async def test_native_photo_provider_choice_saves_host_url_and_archived_file_id(
     app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
     app.send_photo = AsyncMock(side_effect=channel_post)
     store.catalog.create_character.side_effect = save
-    store.limiter.claim_once.side_effect = [True, False]
+    store.limiter.claim_once.side_effect = [True, False, False]
     try:
         buttons, _ = await prepare_upload_callback(
             app, '/upload "Toji Fushiguro" "Jujutsu Kaisen" 2', source
         )
         assert len(buttons) == 2 and "ImgBB" in buttons[1].text
+        card, review_buttons = await review_upload_choice(app, buttons[1])
+        assert ("Character", "Toji Fushiguro") in card.fields
+        assert ("Series", "Jujutsu Kaisen") in card.fields
+        assert ("Rarity", "Rare") in card.fields and ("Host", "ImgBB") in card.fields
+        assert "Publish publicly" in review_buttons[0].text
+        assert "Cancel upload" in review_buttons[1].text
+        assert events == []
+        store.limiter.claim_once.assert_not_awaited()
+        app.get_chat.assert_not_awaited()
+        store.catalog.prepare_numbering.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
                 "summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock, side_effect=host
             ) as hosted,
         ):
-            await dispatch(app, callback_packet(buttons[1].callback_data))
-            await dispatch(app, callback_packet(buttons[1].callback_data))
+            await dispatch(app, callback_packet(review_buttons[0].callback_data))
+            await dispatch(app, callback_packet(review_buttons[0].callback_data))
+            await dispatch(app, callback_packet(review_buttons[1].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
         data = store.catalog.create_character.await_args.args[0]
         assert (data.name, data.category, data.rarity) == (
             "Toji Fushiguro",
@@ -1056,7 +1079,7 @@ async def test_native_photo_provider_choice_saves_host_url_and_archived_file_id(
         hosted.assert_awaited_once()
         store.catalog.create_character.assert_awaited_once()
         assert sent.await_args.args[2].title == "Character added"
-        assert store.limiter.claim_once.await_count == 2
+        assert store.limiter.claim_once.await_count == 3
     finally:
         await app.dispatcher.stop()
 
@@ -1097,6 +1120,9 @@ async def test_native_video_upload_uses_catbox_and_forces_amv():
             app, "/upload Toji-Fushiguro Jujutsu-Kaisen 2", source
         )
         assert len(buttons) == 1 and "Catbox" in buttons[0].text
+        card, review_buttons = await review_upload_choice(app, buttons[0])
+        assert ("Rarity", "AMV Edition") in card.fields and ("Host", "Catbox") in card.fields
+        assert next(value for label, value in card.fields if label == "Media").startswith("Video")
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
@@ -1105,7 +1131,7 @@ async def test_native_video_upload_uses_catbox_and_forces_amv():
                 return_value="https://files.catbox.moe/example.mp4",
             ) as hosted,
         ):
-            await dispatch(app, callback_packet(buttons[0].callback_data))
+            await dispatch(app, callback_packet(review_buttons[0].callback_data))
         hosted.assert_awaited_once()
         data = store.catalog.create_character.await_args.args[0]
         assert (data.name, data.category, data.rarity, data.media_type) == (
@@ -1121,15 +1147,21 @@ async def test_native_video_upload_uses_catbox_and_forces_amv():
         await app.dispatcher.stop()
 
 
-@pytest.mark.parametrize("change", ["actor", "provider", "text", "media"])
-async def test_native_upload_menu_rejects_other_actor_or_changed_signed_inputs(change):
-    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+@pytest.mark.parametrize("phase", ["choice", "publish", "cancel"])
+@pytest.mark.parametrize("change", ["actor", "provider", "text", "media", "size"])
+async def test_native_upload_menu_rejects_other_actor_or_changed_signed_inputs(change, phase):
+    app, store = await setup(
+        operators=(42, 99), db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY"
+    )
     content = jpeg()
     source = source_photo(content)
     app.stream_media = AsyncMock()
     try:
         buttons, command = await prepare_upload_callback(app, "/upload A | S | 2", source)
         callback = buttons[0].callback_data
+        if phase != "choice":
+            _, review_buttons = await review_upload_choice(app, buttons[0])
+            callback = review_buttons[0 if phase == "publish" else 1].callback_data
         user_id = 42
         if change == "actor":
             user_id = 99
@@ -1138,12 +1170,15 @@ async def test_native_upload_menu_rejects_other_actor_or_changed_signed_inputs(c
             callback = callback.replace(":c:", ":i:")
         elif change == "text":
             command.text = "/upload Changed | S | 2"
+        elif change == "size":
+            source.photo.file_size += 1
         else:
             source.photo.file_unique_id = "different-photo"
         with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as hosted:
             await dispatch(app, callback_packet(callback, user_id=user_id))
         hosted.assert_not_awaited()
         app.stream_media.assert_not_called()
+        store.limiter.claim_once.assert_not_awaited()
         store.catalog.create_character.assert_not_awaited()
         assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
     finally:
@@ -1164,6 +1199,7 @@ async def test_native_channel_timeout_keeps_original_file_id_and_warns_without_r
     store.catalog.create_character.return_value = {"id": "generated", "number": 1}
     try:
         buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source)
+        _, review_buttons = await review_upload_choice(app, buttons[0])
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
@@ -1172,7 +1208,7 @@ async def test_native_channel_timeout_keeps_original_file_id_and_warns_without_r
                 return_value="https://files.catbox.moe/example.jpg",
             ),
         ):
-            await dispatch(app, callback_packet(buttons[0].callback_data))
+            await dispatch(app, callback_packet(review_buttons[0].callback_data))
         assert (
             store.catalog.create_character.await_args.args[0].telegram_file_id
             == "original-photo-id"
@@ -1215,6 +1251,9 @@ async def test_native_gif_upload_uses_animation_file_id_and_amv_rarity():
     try:
         buttons, _ = await prepare_upload_callback(app, '/upload "A Name" "A Series" 8', source)
         assert len(buttons) == 1 and "Catbox" in buttons[0].text
+        card, review_buttons = await review_upload_choice(app, buttons[0])
+        assert ("Rarity", "AMV Edition") in card.fields
+        assert next(value for label, value in card.fields if label == "Media").startswith("GIF")
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch(
@@ -1223,11 +1262,268 @@ async def test_native_gif_upload_uses_animation_file_id_and_amv_rarity():
                 return_value="https://files.catbox.moe/example.gif",
             ),
         ):
-            await dispatch(app, callback_packet(buttons[0].callback_data))
+            await dispatch(app, callback_packet(review_buttons[0].callback_data))
         data = store.catalog.create_character.await_args.args[0]
         assert data.rarity == "amv-edition" and data.media_type == "animation"
         assert data.telegram_file_id == "channel-gif-id"
         assert data.image_url.endswith(".gif")
         assert sent.await_args.args[2].title == "Character added"
+    finally:
+        await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize(
+    ("button", "replacement"),
+    [
+        ("choose", "catalog-publish"),
+        ("choose", "catalog-cancel"),
+        ("publish", "catalog-cancel"),
+        ("cancel", "catalog-publish"),
+    ],
+)
+async def test_upload_action_tokens_cannot_be_reused_for_another_phase(button, replacement):
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
+        _, review_buttons = await review_upload_choice(app, buttons[0])
+        original = {
+            "choose": buttons[0].callback_data,
+            "publish": review_buttons[0].callback_data,
+            "cancel": review_buttons[1].callback_data,
+        }[button]
+        forged = original.replace(original.split(":", 1)[0], replacement, 1)
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(app, callback_packet(forged))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        app.stream_media.assert_not_called()
+        host.assert_not_awaited()
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.prepare_numbering.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_cancel_blocks_every_provider_review_without_external_side_effects():
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+    app.stream_media = AsyncMock()
+    app.get_chat = AsyncMock()
+    claims = set()
+
+    async def claim(key, *, seconds):
+        assert seconds == 7 * 86400
+        if key in claims:
+            return False
+        claims.add(key)
+        return True
+
+    store.limiter.claim_once.side_effect = claim
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
+        _, catbox_review = await review_upload_choice(app, buttons[0])
+        _, imgbb_review = await review_upload_choice(app, buttons[1])
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as catbox,
+            patch("summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock) as imgbb,
+        ):
+            await dispatch(app, callback_packet(imgbb_review[1].callback_data))
+            assert sent.await_args.args[2].title == "Upload canceled"
+            assert "No media was uploaded" in sent.await_args.args[2].body
+            await dispatch(app, callback_packet(catbox_review[0].callback_data))
+            assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+            await dispatch(app, callback_packet(imgbb_review[0].callback_data))
+            assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        assert claims == {f"catalog-media:{_event_id(123, 42, 50)}"}
+        catbox.assert_not_awaited()
+        imgbb.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        app.get_chat.assert_not_awaited()
+        store.catalog.prepare_numbering.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_expired_review_never_claims_or_publishes():
+    from datetime import timedelta
+
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    try:
+        buttons, command = await prepare_upload_callback(
+            app, "/upload A | S | 1", source_photo(jpeg())
+        )
+        _, review = await review_upload_choice(app, buttons[0])
+        command.date = datetime.now(UTC) - timedelta(minutes=16)
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(app, callback_packet(review[0].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        host.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize("phase", ["publish", "cancel"])
+async def test_uncertain_upload_claim_never_starts_external_io(phase):
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.limiter.claim_once.side_effect = AutoReconnect("PRIVATE_DATABASE_DETAIL")
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
+        _, review = await review_upload_choice(app, buttons[0])
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(
+                app, callback_packet(review[0 if phase == "publish" else 1].callback_data)
+            )
+        args = app.answer_callback_query.await_args.kwargs
+        assert args["show_alert"] is True
+        assert (
+            "unconfirmed" in args["text"].lower() and "PRIVATE_DATABASE_DETAIL" not in args["text"]
+        )
+        host.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        store.catalog.prepare_numbering.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_upload_conflict_after_review_stops_before_claim_or_external_io():
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    # Another operator creates this internal ID after it was reviewed.
+    store.catalog.character_exists.side_effect = [False, True]
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
+        _, review = await review_upload_choice(app, buttons[0])
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(app, callback_packet(review[0].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        assert "already exists" in app.answer_callback_query.await_args.kwargs["text"]
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.prepare_numbering.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        host.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_numbering_failure_after_claim_cannot_start_media_upload():
+    from summon.repositories.character_numbers import CharacterNumberingUnavailable
+
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.catalog.prepare_numbering.side_effect = CharacterNumberingUnavailable("PRIVATE_DETAIL")
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
+        _, review = await review_upload_choice(app, buttons[0])
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(app, callback_packet(review[0].callback_data))
+        args = app.answer_callback_query.await_args.kwargs
+        assert args["show_alert"] is True and "No upload started" in args["text"]
+        assert "new /upload" in args["text"] and "PRIVATE_DETAIL" not in args["text"]
+        store.limiter.claim_once.assert_awaited_once()
+        app.stream_media.assert_not_called()
+        host.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_review_unavailable_when_catalog_preflight_fails():
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.catalog.character_exists.side_effect = AutoReconnect("PRIVATE_DETAIL")
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, callback_packet(buttons[0].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        assert "No new upload was started" in app.answer_callback_query.await_args.kwargs["text"]
+        assert "PRIVATE_DETAIL" not in app.answer_callback_query.await_args.kwargs["text"]
+        sent.assert_not_awaited()
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.prepare_numbering.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_refreshed_telegram_file_reference_keeps_review_valid():
+    app, store = await setup(db_channel=-1001234567890)
+    content = jpeg()
+    source = source_photo(content)
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_photo = AsyncMock(return_value=SimpleNamespace(photo=None))
+    store.catalog.create_character.return_value = {"id": "generated", "number": 1}
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source)
+        source.photo.file_id = "renewed-reference-for-review"
+        _, review = await review_upload_choice(app, buttons[0])
+        source.photo.file_id = "renewed-reference-for-publish"
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/example.jpg",
+            ) as host,
+        ):
+            await dispatch(app, callback_packet(review[0].callback_data))
+        host.assert_awaited_once()
+        assert (
+            store.catalog.create_character.await_args.args[0].telegram_file_id
+            == "renewed-reference-for-publish"
+        )
+    finally:
+        await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize(
+    ("user_id", "group", "expected"), [(42, False, True), (99, False, False), (42, True, False)]
+)
+async def test_upload_review_instructions_appear_only_in_private_operator_help(
+    user_id, group, expected
+):
+    app, _ = await setup()
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet("/help", user_id=user_id, group=group))
+        fields = dict(sent.await_args.args[2].fields)
+        assert ("Media upload" in fields) is expected
+        if expected:
+            assert "/upload" in fields["Media upload"]
+            assert "review" in fields["Media upload"] and "cancel" in fields["Media upload"]
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_operator_revocation_after_review_prevents_publication():
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source_photo(jpeg()))
+        _, review = await review_upload_choice(app, buttons[0])
+        app._test_settings.operator_ids = []
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(app, callback_packet(review[0].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.prepare_numbering.assert_not_awaited()
+        store.catalog.create_character.assert_not_awaited()
+        host.assert_not_awaited()
+        app.stream_media.assert_not_called()
     finally:
         await app.dispatcher.stop()

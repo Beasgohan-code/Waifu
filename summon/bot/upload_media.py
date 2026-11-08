@@ -22,6 +22,7 @@ from summon.services.catbox import MAX_MEDIA_BYTES, valid_media_signature
 
 MediaKind = Literal["photo", "video", "animation"]
 Provider = Literal["catbox", "imgbb"]
+UploadPurpose = Literal["choose", "publish", "cancel"]
 UPLOAD_LIFETIME = timedelta(minutes=15)
 
 
@@ -125,10 +126,19 @@ def valid_upload_age(message: Message, *, now: datetime | None = None) -> bool:
 
 
 def menu_token(
-    key: bytes, bot_id: int, actor_id: int, message: Message, media: ReplyMedia, provider: Provider
+    key: bytes,
+    bot_id: int,
+    actor_id: int,
+    message: Message,
+    media: ReplyMedia,
+    provider: Provider,
+    *,
+    purpose: UploadPurpose = "choose",
 ) -> str:
-    """Bind the button to the bot, operator, original text and exact source media."""
+    """Bind each distinct action to the bot, operator, command and source media."""
     text = str(message.text or message.caption or "")
+    # Wzgram file IDs include Telegram's renewable file_reference; bind the
+    # stable unique ID and declared size, not a reference that can refresh.
     material = "\0".join(
         (
             str(bot_id),
@@ -138,7 +148,9 @@ def menu_token(
             text,
             media.kind,
             media.unique_id,
+            str(media.size),
             provider,
+            purpose,
         )
     ).encode("utf-8")
     digest = hmac.new(key, material, hashlib.sha256).digest()[:12]

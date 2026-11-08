@@ -77,11 +77,26 @@ def test_provider_token_is_bound_to_operator_bot_text_media_and_provider():
     assert not valid_token(token, menu_token(key, 123, 43, command, photo, "catbox"))
     assert not valid_token(token, menu_token(key, 124, 42, command, photo, "catbox"))
     assert not valid_token(token, menu_token(key, 123, 42, command, photo, "imgbb"))
+    publish = menu_token(key, 123, 42, command, photo, "catbox", purpose="publish")
+    cancel = menu_token(key, 123, 42, command, photo, "catbox", purpose="cancel")
+    assert len({token, publish, cancel}) == 3
+    assert not valid_token(publish, token) and not valid_token(cancel, publish)
     assert not valid_token(
         token, menu_token(key, 123, 42, command_message("/upload A B 1"), photo, "catbox")
     )
     changed_photo = photo_message()
     changed_photo.photo.file_unique_id = "different-media"
+    assert not valid_token(
+        token, menu_token(key, 123, 42, command, reply_media(changed_photo), "catbox")
+    )
+    # Telegram can refresh the file reference while retaining stable media identity.
+    changed_photo = photo_message()
+    changed_photo.photo.file_id = "renewed-file-reference"
+    assert valid_token(
+        token, menu_token(key, 123, 42, command, reply_media(changed_photo), "catbox")
+    )
+    changed_photo = photo_message()
+    changed_photo.photo.file_size += 1
     assert not valid_token(
         token, menu_token(key, 123, 42, command, reply_media(changed_photo), "catbox")
     )
