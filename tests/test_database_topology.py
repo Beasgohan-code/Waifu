@@ -354,3 +354,143 @@ def test_mongo_startup_authentication_hint_never_reveals_server_message(code):
     message = str(safe_startup_error(OperationFailure("PRIVATE_CREDENTIAL", code=code)))
     assert "authentication or authorization" in message
     assert "PRIVATE_CREDENTIAL" not in message
+
+
+async def test_startup_retries_transient_selection_only_before_initialization(caplog):
+    from unittest.mock import call
+
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    hello = {
+        "ok": 1,
+        "setName": "rs",
+        "isWritablePrimary": True,
+        "maxWireVersion": 17,
+        "logicalSessionTimeoutMinutes": 30,
+    }
+    error = ServerSelectionTimeoutError("SSL handshake failed PRIVATE_HOST PRIVATE_CREDENTIAL")
+    client = client_for(hello)
+    client.admin.command.side_effect = [error, error, {"ok": 1}, hello]
+    with (
+        patch("summon.database.AsyncMongoClient", return_value=client) as factory,
+        patch("summon.database.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        patch("summon.database.initialize_database", new_callable=AsyncMock) as initialize,
+    ):
+        result, db = await connect_database(config())
+    assert result is client
+    assert client.admin.command.await_args_list == [
+        call("ping"),
+        call("ping"),
+        call("ping"),
+        call("hello"),
+    ]
+    assert sleep.await_args_list == [call(1), call(2)]
+    initialize.assert_awaited_once_with(db, include_poller_health=False)
+    client.close.assert_not_awaited()
+    assert factory.call_args.kwargs["serverSelectionTimeoutMS"] == 5000
+    assert "tlsAllowInvalidCertificates" not in factory.call_args.kwargs
+    assert "tlsAllowInvalidHostnames" not in factory.call_args.kwargs
+    assert "PRIVATE_" not in caplog.text
+    assert "retrying the read-only ping" in caplog.text
+
+
+async def test_startup_exhausts_bounded_selection_retries_and_closes(caplog):
+    from unittest.mock import call
+
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    client = client_for(None)
+    client.admin.command.side_effect = ServerSelectionTimeoutError(
+        "PRIVATE_HOST PRIVATE_CREDENTIAL"
+    )
+    with (
+        patch("summon.database.AsyncMongoClient", return_value=client),
+        patch("summon.database.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        patch("summon.database.initialize_database", new_callable=AsyncMock) as initialize,
+        pytest.raises(ServerSelectionTimeoutError),
+    ):
+        await connect_database(config())
+    assert client.admin.command.await_args_list == [call("ping")] * 6
+    assert sleep.await_args_list == [call(1), call(2), call(4), call(5), call(5)]
+    initialize.assert_not_awaited()
+    client.close.assert_awaited_once()
+    assert "PRIVATE_" not in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["certificate", "authentication"])
+async def test_startup_does_not_retry_definite_certificate_or_auth_failure(failure):
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    client = client_for(None)
+    client.admin.command.side_effect = (
+        ServerSelectionTimeoutError("CERTIFICATE_VERIFY_FAILED PRIVATE_HOST")
+        if failure == "certificate"
+        else OperationFailure("PRIVATE_CREDENTIAL", code=18)
+    )
+    with (
+        patch("summon.database.AsyncMongoClient", return_value=client),
+        patch("summon.database.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        patch("summon.database.initialize_database", new_callable=AsyncMock) as initialize,
+        pytest.raises((ServerSelectionTimeoutError, OperationFailure)),
+    ):
+        await connect_database(config())
+    client.admin.command.assert_awaited_once_with("ping")
+    sleep.assert_not_awaited()
+    initialize.assert_not_awaited()
+    client.close.assert_awaited_once()
+
+
+async def test_startup_never_retries_schema_initialization_after_selection_failure():
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    hello = {
+        "ok": 1,
+        "setName": "rs",
+        "isWritablePrimary": True,
+        "maxWireVersion": 17,
+        "logicalSessionTimeoutMinutes": 30,
+    }
+    client = client_for(hello)
+    with (
+        patch("summon.database.AsyncMongoClient", return_value=client),
+        patch("summon.database.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        patch(
+            "summon.database.initialize_database",
+            new_callable=AsyncMock,
+            side_effect=ServerSelectionTimeoutError("PRIVATE_HOST"),
+        ) as initialize,
+        pytest.raises(ServerSelectionTimeoutError),
+    ):
+        await connect_database(config())
+    assert client.admin.command.await_count == 2
+    initialize.assert_awaited_once()
+    sleep.assert_not_awaited()
+    client.close.assert_awaited_once()
+
+
+async def test_cancelled_startup_retry_closes_mongo_client():
+    import asyncio
+
+    from pymongo.errors import ServerSelectionTimeoutError
+
+    entered_sleep = asyncio.Event()
+    never = asyncio.Event()
+
+    async def wait_for_cancellation(_delay):
+        entered_sleep.set()
+        await never.wait()
+
+    client = client_for(None)
+    client.admin.command.side_effect = ServerSelectionTimeoutError("PRIVATE_HOST")
+    with (
+        patch("summon.database.AsyncMongoClient", return_value=client),
+        patch("summon.database.asyncio.sleep", side_effect=wait_for_cancellation),
+        patch("summon.database.initialize_database", new_callable=AsyncMock) as initialize,
+    ):
+        task = asyncio.create_task(connect_database(config()))
+        await asyncio.wait_for(entered_sleep.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    client.close.assert_awaited_once()
+    initialize.assert_not_awaited()

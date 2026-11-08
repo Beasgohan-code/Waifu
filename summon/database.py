@@ -6,6 +6,8 @@ use a replica set or sharded cluster. No non-transactional fallback is provided.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
@@ -26,6 +28,12 @@ from summon.auto_replies import (
 from summon.config import Settings
 from summon.group_notes import MAX_NOTE_LENGTH, MAX_NOTES, NOTE_NAME_PATTERN, NOTE_REVISION_PATTERN
 from summon.rarities import MAX_SPAWN_WEIGHT, RARITY_VALUES, RARITY_WEIGHTS
+
+logger = logging.getLogger(__name__)
+
+# Retry the read-only startup ping for transient cluster/network availability.
+# The existing short per-operation server selection timeout remains unchanged.
+_MONGO_STARTUP_RETRY_DELAYS = (1, 2, 4, 5, 5)
 
 _NUMBER = ["int", "long"]
 COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -430,6 +438,33 @@ async def require_transaction_topology(client: Any) -> None:
         )
 
 
+async def _ping_with_startup_retries(client: AsyncMongoClient) -> None:
+    """Retry only the read-only ping; never repeat schema or index writes.
+
+    Authentication and known certificate-verification failures are not treated
+    as transient. Log only attempt numbers, never raw driver errors or hosts.
+    """
+    total_attempts = len(_MONGO_STARTUP_RETRY_DELAYS) + 1
+    for attempt, delay in enumerate(_MONGO_STARTUP_RETRY_DELAYS, start=1):
+        try:
+            await client.admin.command("ping")
+            return
+        except ServerSelectionTimeoutError as exc:
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc)[:16384].upper():
+                raise
+            logger.warning(
+                "MongoDB server selection failed during startup (attempt %d of %d); "
+                "retrying the read-only ping in %d seconds. Check cluster and network access "
+                "if the failure persists.",
+                attempt,
+                total_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    # The last failure is allowed to propagate to the redacting runtime entry point.
+    await client.admin.command("ping")
+
+
 async def connect_database(settings: Settings) -> tuple[AsyncMongoClient, Any]:
     if not settings.mongo_uri.get_secret_value():
         raise RuntimeError("SUMMON_MONGO_URI is required to connect to MongoDB")
@@ -442,7 +477,7 @@ async def connect_database(settings: Settings) -> tuple[AsyncMongoClient, Any]:
         retryWrites=True,
     )
     try:
-        await client.admin.command("ping")
+        await _ping_with_startup_retries(client)
         await require_transaction_topology(client)
         database = client[settings.mongo_database]
         await initialize_database(database, include_poller_health=settings.poller_heartbeat_enabled)

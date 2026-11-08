@@ -16,7 +16,8 @@ import pytest
 from pymongo import AsyncMongoClient
 
 from summon.auth import TelegramUser
-from summon.database import initialize_database
+from summon.config import Settings
+from summon.database import connect_database, initialize_database
 from summon.models import GroupSettings
 from summon.repositories.auth import AuthRepository
 from summon.repositories.collection import CollectionRepository
@@ -53,6 +54,21 @@ async def isolated_database():
         # Never drop an existing or user-selected DB, and only with separate approval.
         if os.environ.get("SUMMON_TEST_MONGO_DROP_CONFIRM") == "DROP_ISOLATED_TEST_DB":
             await client.drop_database(name)
+        await client.close()
+
+
+async def test_runtime_database_startup_on_isolated_replica_set(isolated_database):
+    _, database = isolated_database
+    settings = Settings(
+        mongo_uri=os.environ["SUMMON_TEST_MONGO_URI"],
+        mongo_database=database.name,
+        _env_file=None,
+    )
+    client, opened = await connect_database(settings)
+    try:
+        assert opened.name == database.name
+        assert (await opened.command("ping"))["ok"] == 1
+    finally:
         await client.close()
 
 
