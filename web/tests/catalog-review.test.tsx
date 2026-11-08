@@ -54,6 +54,69 @@ describe('catalogue review', () => {
     expect(onDraftChange).toHaveBeenLastCalledWith(null);
   });
 
+  it('loads existing metadata without publishing or leaving a dirty draft', async () => {
+    vi.mocked(api.get).mockResolvedValue({ revision: 'c'.repeat(64), character: {
+      id: 'aiko', name: 'Original Aiko', category: 'Old series', rarity: 'epic', image_url: '/art/aiko.webp', description: 'Existing text', active: false,
+    } });
+    const put = vi.spyOn(api, 'put').mockResolvedValue({});
+    const draft = vi.fn(); render(<Admin notify={vi.fn()} refresh={vi.fn()} onDraftChange={draft} />);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('Character ID'), 'aiko');
+    await user.click(screen.getByRole('button', { name: 'Load existing details' }));
+    expect(screen.getByLabelText('Name')).toHaveValue('Original Aiko');
+    expect(screen.getByLabelText('Name')).toHaveFocus();
+    expect(screen.getByLabelText('Series / category')).toHaveValue('Old series');
+    expect(screen.getByLabelText('Rarity')).toHaveValue('epic');
+    expect(screen.getByLabelText('Available in the catalogue and for spawning')).not.toBeChecked();
+    expect(screen.getByRole('status')).toHaveTextContent(/no changes have been published/i);
+    expect(draft).toHaveBeenLastCalledWith(null);
+    const unload = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(false);
+    expect(put).not.toHaveBeenCalled();
+    await user.type(screen.getByLabelText('Name'), ' revised');
+    expect(draft).toHaveBeenLastCalledWith({ blocked: false });
+  });
+
+  it('does not replace typed details when loading is unavailable or the ID is missing', async () => {
+    render(<Admin notify={vi.fn()} refresh={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('Character ID'), 'aiko');
+    await user.type(screen.getByLabelText('Name'), 'Keep this draft');
+    expect(screen.getByRole('button', { name: 'Load existing details' })).toBeDisabled();
+    expect(api.get).not.toHaveBeenCalled();
+    await user.clear(screen.getByLabelText('Name'));
+    await user.click(screen.getByRole('button', { name: 'Load existing details' }));
+    expect(screen.getByRole('alert')).toHaveTextContent(/no existing character/i);
+    expect(screen.getByLabelText('Character ID')).toHaveValue('aiko');
+    expect(screen.getByLabelText('Name')).toHaveValue('');
+  });
+
+  it('previews existing motion media only on request and warns before replacing its URL', async () => {
+    const video = 'https://files.catbox.moe/clip.mp4';
+    vi.mocked(api.get).mockResolvedValue({ revision: 'd'.repeat(64), character: {
+      id: 'aiko', name: 'Motion Aiko', category: 'Sky', rarity: 'amv-edition', image_url: video,
+      description: '', active: true, media_type: 'video',
+    } });
+    render(<Admin notify={vi.fn()} refresh={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('Character ID'), 'aiko');
+    await user.click(screen.getByRole('button', { name: 'Load existing details' }));
+    expect(screen.getByRole('status')).toHaveTextContent(/keep its URL unchanged/i);
+    await user.click(screen.getByRole('button', { name: 'Review character' }));
+    expect(screen.getByText('Video')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Artwork preview for Motion Aiko')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load artwork preview' }));
+    const preview = screen.getByLabelText('Artwork preview for Motion Aiko');
+    expect(preview.tagName).toBe('VIDEO');
+    expect(preview).toHaveAttribute('preload', 'metadata');
+    expect(preview).not.toHaveAttribute('autoplay');
+    await user.click(screen.getByRole('button', { name: /Edit details/ }));
+    await user.clear(screen.getByLabelText('Artwork URL'));
+    await user.paste('https://images.example/new.jpg');
+    await user.click(screen.getByRole('button', { name: 'Review character' }));
+    expect(screen.getByRole('status')).toHaveTextContent(/removes its Telegram file reference/i);
+  });
+
   it('lets an operator revise the draft before publishing', async () => {
     const put = vi.spyOn(api, 'put').mockResolvedValue({});
     render(<Admin notify={vi.fn()} refresh={vi.fn()} />);

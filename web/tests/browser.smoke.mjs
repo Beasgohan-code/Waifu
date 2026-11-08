@@ -82,9 +82,10 @@ try {
 
   await page.getByRole('button', { name: 'Catalogue admin' }).click();
   await page.getByLabel('Character ID').fill('aiko');
+  await page.getByRole('button', { name: 'Load existing details' }).click();
+  await page.getByText('Existing details loaded; no changes have been published.').waitFor();
+  assert.equal(await page.getByLabel('Name', { exact: true }).inputValue(), 'Aiko Tsukino');
   await page.getByLabel('Name', { exact: true }).fill('Sample draft');
-  await page.getByLabel('Series / category').fill('Sample series');
-  await page.getByLabel('Artwork URL').fill('/art/aiko.webp');
   await page.getByRole('button', { name: 'Review character' }).click();
   await page.getByRole('heading', { name: 'Check the details.' }).waitFor();
   await page.getByText('Current record for this ID').waitFor();
