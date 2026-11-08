@@ -1620,3 +1620,203 @@ async def test_upload_cancel_guard_survives_a_new_mongo_limiter_instance(isolate
     )
     assert sorted(outcomes) == [False, True]
     assert not await claim_upload_action(RateLimiter(db), other)
+
+
+@pytest.mark.parametrize("kind", ["photo", "video", "animation"])
+async def test_reviewed_media_replacement_preserves_ownership_alias_and_legacy_blob(
+    isolated_database, kind
+):
+    import hashlib
+
+    from summon.models import CharacterMediaInput
+    from summon.repositories.catalog import CatalogRepository
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    secret = "synthetic-media-revision-secret-" + "x" * 32
+    content = b"\xff\xd8\xffsynthetic-legacy-jpeg"
+    digest = hashlib.sha256(content).hexdigest()
+    await db.character_artworks.insert_one(
+        {
+            "_id": digest,
+            "content": content,
+            "content_type": "image/jpeg",
+            "created_at": datetime.now(UTC),
+        }
+    )
+    active = kind != "photo"
+    await db.characters.update_one(
+        {"_id": "ren"},
+        {
+            "$set": {
+                "image_url": f"/api/artwork/{digest}",
+                "media_type": "photo",
+                "telegram_file_id": "old-synthetic-file",
+                "active": active,
+            }
+        },
+    )
+    await db.inventory.insert_many(
+        [
+            {"user_id": 101, "character_id": "ren", "quantity": 3, "favorite": True},
+            {"user_id": 102, "character_id": "ren", "quantity": 1, "favorite": False},
+        ]
+    )
+    before = await db.characters.find_one({"_id": "ren"})
+    inventory_before = await db.inventory.find({"character_id": "ren"}).sort("user_id").to_list(10)
+    state = await repo.edit_state("ren", secret=secret)
+    extension = {"photo": "jpg", "video": "mp4", "animation": "gif"}[kind]
+    media = CharacterMediaInput(
+        image_url=f"https://files.catbox.moe/synthetic.{extension}",
+        media_type=kind,
+        telegram_file_id=f"synthetic-{kind}-file-id",
+    )
+    result = await repo.replace_media_reviewed(
+        "ren",
+        media,
+        actor_id=101,
+        event_id=f"replace-{kind}",
+        expected_revision=state["revision"],
+        revision_secret=secret,
+    )
+    expected = {**before, **media.model_dump()}
+    if kind != "photo":
+        expected["rarity"] = "amv-edition"
+    assert await db.characters.find_one({"_id": "ren"}) == expected
+    assert (
+        await db.inventory.find({"character_id": "ren"}).sort("user_id").to_list(10)
+        == inventory_before
+    )
+    assert await repo.artwork(digest) == content
+    assert (await db.characters.find_one({"number": before["number"]}))["_id"] == "ren"
+    assert result["id"] == "ren" and result["number"] == before["number"]
+    assert "telegram_file_id" not in result
+    if active:
+        via_alias = await repo.details(101, f"{before['number']:02d}")
+        assert via_alias["id"] == "ren" and via_alias["quantity"] == 3 and via_alias["favorite"]
+    audit = await db.activity.find_one({"_id": f"replace-{kind}"})
+    assert audit["kind"] == "character_media_replaced" and audit["user_id"] == 101
+    assert "telegram_file_id" in audit["fields"] and "synthetic-" not in str(audit)
+
+
+async def test_concurrent_reviewed_media_replacements_only_one_can_commit(isolated_database):
+    from summon.models import CharacterMediaInput
+    from summon.repositories.catalog import CatalogRepository, CatalogStaleRevision
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    secret = "synthetic-media-race-secret-" + "x" * 32
+    await db.inventory.insert_one({"user_id": 101, "character_id": "aiko", "quantity": 4})
+    state = await repo.edit_state("aiko", secret=secret)
+    media = [
+        CharacterMediaInput(
+            image_url="https://files.catbox.moe/a.jpg",
+            media_type="photo",
+            telegram_file_id="photo-file",
+        ),
+        CharacterMediaInput(
+            image_url="https://files.catbox.moe/b.mp4",
+            media_type="video",
+            telegram_file_id="video-file",
+        ),
+    ]
+
+    async def replace(index):
+        return await repo.replace_media_reviewed(
+            "aiko",
+            media[index],
+            actor_id=101 + index,
+            event_id=f"media-race-{index}",
+            expected_revision=state["revision"],
+            revision_secret=secret,
+        )
+
+    outcomes = await asyncio.gather(replace(0), replace(1), return_exceptions=True)
+    assert sum(isinstance(result, dict) for result in outcomes) == 1
+    assert sum(isinstance(result, CatalogStaleRevision) for result in outcomes) == 1
+    winner = next(index for index, result in enumerate(outcomes) if isinstance(result, dict))
+    stored = await db.characters.find_one({"_id": "aiko"})
+    assert stored["image_url"] == media[winner].image_url
+    assert stored["telegram_file_id"] == media[winner].telegram_file_id
+    assert (await db.inventory.find_one({"user_id": 101}))["quantity"] == 4
+    audits = await db.activity.find({"kind": "character_media_replaced"}).to_list(10)
+    assert len(audits) == 1 and audits[0]["_id"] == f"media-race-{winner}"
+
+
+async def test_reviewed_media_replacement_rejects_edits_deletion_and_duplicate_audit(
+    isolated_database,
+):
+    from summon.models import CharacterChanges, CharacterMediaInput
+    from summon.repositories.catalog import (
+        CatalogConflict,
+        CatalogNotFound,
+        CatalogRepository,
+        CatalogStaleRevision,
+    )
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    secret = "synthetic-media-stale-secret-" + "x" * 32
+    media = CharacterMediaInput(
+        image_url="https://files.catbox.moe/new.jpg",
+        media_type="photo",
+        telegram_file_id="synthetic-file-id",
+    )
+    await db.inventory.insert_one({"user_id": 101, "character_id": "aiko", "quantity": 2})
+    state = await repo.edit_state("aiko", secret=secret)
+    await repo.update_character(
+        "aiko", CharacterChanges(name="Edited concurrently"), actor_id=102, event_id="media-edit"
+    )
+    with pytest.raises(CatalogStaleRevision):
+        await repo.replace_media_reviewed(
+            "aiko",
+            media,
+            actor_id=101,
+            event_id="media-stale",
+            expected_revision=state["revision"],
+            revision_secret=secret,
+        )
+    assert (await db.characters.find_one({"_id": "aiko"}))["name"] == "Edited concurrently"
+    assert await db.activity.find_one({"_id": "media-stale"}) is None
+
+    current = await repo.edit_state("aiko", secret=secret)
+    await repo.replace_media_reviewed(
+        "aiko",
+        media,
+        actor_id=101,
+        event_id="media-once",
+        expected_revision=current["revision"],
+        revision_secret=secret,
+    )
+    before_duplicate = await db.characters.find_one({"_id": "aiko"})
+    current = await repo.edit_state("aiko", secret=secret)
+    another = CharacterMediaInput(
+        image_url="https://files.catbox.moe/other.mp4",
+        media_type="video",
+        telegram_file_id="other-file-id",
+    )
+    with pytest.raises(CatalogConflict):
+        await repo.replace_media_reviewed(
+            "aiko",
+            another,
+            actor_id=101,
+            event_id="media-once",
+            expected_revision=current["revision"],
+            revision_secret=secret,
+        )
+    assert await db.characters.find_one({"_id": "aiko"}) == before_duplicate
+    assert await db.activity.count_documents({"_id": "media-once"}) == 1
+
+    await db.characters.delete_one({"_id": "aiko"})
+    with pytest.raises(CatalogNotFound):
+        await repo.replace_media_reviewed(
+            "aiko",
+            another,
+            actor_id=101,
+            event_id="media-deleted",
+            expected_revision=current["revision"],
+            revision_secret=secret,
+        )
+    assert await db.characters.find_one({"_id": "aiko"}) is None
+    assert await db.activity.find_one({"_id": "media-deleted"}) is None
+    assert (await db.inventory.find_one({"user_id": 101}))["character_id"] == "aiko"

@@ -112,8 +112,8 @@ def register_collector_commands(
                 ("Catalog operator", "/upload · /addchar · /updatechar (private chat)"),
                 (
                     "Media upload",
-                    'Reply with /upload "Name" "Anime" 1; choose a host, '
-                    "review, then publish or cancel.",
+                    'Reply with /upload "Name" "Anime" 1 or /updatechar exact-id media; '
+                    "choose a host, review, then publish or cancel.",
                 ),
             )
             if user and user.id in settings.operator_ids and not _group(message)

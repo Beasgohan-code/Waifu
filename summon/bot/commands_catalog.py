@@ -36,6 +36,7 @@ from summon.bot.upload_media import (
     UploadPurpose,
     claim_upload_action,
     menu_token,
+    parse_replacement,
     parse_upload,
     read_motion,
     reply_media,
@@ -43,9 +44,14 @@ from summon.bot.upload_media import (
     valid_upload_age,
 )
 from summon.config import Settings
-from summon.models import CharacterBasics, CharacterChanges, CharacterInput
+from summon.models import CharacterBasics, CharacterChanges, CharacterInput, CharacterMediaInput
 from summon.rarities import MAX_SPAWN_WEIGHT, RARITY_WEIGHTS, Rarity, parse_rarity, rarity_label
-from summon.repositories.catalog import CatalogConflict, CatalogNotFound
+from summon.repositories.catalog import (
+    CatalogConflict,
+    CatalogNotFound,
+    CatalogRevisionUnavailable,
+    CatalogStaleRevision,
+)
 from summon.repositories.character_numbers import CharacterNumberingUnavailable
 from summon.repositories.rarity_weights import InvalidSpawnWeights, SpawnWeightConflict
 from summon.services.artwork import (
@@ -72,6 +78,14 @@ class NewCharacter:
     category: str
     rarity: Rarity
     url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MediaReview:
+    revision: str
+    character: CharacterBasics
+    media_type: str
+    active: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +204,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
         if secret
         else secrets.token_bytes(32)
     )
+    revision_key = hashlib.sha256(b"summon-media-revision-v1\0" + menu_key).hexdigest()
 
     async def authorize(message: Message) -> TelegramUser | None:
         user = _user(message)
@@ -432,10 +447,21 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
         raise InvalidArtwork("Reply to a photo, video or GIF")
 
     async def start_media_upload(
-        message: Message, user: TelegramUser, bot_id: int, event_id: str
+        message: Message,
+        user: TelegramUser,
+        bot_id: int,
+        event_id: str,
+        *,
+        replacement: bool = False,
     ) -> None:
         try:
-            parsed = parse_upload(command_input(message).args or "", _generated_id("", event_id))
+            args = command_input(message).args or ""
+            if replacement:
+                target_id = parse_replacement(args)
+                parsed = None
+            else:
+                parsed = parse_upload(args, _generated_id("", event_id))
+                target_id = parsed.character_id
             source = await upload_source(message)
             media = reply_media(source)
             if not valid_upload_age(message):
@@ -467,14 +493,28 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 message,
                 Card(
                     "Check the character details",
-                    'Reply to a photo, video or GIF with /upload "Character name" '
-                    '"Anime name" 1, or use /upload Character | Anime | 1. '
-                    "Rarity numbers are 1–18; video and GIF use AMV Edition.",
+                    (
+                        "Reply to a photo, video or GIF with /updatechar exact-id media. "
+                        "Use the character's exact internal ID."
+                        if replacement
+                        else 'Reply to a photo, video or GIF with /upload "Character name" '
+                        '"Anime name" 1, or use /upload Character | Anime | 1. '
+                        "Rarity numbers are 1–18; video and GIF use AMV Edition."
+                    ),
                     emoji=Emoji.WARNING,
                 ),
             )
             return
-        rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+        fields: tuple[tuple[str, str], ...]
+        if parsed is None:
+            fields = (("ID", target_id), ("Action", "Replace existing media"))
+        else:
+            rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+            fields = (
+                ("Character", parsed.name),
+                ("Series", parsed.category),
+                ("Rarity", rarity_label(rarity)),
+            )
         await respond(
             message,
             Card(
@@ -484,11 +524,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 "when its key is configured. Publishing makes the file public. "
                 "Videos and GIFs may retain embedded metadata.",
                 emoji=Emoji.OPEN_COLLECTION,
-                fields=(
-                    ("Character", parsed.name),
-                    ("Series", parsed.category),
-                    ("Rarity", rarity_label(rarity)),
-                ),
+                fields=fields,
             ),
             markup=upload_provider_keyboard(choices, premium=settings.premium_emoji_enabled),
         )
@@ -679,6 +715,33 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             logger.warning("Catalog archive delivery unconfirmed (%s)", type(exc).__name__)
             return original_file_id, False
 
+    async def replacement_state(character_id: str) -> MediaReview:
+        state = await store.catalog.edit_state(character_id, secret=revision_key)
+        if not isinstance(state, dict):
+            raise CatalogRevisionUnavailable("Invalid catalog state")
+        revision = state.get("revision")
+        if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{64}", revision) is None:
+            raise CatalogRevisionUnavailable("Invalid catalog state")
+        entry = state.get("character")
+        if entry is None:
+            raise CatalogNotFound("Character not found")
+        if not isinstance(entry, dict) or entry.get("id") != character_id:
+            raise CatalogRevisionUnavailable("Invalid catalog state")
+        try:
+            basic = CharacterBasics.model_validate(
+                {key: entry.get(key) for key in ("id", "name", "category", "rarity")}
+            )
+        except ValidationError as exc:
+            raise CatalogRevisionUnavailable("Invalid catalog state") from exc
+        media_type, active = entry.get("media_type", "photo"), entry.get("active", True)
+        if (
+            not isinstance(media_type, str)
+            or media_type not in {"photo", "video", "animation"}
+            or not isinstance(active, bool)
+        ):
+            raise CatalogRevisionUnavailable("Invalid catalog state")
+        return MediaReview(revision, basic, media_type, active)
+
     @app.on_callback_query(
         filters.regex(r"^catalog-(?:upload|publish|cancel):")
         | filters.regex(rb"^catalog-(?:upload|publish|cancel):")
@@ -736,28 +799,21 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 maxsplit=1
             )
             command_name, _, mention = (command_text[0] if command_text else "").partition("@")
-            if command_name.casefold() != "/upload" or (
-                mention and mention.casefold() != (identity.username or "").casefold()
-            ):
+            if mention and mention.casefold() != (identity.username or "").casefold():
                 raise ValueError("Original command changed")
             event_id = _event_id(identity.id, actor.id, command_message.id)
-            parsed = parse_upload(
-                command_input(command_message).args or "", _generated_id("", event_id)
-            )
+            args = command_input(command_message).args or ""
+            replacement = command_name.casefold() in {"/updatechar", "/update"}
+            if replacement:
+                target_id = parse_replacement(args)
+                parsed = None
+            elif command_name.casefold() == "/upload":
+                parsed = parse_upload(args, _generated_id("", event_id))
+                target_id = parsed.character_id
+            else:
+                raise ValueError("Original command changed")
             source = await upload_source(command_message)
             media = reply_media(source)
-            expected = menu_token(
-                menu_key, identity.id, actor.id, command_message, media, provider, purpose=purpose
-            )
-            if not valid_token(expected, parts[3]):
-                raise ValueError("Original command or media changed")
-            if purpose != "cancel":
-                if provider == "imgbb" and (
-                    media.kind != "photo" or not settings.imgbb_key.get_secret_value().strip()
-                ):
-                    raise ValueError("Provider is unavailable")
-                if settings.db_channel is None:
-                    raise ValueError("Archive channel is unavailable")
             if not await store.limiter.allow(
                 f"catalog:{actor.id}:upload-{purpose}", limit=10, seconds=60
             ):
@@ -765,7 +821,37 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                     callback_text("Try again shortly.", emoji=Emoji.HOURGLASS), show_alert=True
                 )
                 return
-            if purpose != "cancel" and await store.catalog.character_exists(parsed.character_id):
+            current = (
+                await replacement_state(target_id) if replacement and purpose == "publish" else None
+            )
+            expected = menu_token(
+                menu_key,
+                identity.id,
+                actor.id,
+                command_message,
+                media,
+                provider,
+                purpose=purpose,
+                revision=current.revision if current is not None else None,
+            )
+            if not valid_token(expected, parts[3]):
+                if replacement and purpose == "publish":
+                    raise CatalogStaleRevision("Review no longer matches")
+                raise ValueError("Original command or media changed")
+            if replacement and purpose == "choose":
+                current = await replacement_state(target_id)
+            if purpose != "cancel":
+                if provider == "imgbb" and (
+                    media.kind != "photo" or not settings.imgbb_key.get_secret_value().strip()
+                ):
+                    raise ValueError("Provider is unavailable")
+                if settings.db_channel is None:
+                    raise ValueError("Archive channel is unavailable")
+            if (
+                not replacement
+                and purpose != "cancel"
+                and await store.catalog.character_exists(target_id)
+            ):
                 raise CatalogConflict
             if purpose != "choose":
                 if await store.catalog.catalog_event_exists(event_id):
@@ -776,7 +862,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 claim_started = True
                 if not await claim_upload_action(store.limiter, event_id):
                     raise ImageHostAlreadyAttempted
-            if purpose == "publish":
+            if purpose == "publish" and not replacement:
                 # Do not run even the numbering backfill for a canceled or
                 # previously claimed confirmation. Preflight still occurs
                 # before downloading, hosting or archiving any media.
@@ -784,7 +870,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
         except (ValueError, ValidationError):
             await callback.answer(
                 callback_text(
-                    "This menu expired or its original message changed. Send /upload again.",
+                    "This menu expired or its original message changed. Send the command again.",
                     emoji=Emoji.WARNING,
                 ),
                 show_alert=True,
@@ -796,6 +882,29 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                     "Numbering needs review. No upload started; use a new /upload after review.",
                     emoji=Emoji.WARNING,
                 ),
+                show_alert=True,
+            )
+            return
+        except CatalogStaleRevision:
+            await callback.answer(
+                callback_text(
+                    "The review no longer matches. Choose a host to review the latest record.",
+                    emoji=Emoji.WARNING,
+                ),
+                show_alert=True,
+            )
+            return
+        except CatalogNotFound:
+            await callback.answer(
+                callback_text(
+                    "This character no longer exists. Check its exact ID.", emoji=Emoji.WARNING
+                ),
+                show_alert=True,
+            )
+            return
+        except CatalogRevisionUnavailable:
+            await callback.answer(
+                callback_text("Catalog record needs operator review.", emoji=Emoji.WARNING),
                 show_alert=True,
             )
             return
@@ -827,37 +936,69 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
 
         if purpose == "choose":
             publish_token = menu_token(
-                menu_key, identity.id, actor.id, command_message, media, provider, purpose="publish"
+                menu_key,
+                identity.id,
+                actor.id,
+                command_message,
+                media,
+                provider,
+                purpose="publish",
+                revision=current.revision if current is not None else None,
             )
             cancel_token = menu_token(
                 menu_key, identity.id, actor.id, command_message, media, provider, purpose="cancel"
             )
             publish_data = f"catalog-publish:{command_message.id}:{parts[2]}:{publish_token}"
             cancel_data = f"catalog-cancel:{command_message.id}:{parts[2]}:{cancel_token}"
-            rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
-            media_label = {"photo": "Photo", "video": "Video", "animation": "GIF / animation"}[
-                media.kind
-            ]
-            await callback.answer(callback_text("Review before publishing.", emoji=Emoji.NOTE))
-            await respond(
-                callback.message,
-                Card(
-                    "Review before publishing",
+            labels = {"photo": "Photo", "video": "Video", "animation": "GIF / animation"}
+            media_label = labels[media.kind]
+            host_label = "Catbox" if provider == "catbox" else "ImgBB"
+            fields: tuple[tuple[str, str], ...]
+            if replacement:
+                if current is None:
+                    raise RuntimeError("Missing reviewed catalog state")
+                rarity = "amv-edition" if media.kind != "photo" else current.character.rarity
+                body = (
+                    "Check the original media above. Publishing replaces the current artwork, "
+                    "uploads a public file and attempts a DB_CHANNEL copy. The ID and ownership "
+                    "stay unchanged; old public files and channel copies are not deleted. "
+                    "Moving media becomes AMV Edition. If the record changes, review again. "
+                    "This review expires 15 minutes after the original command."
+                )
+                fields = (
+                    ("ID", target_id),
+                    ("Character", current.character.name),
+                    ("Series", current.character.category),
+                    ("Current rarity", rarity_label(current.character.rarity)),
+                    ("New rarity", rarity_label(rarity)),
+                    ("Current media", labels[current.media_type]),
+                    ("New media", f"{media_label} · {media.size:,} bytes"),
+                    ("Availability", "Active" if current.active else "Inactive"),
+                    ("Host", host_label),
+                )
+            else:
+                if parsed is None:
+                    raise RuntimeError("Missing new character details")
+                rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+                body = (
                     "Check the original media above and these details. Publishing uploads a "
                     "public file, attempts a DB_CHANNEL copy and creates the character. "
                     "Neither external copy can be automatically undone. For different details, "
                     "cancel and send a new /upload. This review expires 15 minutes after the "
-                    "original command.",
-                    emoji=Emoji.OPEN_COLLECTION,
-                    fields=(
-                        ("ID", parsed.character_id),
-                        ("Character", parsed.name),
-                        ("Series", parsed.category),
-                        ("Rarity", rarity_label(rarity)),
-                        ("Media", f"{media_label} · {media.size:,} bytes"),
-                        ("Host", "Catbox" if provider == "catbox" else "ImgBB"),
-                    ),
-                ),
+                    "original command."
+                )
+                fields = (
+                    ("ID", target_id),
+                    ("Character", parsed.name),
+                    ("Series", parsed.category),
+                    ("Rarity", rarity_label(rarity)),
+                    ("Media", f"{media_label} · {media.size:,} bytes"),
+                    ("Host", host_label),
+                )
+            await callback.answer(callback_text("Review before publishing.", emoji=Emoji.NOTE))
+            await respond(
+                callback.message,
+                Card("Review before publishing", body, emoji=Emoji.OPEN_COLLECTION, fields=fields),
                 markup=upload_review_keyboard(
                     publish_data, cancel_data, premium=settings.premium_emoji_enabled
                 ),
@@ -871,7 +1012,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 Card(
                     "Upload canceled",
                     "No media was uploaded by this command. Older reviews for this command "
-                    "cannot publish; send a new /upload to start again.",
+                    "cannot publish; send the command again to start a new review.",
                     emoji=Emoji.DONE,
                 ),
             )
@@ -895,19 +1036,50 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 else:
                     url = await upload_catbox(payload, extension, settings.catbox_userhash)
             backup_id, archived = await archive_media(
-                payload, extension, media.kind, media.file_id, parsed.character_id
+                payload, extension, media.kind, media.file_id, target_id
             )
-            rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
-            data = CharacterInput(
-                id=parsed.character_id,
-                name=parsed.name,
-                category=parsed.category,
-                rarity=rarity,
-                image_url=url,
-                media_type=media.kind,
-                telegram_file_id=backup_id,
+            if replacement:
+                if current is None:
+                    raise CatalogRevisionUnavailable("Missing reviewed state")
+                media_input = CharacterMediaInput(
+                    image_url=url, media_type=media.kind, telegram_file_id=backup_id
+                )
+                saved = await store.catalog.replace_media_reviewed(
+                    target_id,
+                    media_input,
+                    actor_id=actor.id,
+                    event_id=event_id,
+                    expected_revision=current.revision,
+                    revision_secret=revision_key,
+                )
+            else:
+                if parsed is None:
+                    raise ValueError("Missing new character details")
+                rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+                data = CharacterInput(
+                    id=target_id,
+                    name=parsed.name,
+                    category=parsed.category,
+                    rarity=rarity,
+                    image_url=url,
+                    media_type=media.kind,
+                    telegram_file_id=backup_id,
+                )
+                saved = await store.catalog.create_character(
+                    data, actor_id=actor.id, event_id=event_id
+                )
+        except (CatalogStaleRevision, CatalogNotFound):
+            await respond(
+                callback.message,
+                Card(
+                    "Replacement not applied",
+                    "The record changed or was removed during upload. No replacement was saved. "
+                    "The selected host or DB_CHANNEL may contain a copy; "
+                    "check both before retrying.",
+                    emoji=Emoji.WARNING,
+                ),
             )
-            saved = await store.catalog.create_character(data, actor_id=actor.id, event_id=event_id)
+            return
         except (
             ImageHostError,
             ValueError,
@@ -917,6 +1089,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             TimeoutError,
             PyMongoError,
             CatalogConflict,
+            CatalogRevisionUnavailable,
             CharacterNumberingUnavailable,
         ) as exc:
             logger.warning("Public catalog upload unconfirmed (%s)", type(exc).__name__)
@@ -932,18 +1105,35 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             )
             return
         number = saved.get("number") if isinstance(saved, dict) else None
+        if replacement:
+            if current is None:
+                raise RuntimeError("Missing reviewed catalog state")
+            rarity = "amv-edition" if media.kind != "photo" else current.character.rarity
+            title = "Character artwork replaced"
+            summary = (
+                "The hosted URL and Telegram file ID were saved without changing ownership. "
+                "Old public files and channel copies were not deleted."
+            )
+        else:
+            if parsed is None:
+                raise RuntimeError("Missing new character details")
+            rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+            title = "Character added"
+            summary = (
+                "The hosted media URL and Telegram file ID were saved; ownership was not changed."
+            )
         await respond(
             callback.message,
             Card(
-                "Character added",
-                "The hosted media URL and Telegram file ID were saved; ownership was not changed."
+                title,
+                summary
                 + (
                     " Channel copy unconfirmed; check DB_CHANNEL before reposting."
                     if not archived
                     else ""
                 ),
                 emoji=Emoji.DONE,
-                fields=(("ID", str(number or data.id)), ("Rarity", rarity_label(data.rarity))),
+                fields=(("ID", str(number or target_id)), ("Rarity", rarity_label(rarity))),
             ),
         )
 
@@ -972,6 +1162,9 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 raise ValueError("Invalid character ID")
             character_id, field = parts[:2]
             value = parts[2].strip() if len(parts) == 3 else ""
+            if field == "media" and not value:
+                await start_media_upload(message, user, identity.id, event_id, replacement=True)
+                return
             field = {"series": "category", "anime": "category", "image": "image_url"}.get(
                 field, field
             )
@@ -1031,8 +1224,8 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 Card(
                     "Check the update",
                     "Use /updatechar id name|series|rarity|image|description value. "
-                    "Images accept a public HTTPS URL; replied photos require an "
-                    "operator-configured ImgBB backend and key.",
+                    "To review a media replacement, reply to a photo, video or GIF with "
+                    "/updatechar exact-id media. Images also accept a public HTTPS URL.",
                     emoji=Emoji.WARNING,
                 ),
             )

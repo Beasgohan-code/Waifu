@@ -40,6 +40,8 @@ async def setup(*, operators=(42,), **settings_overrides):
             spawn_weights=AsyncMock(return_value=dict(RARITY_WEIGHTS)),
             create_character=AsyncMock(),
             update_character=AsyncMock(),
+            replace_media_reviewed=AsyncMock(),
+            edit_state=AsyncMock(),
             prepare_numbering=AsyncMock(),
             catalog_event_exists=AsyncMock(return_value=False),
             character_exists=AsyncMock(return_value=False),
@@ -1505,6 +1507,7 @@ async def test_upload_review_instructions_appear_only_in_private_operator_help(
         assert ("Media upload" in fields) is expected
         if expected:
             assert "/upload" in fields["Media upload"]
+            assert "/updatechar exact-id media" in fields["Media upload"]
             assert "review" in fields["Media upload"] and "cancel" in fields["Media upload"]
     finally:
         await app.dispatcher.stop()
@@ -1525,5 +1528,469 @@ async def test_operator_revocation_after_review_prevents_publication():
         store.catalog.create_character.assert_not_awaited()
         host.assert_not_awaited()
         app.stream_media.assert_not_called()
+    finally:
+        await app.dispatcher.stop()
+
+
+def replacement_state(revision="a" * 64, *, rarity="epic", media_type="video", active=True):
+    return {
+        "revision": revision,
+        "character": {
+            "id": "aiko",
+            "name": "Aiko",
+            "category": "Sky",
+            "rarity": rarity,
+            "media_type": media_type,
+            "image_url": "https://files.catbox.moe/old.mp4",
+            "description": "Do not overwrite",
+            "active": active,
+            "number": 7,
+        },
+    }
+
+
+async def test_reviewed_photo_replacement_preserves_id_and_waits_for_confirmation():
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+    content = jpeg()
+    source = source_photo(content)
+    events = []
+
+    async def stream(_message, *, limit):
+        events.append("download")
+        yield content
+
+    async def host(*_args, **_kwargs):
+        events.append("host")
+        return "https://i.ibb.co/test/new.jpg"
+
+    async def channel_post(**_kwargs):
+        events.append("channel")
+        return SimpleNamespace(photo=SimpleNamespace(file_id="replacement-channel-id"))
+
+    async def save(*_args, **_kwargs):
+        events.append("catalog")
+        return {"id": "aiko", "number": 7}
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_photo = AsyncMock(side_effect=channel_post)
+    store.catalog.edit_state.return_value = replacement_state(active=False)
+    store.catalog.replace_media_reviewed.side_effect = save
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/updatechar aiko media", source)
+        assert len(buttons) == 2
+        assert events == []
+        card, review = await review_upload_choice(app, buttons[1])
+        fields = dict(card.fields)
+        assert fields["ID"] == "aiko" and fields["Character"] == "Aiko"
+        assert fields["Current rarity"] == fields["New rarity"] == "Epic (legacy)"
+        assert fields["Current media"] == "Video" and fields["New media"].startswith("Photo")
+        assert fields["Availability"] == "Inactive" and fields["Host"] == "ImgBB"
+        assert "not deleted" in card.body and "ownership" in card.body
+        assert events == []
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.replace_media_reviewed.assert_not_awaited()
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock, side_effect=host
+            ) as hosted,
+        ):
+            await dispatch(app, callback_packet(review[0].callback_data))
+        assert events == ["download", "host", "channel", "catalog"]
+        hosted.assert_awaited_once()
+        args = store.catalog.replace_media_reviewed.await_args
+        assert args.args[0] == "aiko"
+        media = args.args[1]
+        assert (media.image_url, media.media_type, media.telegram_file_id) == (
+            "https://i.ibb.co/test/new.jpg",
+            "photo",
+            "replacement-channel-id",
+        )
+        assert args.kwargs["actor_id"] == 42 and args.kwargs["event_id"] == _event_id(123, 42, 50)
+        assert args.kwargs["expected_revision"] == "a" * 64
+        assert len(args.kwargs["revision_secret"]) == 64
+        assert sent.await_args.args[2].title == "Character artwork replaced"
+        assert ("Rarity", "Epic (legacy)") in sent.await_args.args[2].fields
+        store.catalog.create_character.assert_not_awaited()
+        store.catalog.update_character.assert_not_awaited()
+        store.catalog.prepare_numbering.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_reviewed_video_replacement_shows_amv_and_keeps_original_id_on_archive_failure():
+    from wzgram.types import Video
+
+    content = b"\x00\x00\x00\x18ftypisom" + b"video"
+    source = Message(
+        id=49,
+        chat=Chat(id=42, type=ChatType.PRIVATE),
+        from_user=User(id=42),
+        video=Video(
+            file_id="original-video",
+            file_unique_id="stable-video",
+            width=16,
+            height=16,
+            codec="h264",
+            duration=1,
+            mime_type="video/mp4",
+            file_size=len(content),
+        ),
+    )
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+    store.catalog.edit_state.return_value = replacement_state(rarity="rare", media_type="photo")
+    store.catalog.replace_media_reviewed.return_value = {"id": "aiko", "number": 7}
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_video = AsyncMock(side_effect=TimeoutError("private channel detail"))
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/update aiko media", source)
+        assert len(buttons) == 1 and "Catbox" in buttons[0].text
+        card, review = await review_upload_choice(app, buttons[0])
+        fields = dict(card.fields)
+        assert fields["Current rarity"] == "Rare" and fields["New rarity"] == "AMV Edition"
+        assert fields["Current media"] == "Photo" and fields["New media"].startswith("Video")
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/new.mp4",
+            ) as host,
+        ):
+            await dispatch(app, callback_packet(review[0].callback_data))
+        host.assert_awaited_once()
+        media = store.catalog.replace_media_reviewed.await_args.args[1]
+        assert media.media_type == "video" and media.telegram_file_id == "original-video"
+        assert sent.await_args.args[2].title == "Character artwork replaced"
+        assert "Channel copy unconfirmed" in sent.await_args.args[2].body
+        assert ("Rarity", "AMV Edition") in sent.await_args.args[2].fields
+        app.send_video.assert_awaited_once()
+        store.catalog.create_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_replacement_stale_before_upload_requires_new_review_without_claim():
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.catalog.edit_state.side_effect = [
+        replacement_state("a" * 64),
+        replacement_state("b" * 64),
+    ]
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/updatechar aiko media", source_photo(jpeg())
+        )
+        _, review = await review_upload_choice(app, buttons[0])
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(app, callback_packet(review[0].callback_data))
+        args = app.answer_callback_query.await_args.kwargs
+        assert args["show_alert"] is True and "review" in args["text"].lower()
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.replace_media_reviewed.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        host.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_replacement_stale_after_hosting_warns_about_public_orphans_and_never_retries():
+    from summon.repositories.catalog import CatalogStaleRevision
+
+    app, store = await setup(db_channel=-1001234567890)
+    content = jpeg()
+    source = source_photo(content)
+    store.catalog.edit_state.return_value = replacement_state()
+    store.catalog.replace_media_reviewed.side_effect = CatalogStaleRevision("changed")
+    store.limiter.claim_once.side_effect = [True, False]
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_photo = AsyncMock(
+        return_value=SimpleNamespace(photo=SimpleNamespace(file_id="channel-id"))
+    )
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/updatechar aiko media", source)
+        _, review = await review_upload_choice(app, buttons[0])
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/new.jpg",
+            ) as host,
+        ):
+            await dispatch(app, callback_packet(review[0].callback_data))
+            card = sent.await_args.args[2]
+            assert card.title == "Replacement not applied"
+            assert "No replacement was saved" in card.body and "may contain a copy" in card.body
+            await dispatch(app, callback_packet(review[0].callback_data))
+        host.assert_awaited_once()
+        app.send_photo.assert_awaited_once()
+        store.catalog.replace_media_reviewed.assert_awaited_once()
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_canceling_replacement_ignores_later_catalog_edits_and_blocks_old_review():
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.catalog.edit_state.return_value = replacement_state()
+    store.limiter.claim_once.side_effect = [True, False]
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/updatechar aiko media", source_photo(jpeg())
+        )
+        _, review = await review_upload_choice(app, buttons[0])
+        store.catalog.edit_state.return_value = replacement_state("b" * 64)
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host,
+        ):
+            await dispatch(app, callback_packet(review[1].callback_data))
+            assert sent.await_args.args[2].title == "Upload canceled"
+            # Cancel uses the command's shared claim, not the old catalog revision.
+            assert store.catalog.edit_state.await_count == 1
+            store.catalog.edit_state.return_value = replacement_state()
+            await dispatch(app, callback_packet(review[0].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        assert store.limiter.claim_once.await_count == 2
+        host.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        store.catalog.replace_media_reviewed.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize(
+    "broken_state",
+    [
+        {"revision": "a" * 64, "character": None},
+        {"revision": "invalid", "character": replacement_state()["character"]},
+        {"revision": "a" * 64, "character": {**replacement_state()["character"], "id": "other"}},
+        {"revision": "a" * 64, "character": {**replacement_state()["character"], "rarity": "bad"}},
+        {"revision": "a" * 64, "character": {**replacement_state()["character"], "active": "yes"}},
+        {"revision": "a" * 64, "character": {**replacement_state()["character"], "media_type": []}},
+    ],
+)
+async def test_replacement_unavailable_for_missing_or_invalid_catalog_record(broken_state):
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.catalog.edit_state.return_value = broken_state
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/updatechar aiko media", source_photo(jpeg())
+        )
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host,
+        ):
+            await dispatch(app, callback_packet(buttons[0].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        sent.assert_not_awaited()
+        host.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.replace_media_reviewed.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_reviewed_gif_replacement_publishes_animation_reference_as_amv():
+    from wzgram.types import Animation
+
+    content = b"GIF89a" + b"frame"
+    source = Message(
+        id=49,
+        chat=Chat(id=42, type=ChatType.PRIVATE),
+        from_user=User(id=42),
+        animation=Animation(
+            file_id="original-gif",
+            file_unique_id="stable-gif",
+            width=16,
+            height=16,
+            duration=1,
+            mime_type="image/gif",
+            file_size=len(content),
+        ),
+    )
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+    store.catalog.edit_state.return_value = replacement_state(rarity="rare", media_type="photo")
+    store.catalog.replace_media_reviewed.return_value = {"id": "aiko", "number": 7}
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_animation = AsyncMock(
+        return_value=SimpleNamespace(animation=SimpleNamespace(file_id="channel-gif"))
+    )
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/updatechar aiko media", source)
+        assert len(buttons) == 1 and "Catbox" in buttons[0].text
+        card, review = await review_upload_choice(app, buttons[0])
+        assert dict(card.fields)["New rarity"] == "AMV Edition"
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/new.gif",
+            ) as host,
+        ):
+            await dispatch(app, callback_packet(review[0].callback_data))
+        host.assert_awaited_once()
+        media = store.catalog.replace_media_reviewed.await_args.args[1]
+        assert media.media_type == "animation" and media.telegram_file_id == "channel-gif"
+        assert media.image_url.endswith(".gif")
+        assert sent.await_args.args[2].title == "Character artwork replaced"
+        assert ("Rarity", "AMV Edition") in sent.await_args.args[2].fields
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_replacement_deleted_after_review_can_still_be_canceled_without_io():
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.catalog.edit_state.return_value = replacement_state()
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/updatechar aiko media", source_photo(jpeg())
+        )
+        _, review = await review_upload_choice(app, buttons[0])
+        store.catalog.edit_state.return_value = {"revision": "b" * 64, "character": None}
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host,
+        ):
+            await dispatch(app, callback_packet(review[0].callback_data))
+            assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+            assert "no longer exists" in app.answer_callback_query.await_args.kwargs["text"]
+            store.limiter.claim_once.assert_not_awaited()
+            await dispatch(app, callback_packet(review[1].callback_data))
+        assert sent.await_args.args[2].title == "Upload canceled"
+        # Only choose and attempted publish consulted the record, never cancel.
+        assert store.catalog.edit_state.await_count == 2
+        store.limiter.claim_once.assert_awaited_once()
+        store.catalog.replace_media_reviewed.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        host.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_tampered_replacement_review_cannot_claim_or_upload():
+    app, store = await setup(db_channel=-1001234567890)
+    app.stream_media = AsyncMock()
+    store.catalog.edit_state.return_value = replacement_state()
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/updatechar aiko media", source_photo(jpeg())
+        )
+        _, review = await review_upload_choice(app, buttons[0])
+        data = review[0].callback_data
+        forged = data[:-1] + ("A" if data[-1] != "A" else "B")
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as host:
+            await dispatch(app, callback_packet(forged))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        store.limiter.claim_once.assert_not_awaited()
+        store.catalog.replace_media_reviewed.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        host.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_replacement_host_timeout_is_unconfirmed_and_button_is_not_retried():
+    app, store = await setup(db_channel=-1001234567890)
+    content = jpeg()
+    store.catalog.edit_state.return_value = replacement_state()
+    store.limiter.claim_once.side_effect = [True, False]
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock()
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/updatechar aiko media", source_photo(content)
+        )
+        _, review = await review_upload_choice(app, buttons[0])
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                side_effect=TimeoutError("synthetic provider detail"),
+            ) as host,
+        ):
+            await dispatch(app, callback_packet(review[0].callback_data))
+            card = sent.await_args.args[2]
+            assert card.title == "Upload result unconfirmed" and "may already exist" in card.body
+            await dispatch(app, callback_packet(review[0].callback_data))
+        host.assert_awaited_once()
+        app.get_chat.assert_not_awaited()
+        store.catalog.replace_media_reviewed.assert_not_awaited()
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_stale_replacement_can_be_reviewed_again_before_its_command_expires():
+    app, store = await setup(db_channel=-1001234567890)
+    content = jpeg()
+    store.catalog.edit_state.side_effect = [
+        replacement_state("a" * 64),
+        replacement_state("b" * 64, rarity="rare"),
+        replacement_state("b" * 64, rarity="rare"),
+        replacement_state("b" * 64, rarity="rare"),
+    ]
+    store.catalog.replace_media_reviewed.return_value = {"id": "aiko", "number": 7}
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_photo = AsyncMock(
+        return_value=SimpleNamespace(photo=SimpleNamespace(file_id="channel"))
+    )
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/updatechar aiko media", source_photo(content)
+        )
+        _, first = await review_upload_choice(app, buttons[0])
+        await dispatch(app, callback_packet(first[0].callback_data))
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+        store.limiter.claim_once.assert_not_awaited()
+        card, fresh = await review_upload_choice(app, buttons[0])
+        assert dict(card.fields)["Current rarity"] == "Rare"
+        assert fresh[0].callback_data != first[0].callback_data
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/new.jpg",
+            ) as host,
+        ):
+            await dispatch(app, callback_packet(fresh[0].callback_data))
+        assert sent.await_args.args[2].title == "Character artwork replaced"
+        assert (
+            store.catalog.replace_media_reviewed.await_args.kwargs["expected_revision"] == "b" * 64
+        )
+        host.assert_awaited_once()
     finally:
         await app.dispatcher.stop()

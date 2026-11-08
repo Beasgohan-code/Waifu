@@ -77,6 +77,19 @@ def parse_upload(args: str, generated_id: str) -> UploadDetails:
     return UploadDetails(basics.id, basics.name, basics.category, basics.rarity)
 
 
+def parse_replacement(args: str) -> str:
+    """Require an exact immutable ID and the explicit media-replacement field."""
+    parts = args.split()
+    if (
+        len(args) > 4096
+        or len(parts) != 2
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", parts[0]) is None
+        or parts[1] != "media"
+    ):
+        raise ValueError("Use /updatechar exact-id media")
+    return parts[0]
+
+
 def reply_media(message: Message) -> ReplyMedia:
     """Inspect a Telegram reply without downloading it or trusting file names."""
     if (
@@ -135,25 +148,29 @@ def menu_token(
     provider: Provider,
     *,
     purpose: UploadPurpose = "choose",
+    revision: str | None = None,
 ) -> str:
     """Bind each distinct action to the bot, operator, command and source media."""
     text = str(message.text or message.caption or "")
     # Wzgram file IDs include Telegram's renewable file_reference; bind the
     # stable unique ID and declared size, not a reference that can refresh.
-    material = "\0".join(
-        (
-            str(bot_id),
-            str(actor_id),
-            str(message.chat.id),
-            str(message.id),
-            text,
-            media.kind,
-            media.unique_id,
-            str(media.size),
-            provider,
-            purpose,
-        )
-    ).encode("utf-8")
+    fields = [
+        str(bot_id),
+        str(actor_id),
+        str(message.chat.id),
+        str(message.id),
+        text,
+        media.kind,
+        media.unique_id,
+        str(media.size),
+        provider,
+        purpose,
+    ]
+    if revision is not None:
+        if purpose != "publish" or re.fullmatch(r"[0-9a-f]{64}", revision) is None:
+            raise ValueError("Invalid catalog revision")
+        fields.append(revision)
+    material = "\0".join(fields).encode("utf-8")
     digest = hmac.new(key, material, hashlib.sha256).digest()[:12]
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 

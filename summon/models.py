@@ -60,6 +60,28 @@ class CharacterInput(CharacterBasics):
         return validate_external_url(value)
 
 
+class CharacterMediaInput(BaseModel):
+    """Hosted replacement media; never accept a new binary blob or file-less record."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    image_url: str = Field(min_length=1, max_length=2048)
+    media_type: MediaType
+    telegram_file_id: str = Field(min_length=1, max_length=2048)
+
+    @field_validator("image_url")
+    @classmethod
+    def valid_public_url(cls, value: str) -> str:
+        return validate_external_url(value)
+
+    @field_validator("telegram_file_id")
+    @classmethod
+    def valid_file_id(cls, value: str) -> str:
+        if not value.isascii() or not value.isprintable():
+            raise ValueError("Invalid Telegram file ID")
+        return value
+
+
 class CharacterChanges(BaseModel):
     """Explicit metadata updates; character IDs and ownership are immutable."""
 

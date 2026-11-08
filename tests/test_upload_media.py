@@ -10,6 +10,7 @@ from wzgram.types import Animation, Chat, Message, Photo, User, Video
 
 from summon.bot.upload_media import (
     menu_token,
+    parse_replacement,
     parse_upload,
     read_motion,
     reply_media,
@@ -81,6 +82,15 @@ def test_provider_token_is_bound_to_operator_bot_text_media_and_provider():
     cancel = menu_token(key, 123, 42, command, photo, "catbox", purpose="cancel")
     assert len({token, publish, cancel}) == 3
     assert not valid_token(publish, token) and not valid_token(cancel, publish)
+    revision = "a" * 64
+    reviewed = menu_token(
+        key, 123, 42, command, photo, "catbox", purpose="publish", revision=revision
+    )
+    assert not valid_token(reviewed, publish)
+    assert not valid_token(
+        reviewed,
+        menu_token(key, 123, 42, command, photo, "catbox", purpose="publish", revision="b" * 64),
+    )
     assert not valid_token(
         token, menu_token(key, 123, 42, command_message("/upload A B 1"), photo, "catbox")
     )
@@ -175,3 +185,36 @@ async def test_animation_detects_gif_and_rejects_incomplete_download():
     media = reply_media(msg)
     with pytest.raises(InvalidArtwork):
         await read_motion(SimpleNamespace(stream_media=stream), msg, media, asyncio.Semaphore(1))
+
+
+def test_media_replacement_requires_exact_id_and_no_extra_fields():
+    assert parse_replacement("aiko-02 media") == "aiko-02"
+    for value in ("Aiko media", "aiko image", "aiko media value", "../a media", "aiko", ""):
+        with pytest.raises(ValueError):
+            parse_replacement(value)
+
+
+def test_media_review_signing_rejects_invalid_revision():
+    with pytest.raises(ValueError):
+        menu_token(
+            b"key",
+            123,
+            42,
+            command_message(),
+            reply_media(photo_message()),
+            "catbox",
+            purpose="publish",
+            revision="not-a-revision",
+        )
+    for purpose in ("choose", "cancel"):
+        with pytest.raises(ValueError):
+            menu_token(
+                b"key",
+                123,
+                42,
+                command_message(),
+                reply_media(photo_message()),
+                "catbox",
+                purpose=purpose,
+                revision="a" * 64,
+            )

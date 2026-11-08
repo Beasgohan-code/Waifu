@@ -10,10 +10,18 @@ import secrets
 from typing import Any, cast
 from uuid import uuid4
 
+from pydantic import ValidationError
 from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 
-from summon.models import CharacterChanges, CharacterInput, InventorySort, normalize_name
+from summon.models import (
+    CharacterBasics,
+    CharacterChanges,
+    CharacterInput,
+    CharacterMediaInput,
+    InventorySort,
+    normalize_name,
+)
 from summon.rarities import spawn_values
 from summon.repositories.base import transaction, utcnow
 from summon.repositories.character_numbers import CharacterNumbers, numeric_slug
@@ -90,6 +98,8 @@ def catalog_revision(character_id: str, doc: dict[str, Any] | None, secret: str)
             if value is not None and (not isinstance(value, str) or len(value) > maximum):
                 raise CatalogRevisionUnavailable("Catalog record requires operator repair")
         if "active" in doc and not isinstance(doc["active"], bool):
+            raise CatalogRevisionUnavailable("Catalog record requires operator repair")
+        if doc.get("media_type") not in {None, "photo", "video", "animation"}:
             raise CatalogRevisionUnavailable("Catalog record requires operator repair")
         state.extend((field, field in doc, doc.get(field)) for field in _REVISION_FIELDS)
     try:
@@ -334,6 +344,74 @@ class CatalogRepository:
 
         try:
             await transaction(self.client, update)
+        except DuplicateKeyError as exc:
+            raise CatalogConflict("This command was already processed") from exc
+
+    async def replace_media_reviewed(
+        self,
+        character_id: str,
+        media: CharacterMediaInput,
+        *,
+        actor_id: int,
+        event_id: str,
+        expected_revision: str,
+        revision_secret: str,
+    ) -> dict[str, Any]:
+        """Replace only media in an existing, unchanged record and audit atomically.
+
+        No ownership, numeric alias, unrelated metadata or legacy artwork blob is
+        removed. Motion media is classified as AMV Edition. The caller must claim
+        the external upload before I/O and treat any later failure as ambiguous.
+        """
+        if self.client is None:
+            raise RuntimeError("Catalog writes require a transaction client")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", character_id):
+            raise ValueError("Invalid character ID")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            raise CatalogRevisionUnavailable("Invalid catalog revision")
+        values: dict[str, Any] = media.model_dump()
+        if media.media_type in {"video", "animation"}:
+            values["rarity"] = "amv-edition"
+        now = utcnow()
+
+        async def replace(session: Any) -> dict[str, Any]:
+            existing = await self.db.characters.find_one({"_id": character_id}, session=session)
+            if existing is None:
+                raise CatalogNotFound("Character not found")
+            current = catalog_revision(character_id, existing, revision_secret)
+            if not hmac.compare_digest(expected_revision, current):
+                raise CatalogStaleRevision("The catalog record changed after review")
+            try:
+                CharacterBasics.model_validate(
+                    {
+                        "id": character_id,
+                        "name": existing.get("name"),
+                        "category": existing.get("category"),
+                        "rarity": existing.get("rarity"),
+                    }
+                )
+            except ValidationError as exc:
+                raise CatalogRevisionUnavailable("Catalog record requires operator repair") from exc
+            await self.db.activity.insert_one(
+                {
+                    "_id": event_id,
+                    "user_id": actor_id,
+                    "kind": "character_media_replaced",
+                    "character_id": character_id,
+                    "fields": sorted(values),
+                    "created_at": now,
+                },
+                session=session,
+            )
+            result = await self.db.characters.update_one(
+                {"_id": character_id}, {"$set": values}, session=session
+            )
+            if not result.matched_count:
+                raise CatalogNotFound("Character not found")
+            return public_character({**existing, **values})
+
+        try:
+            return await transaction(self.client, replace)
         except DuplicateKeyError as exc:
             raise CatalogConflict("This command was already processed") from exc
 

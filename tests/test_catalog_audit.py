@@ -173,6 +173,8 @@ def test_catalog_review_revision_covers_editable_state_without_exposing_media_id
         catalog_revision("clip", {**doc, "description": "x" * 1201}, secret)
     with pytest.raises(CatalogRevisionUnavailable):
         catalog_revision("clip", {**doc, "telegram_file_id": b"not-text"}, secret)
+    with pytest.raises(CatalogRevisionUnavailable):
+        catalog_revision("clip", {**doc, "media_type": "unknown"}, secret)
 
 
 async def test_catalog_review_returns_public_current_state_and_rejects_stale_writes(monkeypatch):
@@ -257,6 +259,177 @@ async def test_catalog_review_missing_record_cannot_replace_a_newly_created_char
             data,
             actor_id=42,
             expected_revision=catalog_revision("new", None, secret),
+            revision_secret=secret,
+        )
+    db.characters.update_one.assert_not_awaited()
+    db.activity.insert_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize("kind", ["photo", "video", "animation"])
+async def test_reviewed_media_replacement_updates_only_media_and_audits(monkeypatch, kind):
+    from summon.models import CharacterMediaInput
+    from summon.repositories.catalog import catalog_revision
+
+    async def fake_transaction(_client, callback):
+        return await callback("session")
+
+    monkeypatch.setattr("summon.repositories.catalog.transaction", fake_transaction)
+    original = {
+        "_id": "clip",
+        "name": "Aiko",
+        "name_key": "aiko",
+        "category": "Sky",
+        "rarity": "epic",
+        "number": 7,
+        "active": False,
+        "image_url": "https://cdn.example/old.jpg",
+        "media_type": "photo",
+        "telegram_file_id": "old-file",
+        "description": "Keep me",
+    }
+    db = SimpleNamespace(
+        characters=SimpleNamespace(
+            find_one=AsyncMock(return_value=original),
+            update_one=AsyncMock(return_value=SimpleNamespace(matched_count=1)),
+        ),
+        activity=SimpleNamespace(insert_one=AsyncMock()),
+        inventory=SimpleNamespace(update_one=AsyncMock(), delete_one=AsyncMock()),
+        character_artworks=SimpleNamespace(update_one=AsyncMock(), delete_one=AsyncMock()),
+    )
+    secret = "r" * 40
+    media = CharacterMediaInput(
+        image_url="https://files.catbox.moe/new.mp4", media_type=kind, telegram_file_id="new-file"
+    )
+    result = await CatalogRepository(db, client=object()).replace_media_reviewed(
+        "clip",
+        media,
+        actor_id=42,
+        event_id="replacement-event",
+        expected_revision=catalog_revision("clip", original, secret),
+        revision_secret=secret,
+    )
+    changes = db.characters.update_one.await_args.args[1]["$set"]
+    assert changes["image_url"] == media.image_url and changes["telegram_file_id"] == "new-file"
+    assert changes["media_type"] == kind
+    if kind == "photo":
+        assert "rarity" not in changes and result["rarity"] == "epic"
+    else:
+        assert changes["rarity"] == "amv-edition" and result["rarity"] == "amv-edition"
+    assert result["id"] == "clip" and result["name"] == "Aiko" and result["number"] == 7
+    assert result["active"] is False and result["description"] == "Keep me"
+    assert "telegram_file_id" not in result
+    audit = db.activity.insert_one.await_args
+    assert audit.kwargs["session"] == "session"
+    assert audit.args[0]["kind"] == "character_media_replaced"
+    assert audit.args[0]["_id"] == "replacement-event" and audit.args[0]["user_id"] == 42
+    assert "new-file" not in str(audit.args[0])
+    assert db.characters.update_one.await_args.kwargs["session"] == "session"
+    db.inventory.update_one.assert_not_awaited()
+    db.inventory.delete_one.assert_not_awaited()
+    db.character_artworks.update_one.assert_not_awaited()
+    db.character_artworks.delete_one.assert_not_awaited()
+
+
+async def test_reviewed_media_replacement_rejects_stale_or_missing_before_writes(monkeypatch):
+    from summon.models import CharacterMediaInput
+    from summon.repositories.catalog import CatalogNotFound, CatalogStaleRevision, catalog_revision
+
+    async def fake_transaction(_client, callback):
+        return await callback("session")
+
+    monkeypatch.setattr("summon.repositories.catalog.transaction", fake_transaction)
+    initial = {"_id": "a", "name": "Old", "category": "Series", "rarity": "rare"}
+    current = {**initial, "name": "Another operator changed it"}
+    db = SimpleNamespace(
+        characters=SimpleNamespace(
+            find_one=AsyncMock(return_value=current), update_one=AsyncMock()
+        ),
+        activity=SimpleNamespace(insert_one=AsyncMock()),
+    )
+    repo = CatalogRepository(db, client=object())
+    media = CharacterMediaInput(
+        image_url="https://files.catbox.moe/new.jpg", media_type="photo", telegram_file_id="file-id"
+    )
+    secret = "s" * 40
+    with pytest.raises(CatalogStaleRevision):
+        await repo.replace_media_reviewed(
+            "a",
+            media,
+            actor_id=42,
+            event_id="one",
+            expected_revision=catalog_revision("a", initial, secret),
+            revision_secret=secret,
+        )
+    db.characters.update_one.assert_not_awaited()
+    db.activity.insert_one.assert_not_awaited()
+    db.characters.find_one.return_value = None
+    with pytest.raises(CatalogNotFound):
+        await repo.replace_media_reviewed(
+            "a",
+            media,
+            actor_id=42,
+            event_id="two",
+            expected_revision=catalog_revision("a", initial, secret),
+            revision_secret=secret,
+        )
+    db.characters.update_one.assert_not_awaited()
+    db.activity.insert_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"image_url": "http://example.com/unsafe.jpg"},
+        {"image_url": "https://127.0.0.1/private.jpg"},
+        {"image_url": "/api/artwork/" + "a" * 64},
+        {"media_type": "document"},
+        {"telegram_file_id": ""},
+        {"telegram_file_id": "bad\nid"},
+        {"telegram_file_id": "é"},
+        {"content": b"not allowed"},
+    ],
+)
+def test_replacement_media_requires_public_url_and_valid_reference(changes):
+    from pydantic import ValidationError
+
+    from summon.models import CharacterMediaInput
+
+    values = {
+        "image_url": "https://files.catbox.moe/new.jpg",
+        "media_type": "photo",
+        "telegram_file_id": "file-id",
+    }
+    with pytest.raises(ValidationError):
+        CharacterMediaInput(**(values | changes))
+
+
+async def test_reviewed_media_replacement_rejects_malformed_existing_metadata(monkeypatch):
+    from summon.models import CharacterMediaInput
+    from summon.repositories.catalog import CatalogRevisionUnavailable, catalog_revision
+
+    async def fake_transaction(_client, callback):
+        return await callback("session")
+
+    monkeypatch.setattr("summon.repositories.catalog.transaction", fake_transaction)
+    existing = {"_id": "a", "name": "Old", "category": "Series", "rarity": "unknown"}
+    db = SimpleNamespace(
+        characters=SimpleNamespace(
+            find_one=AsyncMock(return_value=existing), update_one=AsyncMock()
+        ),
+        activity=SimpleNamespace(insert_one=AsyncMock()),
+    )
+    secret = "s" * 40
+    with pytest.raises(CatalogRevisionUnavailable):
+        await CatalogRepository(db, client=object()).replace_media_reviewed(
+            "a",
+            CharacterMediaInput(
+                image_url="https://files.catbox.moe/new.jpg",
+                media_type="photo",
+                telegram_file_id="file-id",
+            ),
+            actor_id=42,
+            event_id="bad-record",
+            expected_revision=catalog_revision("a", existing, secret),
             revision_secret=secret,
         )
     db.characters.update_one.assert_not_awaited()
