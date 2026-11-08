@@ -1820,3 +1820,70 @@ async def test_reviewed_media_replacement_rejects_edits_deletion_and_duplicate_a
     assert await db.characters.find_one({"_id": "aiko"}) is None
     assert await db.activity.find_one({"_id": "media-deleted"}) is None
     assert (await db.inventory.find_one({"user_id": 101}))["character_id"] == "aiko"
+
+
+async def test_telegram_media_and_webapp_reviewed_edits_cannot_overwrite_each_other(
+    isolated_database,
+):
+    from summon.models import CharacterInput, CharacterMediaInput
+    from summon.repositories.catalog import CatalogRepository, CatalogStaleRevision
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    web_secret = "synthetic-web-review-secret-" + "w" * 32
+    bot_secret = "synthetic-bot-review-secret-" + "b" * 32
+    await db.inventory.insert_one({"user_id": 101, "character_id": "aiko", "quantity": 5})
+    web_state, bot_state = await asyncio.gather(
+        repo.edit_state("aiko", secret=web_secret), repo.edit_state("aiko", secret=bot_secret)
+    )
+    old = web_state["character"]
+    web_edit = CharacterInput(
+        id="aiko",
+        name="Reviewed web name",
+        category=old["category"],
+        rarity=old["rarity"],
+        image_url=old["image_url"],
+        description=old["description"],
+        active=old["active"],
+    )
+    bot_media = CharacterMediaInput(
+        image_url="https://files.catbox.moe/new.mp4",
+        media_type="video",
+        telegram_file_id="synthetic-bot-file-id",
+    )
+    results = await asyncio.gather(
+        repo.upsert_character(
+            web_edit,
+            actor_id=101,
+            expected_revision=web_state["revision"],
+            revision_secret=web_secret,
+        ),
+        repo.replace_media_reviewed(
+            "aiko",
+            bot_media,
+            actor_id=102,
+            event_id="cross-transport-bot",
+            expected_revision=bot_state["revision"],
+            revision_secret=bot_secret,
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(isinstance(result, CatalogStaleRevision) for result in results) == 1
+    stored = await db.characters.find_one({"_id": "aiko"})
+    if isinstance(results[0], dict):
+        assert stored["name"] == "Reviewed web name" and stored["image_url"] == old["image_url"]
+    else:
+        assert stored["name"] == old["name"] and stored["image_url"] == bot_media.image_url
+        assert (
+            stored["rarity"] == "amv-edition"
+            and stored["telegram_file_id"] == bot_media.telegram_file_id
+        )
+    assert stored["number"] == old["number"]
+    assert (await db.inventory.find_one({"user_id": 101, "character_id": "aiko"}))["quantity"] == 5
+    assert (
+        await db.activity.count_documents(
+            {"kind": {"$in": ["character_saved", "character_media_replaced"]}}
+        )
+        == 1
+    )
