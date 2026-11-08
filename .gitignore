@@ -1,0 +1,31 @@
+# Secrets and local state
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*.db
+*.sqlite*
+*.log
+# Keep migration exports/reports out of the checkout whenever possible.
+migration-data/
+
+# Python
+.venv/
+.bootstrap/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+
+# Web
+node_modules/
+dist/
+coverage/
+.vite/
+
+# System
+.DS_Store
