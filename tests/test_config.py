@@ -10,6 +10,8 @@ def test_default_config_contains_no_credentials_or_database_uri():
     assert settings.mongo_uri.get_secret_value() == ""
     assert settings.telegram_api_hash.get_secret_value() == ""
     assert settings.operator_ids == []
+    assert settings.owner_id is None
+    assert settings.startup_dm_enabled is True
 
 
 def test_production_requires_real_secret_and_database_settings():
@@ -229,6 +231,7 @@ def test_simple_environment_aliases_and_prefixed_precedence(monkeypatch, tmp_pat
     assert settings.bot_token.get_secret_value() == "alias-token"
     assert settings.telegram_api_id == 1234
     assert settings.operator_ids == [42]
+    assert settings.owner_id == 42
     monkeypatch.setenv("SUMMON_MONGO_URI", "mongodb://prefixed.invalid/db")
     monkeypatch.setenv("SUMMON_BOT_TOKEN", "")
     settings = Settings(_env_file=dotenv)
@@ -245,6 +248,31 @@ def test_embedded_bot_worker_is_opt_in_outside_the_docker_image(monkeypatch):
     assert Settings(_env_file=None).run_bot_worker is True
     monkeypatch.setenv("SUMMON_RUN_BOT_WORKER", "false")
     assert Settings(_env_file=None).run_bot_worker is False
+
+
+def test_owner_startup_notification_uses_a_separate_explicit_recipient(monkeypatch):
+    monkeypatch.setenv("OWNER_ID", "42")
+    monkeypatch.setenv("OPERATOR_IDS", "7,8")
+    settings = Settings(_env_file=None)
+    assert settings.owner_id == 42
+    assert settings.operator_ids == [7, 8]
+    monkeypatch.setenv("SUMMON_OWNER_ID", "99")
+    monkeypatch.setenv("SUMMON_STARTUP_DM_ENABLED", "false")
+    settings = Settings(_env_file=None)
+    assert settings.owner_id == 99
+    assert settings.operator_ids == [7, 8]
+    assert settings.startup_dm_enabled is False
+    monkeypatch.delenv("SUMMON_OWNER_ID")
+    monkeypatch.setenv("OWNER_ID", "")
+    assert Settings(_env_file=None).owner_id is None
+
+
+@pytest.mark.parametrize("value", ["0", "-1", str(2**53), "not-a-number", "9" * 100])
+def test_invalid_notification_owner_is_skipped_without_blocking_runtime(monkeypatch, value):
+    monkeypatch.setenv("OPERATOR_IDS", "7,8")
+    monkeypatch.setenv("SUMMON_OWNER_ID", value)
+    settings = Settings(_env_file=None)
+    assert settings.owner_id is None and settings.operator_ids == [7, 8]
 
 
 def test_reference_mongo_db_url_alias_and_existing_precedence(monkeypatch):

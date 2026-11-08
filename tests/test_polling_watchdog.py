@@ -268,7 +268,9 @@ async def test_registered_lease_guards_stop_messages_edits_and_callbacks():
     assert not lease.valid()
 
 
-async def make_worker(monkeypatch, *, stop_mode="normal", embedded=False):
+async def make_worker(
+    monkeypatch, *, stop_mode="normal", embedded=False, owner_id=None, notify=None, start_error=None
+):
     from importlib import import_module
 
     module = import_module("summon.bot.main")
@@ -278,6 +280,7 @@ async def make_worker(monkeypatch, *, stop_mode="normal", embedded=False):
         telegram_api_id=123,
         telegram_api_hash="fake",
         webhooks_disabled_confirmed=True,
+        owner_id=owner_id,
         _env_file=None,
     )
     monitor_started, fail_monitor, fail_lease = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -334,10 +337,12 @@ async def make_worker(monkeypatch, *, stop_mode="normal", embedded=False):
     monkeypatch.setattr(module, "register_handlers", lambda *_args: None)
     # This harness isolates worker supervision; the real manifest has dedicated tests.
     monkeypatch.setattr(module, "validate_handler_registration", lambda *_args: None)
-    monkeypatch.setattr(module, "start_verified_client", AsyncMock())
+    monkeypatch.setattr(module, "start_verified_client", AsyncMock(side_effect=start_error))
     monkeypatch.setattr(module, "register_command_menus", AsyncMock())
     monkeypatch.setattr(module, "monitor_connection", monitor)
     monkeypatch.setattr(module, "idle", idle_mock)
+    if notify is not None:
+        monkeypatch.setattr(module, "notify_owner_startup", notify)
     task = asyncio.create_task(
         module.run(
             shared_database=(mongo, database) if embedded else None,
@@ -345,7 +350,8 @@ async def make_worker(monkeypatch, *, stop_mode="normal", embedded=False):
             on_started=started,
         )
     )
-    await asyncio.wait_for(monitor_started.wait(), 1)
+    if start_error is None:
+        await asyncio.wait_for(monitor_started.wait(), 1)
     return SimpleNamespace(
         task=task,
         bot=bot,
@@ -625,3 +631,211 @@ async def test_embedded_supervisor_reports_fixed_retry_reason(monkeypatch, failu
     monkeypatch.setattr(supervisor, "_wait_before_retry", inspect_retry)
     with pytest.raises(asyncio.CancelledError):
         await supervisor.supervise_embedded_worker(embedded_settings(), object(), object(), status)
+
+
+def owner_startup_settings(**overrides):
+    values = {
+        "owner_id": 42,
+        "bot_token": "123:SYNTHETIC_PRIVATE_TOKEN",
+        "telegram_api_hash": "SYNTHETIC_PRIVATE_HASH",
+        "mongo_uri": "mongodb://SYNTHETIC_PRIVATE_HOST/db",
+        "session_secret": "SYNTHETIC_PRIVATE_SESSION_SECRET",
+        "_env_file": None,
+    }
+    return Settings(**{**values, **overrides})
+
+
+async def test_owner_startup_report_contains_only_safe_details(monkeypatch):
+    from summon.bot import startup_report
+
+    bot = SimpleNamespace(me=SimpleNamespace(username="SummonTestBot"))
+    lease = SimpleNamespace(valid=lambda: True)
+    sender = AsyncMock(return_value=object())
+    monkeypatch.setattr(startup_report, "send_card", sender)
+    await startup_report.notify_owner_startup(bot, owner_startup_settings(), lease)
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] is bot and sender.await_args.args[1] == 42
+    card = sender.await_args.args[2]
+    text = card.telegram_html(premium=False)
+    assert "SUMMON is online" in text and "@SummonTestBot" in text
+    assert "Wzgram" in text and "Initialization completed" in text and "UTC" in text
+    assert "verify update delivery" in text
+    assert "SYNTHETIC_PRIVATE" not in text
+    assert sender.await_args.kwargs == {"rich": True, "premium": True}
+
+
+@pytest.mark.parametrize("reason", ["no_owner", "disabled", "lease_lost"])
+async def test_owner_startup_notification_skips_missing_disabled_or_unleased(monkeypatch, reason):
+    from summon.bot import startup_report
+
+    overrides = {
+        "no_owner": {"owner_id": None, "operator_ids": [7, 8]},
+        "disabled": {"startup_dm_enabled": False},
+        "lease_lost": {},
+    }[reason]
+    sender = AsyncMock()
+    monkeypatch.setattr(startup_report, "send_card", sender)
+    await startup_report.notify_owner_startup(
+        SimpleNamespace(me=None),
+        owner_startup_settings(**overrides),
+        SimpleNamespace(valid=lambda: reason != "lease_lost"),
+    )
+    sender.assert_not_awaited()
+
+
+async def test_owner_startup_report_respects_visual_settings_and_rejects_unsafe_username(
+    monkeypatch,
+):
+    from summon.bot import startup_report
+
+    sender = AsyncMock(return_value=object())
+    monkeypatch.setattr(startup_report, "send_card", sender)
+    await startup_report.notify_owner_startup(
+        SimpleNamespace(me=SimpleNamespace(username='<script>alert("x")</script>')),
+        owner_startup_settings(rich_enabled=False, premium_emoji_enabled=False),
+        SimpleNamespace(valid=lambda: True),
+    )
+    sender.assert_awaited_once()
+    assert sender.await_args.kwargs == {"rich": False, "premium": False}
+    assert "<script>" not in sender.await_args.args[2].telegram_html(premium=False)
+
+
+@pytest.mark.parametrize("failure", ["error", "flood", "unconfirmed", "timeout"])
+async def test_owner_startup_notification_never_retries_ambiguous_failure(
+    monkeypatch, failure, caplog
+):
+    from wzgram.errors import FloodWait
+
+    from summon.bot import startup_report
+
+    async def hung(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    sender = {
+        "error": AsyncMock(side_effect=OSError("PRIVATE_NOTIFICATION_DETAIL")),
+        "flood": AsyncMock(side_effect=FloodWait(60)),
+        "unconfirmed": AsyncMock(return_value=None),
+        "timeout": AsyncMock(side_effect=hung),
+    }[failure]
+    monkeypatch.setattr(startup_report, "send_card", sender)
+    monkeypatch.setattr(startup_report, "_STARTUP_DM_TIMEOUT_SECONDS", 0.01)
+    await asyncio.wait_for(
+        startup_report.notify_owner_startup(
+            SimpleNamespace(me=None), owner_startup_settings(), SimpleNamespace(valid=lambda: True)
+        ),
+        timeout=1,
+    )
+    sender.assert_awaited_once()
+    assert "PRIVATE_NOTIFICATION_DETAIL" not in caplog.text
+    if failure in {"unconfirmed", "timeout"}:
+        assert "unconfirmed" in caplog.text or "not confirmed" in caplog.text
+
+
+async def test_owner_startup_report_uses_premium_fallback_only_on_definite_rejection(caplog):
+    from wzgram.errors import BadRequest
+
+    from summon.bot.startup_report import notify_owner_startup
+
+    bot = SimpleNamespace(
+        me=SimpleNamespace(username="SummonTestBot"),
+        send_rich_message=AsyncMock(side_effect=BadRequest("CUSTOM_EMOJI_INVALID")),
+        send_message=AsyncMock(return_value=object()),
+    )
+    await notify_owner_startup(bot, owner_startup_settings(), SimpleNamespace(valid=lambda: True))
+    bot.send_rich_message.assert_awaited_once()
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs["chat_id"] == 42
+    assert "<tg-emoji" not in bot.send_message.await_args.kwargs["text"]
+    assert "SUMMON is online" in bot.send_message.await_args.kwargs["text"]
+    assert "CUSTOM_EMOJI_INVALID" not in caplog.text
+
+
+async def test_owner_startup_report_does_not_fallback_after_unconfirmed_rich_send(caplog):
+    from summon.bot.startup_report import notify_owner_startup
+
+    bot = SimpleNamespace(
+        me=SimpleNamespace(username="SummonTestBot"),
+        send_rich_message=AsyncMock(return_value=None),
+        send_message=AsyncMock(),
+    )
+    await notify_owner_startup(bot, owner_startup_settings(), SimpleNamespace(valid=lambda: True))
+    bot.send_rich_message.assert_awaited_once()
+    bot.send_message.assert_not_awaited()
+    assert "not confirmed" in caplog.text
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+async def test_worker_sends_one_owner_notice_after_startup_and_cancels_it_before_stop(
+    monkeypatch, embedded
+):
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def notify(bot, settings, lease):
+        assert bot.is_connected and settings.owner_id == 42 and lease.valid()
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    notification = AsyncMock(side_effect=notify)
+    worker = await make_worker(monkeypatch, embedded=embedded, owner_id=42, notify=notification)
+    await asyncio.wait_for(entered.wait(), 1)
+    worker.started.assert_called_once()
+    worker.factory.assert_called_once()
+    notification.assert_awaited_once()
+
+    async def stop():
+        assert cancelled.is_set()
+        worker.bot.is_connected = False
+        worker.bot.is_initialized = False
+
+    worker.bot.stop.side_effect = stop
+    worker.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker.task
+    assert cancelled.is_set()
+    worker.bot.stop.assert_awaited_once()
+    worker.lease.release.assert_awaited_once()
+
+
+async def test_failed_worker_startup_never_sends_owner_notification(monkeypatch):
+    notification = AsyncMock()
+    worker = await make_worker(
+        monkeypatch,
+        embedded=True,
+        owner_id=42,
+        notify=notification,
+        start_error=OSError("PRIVATE_START_DETAIL"),
+    )
+    with pytest.raises(OSError):
+        await asyncio.wait_for(worker.task, 1)
+    notification.assert_not_awaited()
+    worker.started.assert_not_called()
+    worker.bot.stop.assert_awaited_once()
+    worker.lease.release.assert_awaited_once()
+    worker.mongo.close.assert_not_awaited()
+
+
+async def test_owner_dm_failure_does_not_stop_started_worker(monkeypatch, caplog):
+    from summon.bot import startup_report
+
+    attempted = asyncio.Event()
+
+    async def reject(*_args, **_kwargs):
+        attempted.set()
+        raise OSError("PRIVATE_NOTIFICATION_DETAIL")
+
+    sender = AsyncMock(side_effect=reject)
+    monkeypatch.setattr(startup_report, "send_card", sender)
+    worker = await make_worker(monkeypatch, embedded=True, owner_id=42)
+    await asyncio.wait_for(attempted.wait(), 1)
+    await asyncio.sleep(0)
+    assert not worker.task.done()
+    sender.assert_awaited_once()
+    assert "PRIVATE_NOTIFICATION_DETAIL" not in caplog.text
+    worker.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker.task
+    worker.bot.stop.assert_awaited_once()

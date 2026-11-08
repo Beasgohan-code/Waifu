@@ -76,6 +76,8 @@ _ENV_ALIASES: dict[str, tuple[str, ...]] = {
     "rich_enabled": ("RICH_ENABLED",),
     "premium_emoji_enabled": ("PREMIUM_EMOJI_ENABLED",),
     "operator_ids": ("OPERATOR_IDS", "OWNER_ID"),
+    "owner_id": ("OWNER_ID",),
+    "startup_dm_enabled": ("STARTUP_DM_ENABLED",),
     "allowed_origins": ("ALLOWED_ORIGINS",),
 }
 
@@ -170,6 +172,9 @@ class Settings(BaseSettings):
     premium_emoji_enabled: bool = True
     allowed_origins: list[str] = []
     operator_ids: list[int] = []
+    # A single explicit owner is the only startup-notification recipient.
+    owner_id: int | None = None
+    startup_dm_enabled: bool = True
     preview_mode: bool = False
     # Opt-in in ordinary Python installs; enabled by the Render Docker image.
     run_bot_worker: bool = False
@@ -186,6 +191,21 @@ class Settings(BaseSettings):
     @classmethod
     def empty_optional_id(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("owner_id", mode="before")
+    @classmethod
+    def valid_notification_owner(cls, value: object) -> int | None:
+        # An optional notification must never prevent the API/bot from
+        # starting or send to an invalid, group, or unexpectedly coerced ID.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            owner_id = value
+        elif isinstance(value, str) and len(value) <= 32 and value.isascii() and value.isdecimal():
+            owner_id = int(value)
+        else:
+            return None
+        return owner_id if 0 < owner_id < 2**53 else None
 
     @field_validator("operator_ids")
     @classmethod

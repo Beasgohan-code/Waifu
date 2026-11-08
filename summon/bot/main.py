@@ -18,6 +18,7 @@ from summon.bot.handlers import COMMANDS, group_commands, register_handlers
 from summon.bot.ingress import IngressLease, IngressLeaseLost
 from summon.bot.registration import validate_handler_registration
 from summon.bot.session_storage import bot_id_from_token, start_verified_client, worker_storage
+from summon.bot.startup_report import notify_owner_startup
 from summon.bot.watchdog import monitor_connection
 from summon.config import Settings
 from summon.database import connect_database, safe_startup_error
@@ -78,6 +79,7 @@ async def run(
     monitor_task: asyncio.Task[None] | None = None
     idle_task: asyncio.Task[None] | None = None
     startup_task: asyncio.Task[None] | None = None
+    owner_task: asyncio.Task[None] | None = None
     acquired = False
     try:
         async with asyncio.timeout(10):
@@ -145,6 +147,15 @@ async def run(
         idle_task = asyncio.create_task(idle_wait, name="telegram-idle")
         if on_started is not None:
             on_started()
+        # Nonessential owner notification must not block startup or install a
+        # second Telegram client. It is cancelled before the worker stops.
+        if settings.startup_dm_enabled:
+            if settings.owner_id is None:
+                logger.warning("Owner startup DM skipped: configure a valid numeric OWNER_ID.")
+            else:
+                owner_task = asyncio.create_task(
+                    notify_owner_startup(bot, settings, lease), name="owner-startup-notification"
+                )
         done, _ = await asyncio.wait(
             {lease_task, monitor_task, idle_task}, return_when=asyncio.FIRST_COMPLETED
         )
@@ -154,13 +165,13 @@ async def run(
             await finished
     finally:
         lease.invalidate()
-        for pending_task in (startup_task, idle_task, monitor_task, lease_task):
+        for pending_task in (startup_task, owner_task, idle_task, monitor_task, lease_task):
             if pending_task is not None:
                 pending_task.cancel()
         await asyncio.gather(
             *(
                 task
-                for task in (startup_task, idle_task, monitor_task, lease_task)
+                for task in (startup_task, owner_task, idle_task, monitor_task, lease_task)
                 if task is not None
             ),
             return_exceptions=True,

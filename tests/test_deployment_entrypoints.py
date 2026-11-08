@@ -262,7 +262,7 @@ def test_combined_server_sigterm_stops_native_worker_before_shared_mongo(tmp_pat
         worker = import_module('summon.bot.main')
         settings = Settings(bot_token='123:synthetic', telegram_api_id=123,
                             telegram_api_hash='synthetic', webhooks_disabled_confirmed=True,
-                            run_bot_worker=True, _env_file=None)
+                            owner_id=42, run_bot_worker=True, _env_file=None)
 
         async def close_mongo():
             print('SYNTHETIC mongo closed', flush=True)
@@ -289,6 +289,13 @@ def test_combined_server_sigterm_stops_native_worker_before_shared_mongo(tmp_pat
         async def forever(*_args, **_kwargs):
             await asyncio.Event().wait()
 
+        async def notify_owner(*_args, **_kwargs):
+            print('SYNTHETIC owner task started', flush=True)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                print('SYNTHETIC owner task stopped', flush=True)
+
         factory = MagicMock(return_value=Bot())
         app = api.create_app(settings=settings, telegram_bot=object())
         patches = [
@@ -303,6 +310,7 @@ def test_combined_server_sigterm_stops_native_worker_before_shared_mongo(tmp_pat
             (worker, 'start_verified_client', AsyncMock()),
             (worker, 'register_command_menus', AsyncMock()),
             (worker, 'monitor_connection', forever),
+            (worker, 'notify_owner_startup', notify_owner),
         ]
         with ExitStack() as stack:
             for obj, name, replacement in patches:
@@ -350,7 +358,10 @@ def test_combined_server_sigterm_stops_native_worker_before_shared_mongo(tmp_pat
         output, _ = process.communicate(timeout=15)
         # Uvicorn can re-raise the received signal after graceful shutdown.
         assert process.returncode in (0, -signal.SIGTERM), output
+        assert "SYNTHETIC owner task started" in output
+        assert "SYNTHETIC owner task stopped" in output
         assert "SYNTHETIC bot stopped" in output and "SYNTHETIC mongo closed" in output
+        assert output.index("SYNTHETIC owner task stopped") < output.index("SYNTHETIC bot stopped")
         assert output.index("SYNTHETIC bot stopped") < output.index("SYNTHETIC mongo closed")
     finally:
         if process.poll() is None:
