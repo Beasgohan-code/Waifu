@@ -72,7 +72,7 @@ export default function Admin({ notify, refresh, onDraftChange, preview = false 
       setBaseline(snapshot); notify('Character saved to the catalogue.'); refresh(); setReview(false);
     } catch (err) {
       // A network/server error can occur after a successful write. Do not auto-retry.
-      const message = err instanceof ApiError && err.status >= 400 && err.status < 500
+      const message = err instanceof ApiError && [400, 401, 403, 404, 409, 422, 429].includes(err.status)
         ? err.message : 'Save could not be confirmed. Check the catalogue before trying again.';
       setError(message); notify(message, true);
     } finally { pending.current = false; setBusy(false); }

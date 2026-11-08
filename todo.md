@@ -25,7 +25,7 @@ This is the current source of truth for remaining work. The project is a prototy
 - [x] Retain README, this tracker, and license notices; remove superseded `docs/*.md` guides after transferring operational and legal safeguards to README.
 - [x] Add private snapshot-based collector insights shared by Telegram and the Mini App: active completion, copies, duplicates, favorites, rarity distribution, current-ownership goals and a best recorded daily streak. Missing/retired characters are not deleted; goals can change when ownership changes. These are not permanent rewards or public profiles. Production MongoDB and Telegram verification is pending.
 - [x] Add an operator-run encrypted snapshot/verify/insert-only isolated restore tool with explicit confirmations; credentials and MTProto sessions are excluded by design, but free text and personal data remain sensitive. A synthetic export/restore passed isolated MongoDB CI; no production data export or restore occurred.
-- [x] Local validation: 943 Python tests passed, 49 Mongo integration tests skipped locally, and 92 frontend tests passed; Ruff, mypy, TypeScript, build and dependency audits passed. One existing Starlette/httpx deprecation warning remains. The isolated CI and local read-only preview do not establish live Telegram or production readiness.
+- [x] Local validation: 943 Python tests passed, 49 Mongo integration tests skipped locally, and 93 frontend tests passed; Ruff, mypy, TypeScript, build and dependency audits passed. One existing Starlette/httpx deprecation warning remains. The isolated CI and local read-only preview do not establish live Telegram or production readiness.
 
 ## Roadmap (incremental, no production cutover implied)
 

@@ -95,8 +95,8 @@ describe('catalogue review', () => {
     expect(put).not.toHaveBeenCalled();
   });
 
-  it('does not retry an unconfirmed write automatically', async () => {
-    const put = vi.spyOn(api, 'put').mockRejectedValue(new Error('timeout'));
+  it.each([new Error('timeout'), new ApiError(408, 'Gateway timed out')])('does not retry an unconfirmed write automatically', async failure => {
+    const put = vi.spyOn(api, 'put').mockRejectedValue(failure);
     const notify = vi.fn();
     render(<Admin notify={notify} refresh={vi.fn()} />);
     const user = await fillDraft();
