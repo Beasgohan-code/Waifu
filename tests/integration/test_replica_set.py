@@ -1542,3 +1542,54 @@ async def test_group_summon_insights_are_scoped_and_classify_recorded_states(iso
     await db.spawns.insert_one({"_id": "malformed", **base, "status": "active"})
     with pytest.raises(GroupInsightsDataError):
         await repo.group_summon_insights(-100, 101, now)
+
+
+async def test_reviewed_catalog_video_metadata_preserves_or_clears_file_reference(
+    isolated_database,
+):
+    from summon.models import CharacterInput
+    from summon.repositories.catalog import CatalogRepository
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    secret = "synthetic-review-secret-" + "x" * 40
+    video_url = "https://files.catbox.moe/synthetic.mp4"
+    original = CharacterInput(
+        id="review-video",
+        name="Motion",
+        category="Synthetic",
+        rarity="amv-edition",
+        image_url=video_url,
+        media_type="video",
+        telegram_file_id="synthetic-telegram-file-id",
+    )
+    await repo.upsert_character(original, actor_id=101)
+    await db.inventory.insert_one({"user_id": 102, "character_id": original.id, "quantity": 2})
+    state = await repo.edit_state(original.id, secret=secret)
+    assert state["character"]["media_type"] == "video"
+    assert "telegram_file_id" not in state["character"]
+    metadata = CharacterInput(
+        id=original.id,
+        name="Motion revised",
+        category="Synthetic",
+        rarity="amv-edition",
+        image_url=video_url,
+    )
+    await repo.upsert_character(
+        metadata, actor_id=101, expected_revision=state["revision"], revision_secret=secret
+    )
+    stored = await db.characters.find_one({"_id": original.id})
+    assert (
+        stored["media_type"] == "video"
+        and stored["telegram_file_id"] == "synthetic-telegram-file-id"
+    )
+    state = await repo.edit_state(original.id, secret=secret)
+    replacement = metadata.model_copy(update={"image_url": "https://i.ibb.co/example/new.jpg"})
+    await repo.upsert_character(
+        replacement, actor_id=101, expected_revision=state["revision"], revision_secret=secret
+    )
+    stored = await db.characters.find_one({"_id": original.id})
+    assert stored["media_type"] == "photo" and stored["telegram_file_id"] is None
+    assert (await db.inventory.find_one({"user_id": 102, "character_id": original.id}))[
+        "quantity"
+    ] == 2
