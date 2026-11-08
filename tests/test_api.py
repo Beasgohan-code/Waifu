@@ -317,3 +317,95 @@ def test_collection_insights_fail_closed_when_limited_or_database_is_unavailable
     result = client.get("/api/me/collection-insights")
     assert result.status_code == 503
     assert "FAKE_PRIVATE_DB_DETAIL" not in result.text
+
+
+def test_reviewed_catalog_endpoints_require_operator_and_pass_revision_and_verified_actor():
+    from summon.repositories.catalog import CatalogStaleRevision
+
+    character = {
+        "id": "aiko",
+        "name": "Aiko",
+        "category": "Sky",
+        "rarity": "rare",
+        "image_url": "/art/aiko.webp",
+    }
+    revision = "a" * 64
+    catalog = SimpleNamespace(
+        edit_state=AsyncMock(return_value={"revision": revision, "character": character}),
+        upsert_character=AsyncMock(return_value=character),
+    )
+    store = SimpleNamespace(
+        catalog=catalog,
+        users=SimpleNamespace(touch=AsyncMock()),
+        sessions=fake_sessions(),
+        auth=SimpleNamespace(consume=AsyncMock(return_value=True)),
+        limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
+    )
+    settings = Settings(bot_token=TOKEN, session_secret=SECRET, operator_ids=[123], _env_file=None)
+    with TestClient(create_app(settings=settings, store=store)) as client:
+        path = "/api/admin/characters/aiko"
+        assert client.get(f"{path}/edit-state").status_code == 401
+        assert sign_in(client, 124).status_code == 200
+        assert client.get(f"{path}/edit-state").status_code == 403
+        catalog.edit_state.assert_not_awaited()
+        assert sign_in(client, 123).status_code == 200
+        response = client.get(f"{path}/edit-state")
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json()["data"]["revision"] == revision
+        catalog.edit_state.assert_awaited_once_with("aiko", secret=SECRET)
+        payload = {"character": character, "expected_revision": revision}
+        assert client.put(f"{path}/reviewed", json=payload).status_code == 403
+        assert (
+            client.put(
+                f"{path}/reviewed",
+                json={**payload, "expected_revision": "bad"},
+                headers={"X-Summon-Request": "1"},
+            ).status_code
+            == 422
+        )
+        response = client.put(f"{path}/reviewed", json=payload, headers={"X-Summon-Request": "1"})
+        assert response.status_code == 200
+        assert catalog.upsert_character.await_args.kwargs == {
+            "actor_id": 123,
+            "expected_revision": revision,
+            "revision_secret": SECRET,
+        }
+        catalog.upsert_character.side_effect = CatalogStaleRevision()
+        stale = client.put(f"{path}/reviewed", json=payload, headers={"X-Summon-Request": "1"})
+        assert stale.status_code == 409
+        assert "review" in stale.json()["error"]["message"].lower()
+        mismatch = client.put(
+            f"{path}/reviewed",
+            json={**payload, "character": {**character, "id": "other"}},
+            headers={"X-Summon-Request": "1"},
+        )
+        assert mismatch.status_code == 400
+
+
+def test_preview_operator_can_review_fictional_catalog_but_cannot_save():
+    settings = Settings(preview_mode=True, operator_ids=[1], _env_file=None)
+    with TestClient(create_app(settings=settings)) as client:
+        state = client.get("/api/admin/characters/aiko/edit-state")
+        assert state.status_code == 200
+        data = state.json()["data"]
+        assert data["character"]["name"] == "Aiko Tsukino"
+        assert "telegram_file_id" not in data["character"]
+        assert len(data["revision"]) == 64
+        absent = client.get("/api/admin/characters/fictional/edit-state")
+        assert absent.status_code == 200 and absent.json()["data"]["character"] is None
+        response = client.put(
+            "/api/admin/characters/aiko/reviewed",
+            json={
+                "character": {
+                    "id": "aiko",
+                    "name": "Sample",
+                    "category": "Sample",
+                    "rarity": "rare",
+                    "image_url": "/art/aiko.webp",
+                },
+                "expected_revision": data["revision"],
+            },
+            headers={"X-Summon-Request": "1"},
+        )
+        assert response.status_code == 403

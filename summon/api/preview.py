@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from summon.models import GroupSettings, InventorySort
+from summon.repositories.catalog import catalog_revision, public_character
 from summon.repositories.collection_insights import CollectionInsights, summarize_collection
 from summon.repositories.inventory_paging import CursorCodec, CursorState
 from summon.repositories.users import daily_status
@@ -61,6 +62,14 @@ _CHARACTERS: list[dict[str, Any]] = [
 
 
 class PreviewCatalog:
+    async def edit_state(self, character_id: str, *, secret: str) -> dict[str, Any]:
+        sample = next((item for item in _CHARACTERS if item["id"] == character_id), None)
+        doc = {**sample, "_id": character_id} if sample else None
+        return {
+            "revision": catalog_revision(character_id, doc, secret),
+            "character": public_character(doc) if doc else None,
+        }
+
     async def list(
         self,
         user_id: int,

@@ -297,3 +297,10 @@ img { display: block; max-width: 100%; }
   .studio-preview-art img { min-height: 175px; max-height: 280px; }
   .studio-preview-copy { padding: 17px; }
 }
+.studio-fieldset { min-width: 0; border: 0; padding: 0; margin: 0; }
+.studio-current { padding: 16px; margin: 0 0 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--chip); overflow-wrap: anywhere; }
+.studio-current h4 { margin: 0 0 10px; font-size: 13px; }
+.studio-current dl { margin: 0; display: grid; gap: 7px; }
+.studio-current dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; font-size: 12px; }
+.studio-current dt { color: var(--muted); }
+.studio-current dd { margin: 0; }

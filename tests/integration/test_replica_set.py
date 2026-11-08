@@ -1387,3 +1387,84 @@ async def test_first_encounter_remains_after_historical_inventory_reaches_zero(i
     first = next(item for item in progress["achievements"] if item["id"] == "first-summon")
     assert first["completed"] is True
     assert await db.inventory.count_documents({"user_id": 703, "quantity": {"$gt": 0}}) == 0
+
+
+async def test_reviewed_catalog_writes_detect_concurrent_edits_and_preserve_ownership(
+    isolated_database,
+):
+    from summon.models import CharacterChanges, CharacterInput
+    from summon.repositories.catalog import CatalogRepository, CatalogStaleRevision
+
+    client, db = isolated_database
+    repository = CatalogRepository(db, client=client)
+    secret = "test-catalog-revision-secret-" + "x" * 32
+    await db.inventory.insert_one({"user_id": 101, "character_id": "aiko", "quantity": 3})
+    initial = await repository.edit_state("aiko", secret=secret)
+    first = CharacterInput(
+        id="aiko", name="Reviewed one", category="Sky", rarity="rare", image_url="/art/aiko.webp"
+    )
+    second = CharacterInput(
+        id="aiko", name="Reviewed two", category="Sky", rarity="rare", image_url="/art/aiko.webp"
+    )
+    outcomes = await asyncio.gather(
+        repository.upsert_character(
+            first, actor_id=10, expected_revision=initial["revision"], revision_secret=secret
+        ),
+        repository.upsert_character(
+            second, actor_id=11, expected_revision=initial["revision"], revision_secret=secret
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in outcomes) == 1
+    assert sum(isinstance(result, CatalogStaleRevision) for result in outcomes) == 1
+    stored = await db.characters.find_one({"_id": "aiko"})
+    assert stored["name"] in {"Reviewed one", "Reviewed two"}
+    assert (await db.inventory.find_one({"user_id": 101, "character_id": "aiko"}))["quantity"] == 3
+    assert (
+        await db.activity.count_documents({"kind": "character_saved", "character_id": "aiko"}) == 1
+    )
+
+    # A Telegram-style partial edit after review also invalidates the reviewed save.
+    state = await repository.edit_state("aiko", secret=secret)
+    await repository.update_character(
+        "aiko", CharacterChanges(name="Telegram edit"), actor_id=12, event_id="review-test-telegram"
+    )
+    with pytest.raises(CatalogStaleRevision):
+        await repository.upsert_character(
+            first, actor_id=10, expected_revision=state["revision"], revision_secret=secret
+        )
+    assert (await db.characters.find_one({"_id": "aiko"}))["name"] == "Telegram edit"
+
+    # Two operators reviewing a previously missing ID cannot replace one another.
+    new_state = await repository.edit_state("review-new", secret=secret)
+    assert new_state["character"] is None
+    new_one = CharacterInput(
+        id="review-new",
+        name="Created one",
+        category="Sky",
+        rarity="rare",
+        image_url="/art/aiko.webp",
+    )
+    new_two = CharacterInput(
+        id="review-new",
+        name="Created two",
+        category="Sky",
+        rarity="rare",
+        image_url="/art/aiko.webp",
+    )
+    created = await asyncio.gather(
+        repository.upsert_character(
+            new_one, actor_id=10, expected_revision=new_state["revision"], revision_secret=secret
+        ),
+        repository.upsert_character(
+            new_two, actor_id=11, expected_revision=new_state["revision"], revision_secret=secret
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in created) == 1
+    assert sum(isinstance(result, CatalogStaleRevision) for result in created) == 1
+    assert await db.characters.count_documents({"_id": "review-new"}) == 1
+    assert (
+        await db.activity.count_documents({"kind": "character_saved", "character_id": "review-new"})
+        == 1
+    )

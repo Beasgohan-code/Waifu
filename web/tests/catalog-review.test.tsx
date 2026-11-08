@@ -6,7 +6,10 @@ import { api, ApiError } from '../src/api';
 import App from '../src/App';
 import Admin from '../src/pages/Admin';
 
-beforeEach(() => vi.restoreAllMocks());
+beforeEach(() => {
+  vi.restoreAllMocks();
+  vi.spyOn(api, 'get').mockResolvedValue({ revision: 'a'.repeat(64), character: null });
+});
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); window.history.replaceState(null, '', '/'); });
 
 async function fillDraft(image = 'https://images.example/aiko.jpg') {
@@ -27,7 +30,7 @@ describe('catalogue review', () => {
     const notify = vi.fn(); const refresh = vi.fn(); const onDraftChange = vi.fn();
     render(<Admin notify={notify} refresh={refresh} onDraftChange={onDraftChange} />);
     const user = await fillDraft();
-    expect(onDraftChange).toHaveBeenLastCalledWith(true);
+    expect(onDraftChange).toHaveBeenLastCalledWith({ blocked: false });
     await user.click(screen.getByRole('button', { name: /Review character/ }));
     expect(put).not.toHaveBeenCalled();
     expect(screen.getByRole('heading', { name: 'Check the details.' })).toBeInTheDocument();
@@ -40,13 +43,15 @@ describe('catalogue review', () => {
     await user.click(screen.getByRole('checkbox', { name: /I understand an existing ID/ }));
     await user.click(screen.getByRole('button', { name: /Confirm & save/ }));
     expect(put).toHaveBeenCalledOnce();
-    expect(put).toHaveBeenCalledWith('/admin/characters/aiko', {
-      id: 'aiko', name: 'Aiko Tsukino', category: 'Moonlit Chronicles', rarity: 'legendary',
-      image_url: 'https://images.example/aiko.jpg', description: 'A thoughtful collector.', active: true,
+    expect(api.get).toHaveBeenCalledWith('/admin/characters/aiko/edit-state');
+    expect(put).toHaveBeenCalledWith('/admin/characters/aiko/reviewed', {
+      character: { id: 'aiko', name: 'Aiko Tsukino', category: 'Moonlit Chronicles', rarity: 'legendary',
+        image_url: 'https://images.example/aiko.jpg', description: 'A thoughtful collector.', active: true },
+      expected_revision: 'a'.repeat(64),
     });
     expect(notify).toHaveBeenCalledWith('Character saved to the catalogue.');
     expect(refresh).toHaveBeenCalledOnce();
-    expect(onDraftChange).toHaveBeenLastCalledWith(false);
+    expect(onDraftChange).toHaveBeenLastCalledWith(null);
   });
 
   it('lets an operator revise the draft before publishing', async () => {
@@ -72,6 +77,54 @@ describe('catalogue review', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('public HTTPS');
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
     expect(put).not.toHaveBeenCalled();
+  });
+
+  it('displays the existing record before confirming and checks the exact internal ID', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      revision: 'b'.repeat(64),
+      character: { id: 'aiko', name: 'Previous name', category: 'Old series', rarity: 'epic', image_url: '/art/old.webp', description: 'Current description', active: false },
+    });
+    const put = vi.spyOn(api, 'put').mockResolvedValue({});
+    render(<Admin notify={vi.fn()} refresh={vi.fn()} />);
+    const user = await fillDraft();
+    await user.click(screen.getByRole('button', { name: /Review character/ }));
+    expect(screen.getByText('Current record for this ID')).toBeInTheDocument();
+    expect(screen.getByText('Previous name')).toBeInTheDocument();
+    expect(screen.getByText('Old series')).toBeInTheDocument();
+    expect(screen.getByText('Epic (legacy)')).toBeInTheDocument();
+    expect(screen.getByText('Inactive')).toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: /I understand an existing ID/ }));
+    await user.click(screen.getByRole('button', { name: /Confirm & save/ }));
+    expect(put).toHaveBeenCalledWith('/admin/characters/aiko/reviewed', expect.objectContaining({ expected_revision: 'b'.repeat(64) }));
+  });
+
+  it('keeps the draft and never saves when the current record cannot be checked', async () => {
+    vi.mocked(api.get).mockRejectedValue(new Error('unavailable'));
+    const put = vi.spyOn(api, 'put').mockResolvedValue({});
+    render(<Admin notify={vi.fn()} refresh={vi.fn()} />);
+    const user = await fillDraft();
+    await user.click(screen.getByRole('button', { name: /Review character/ }));
+    expect(screen.getByRole('alert')).toHaveTextContent(/could not check/i);
+    expect(screen.getByLabelText('Name')).toHaveValue('Aiko Tsukino');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('requires a fresh review after a conflict without resubmitting automatically', async () => {
+    const get = vi.mocked(api.get);
+    const put = vi.spyOn(api, 'put').mockRejectedValue(new ApiError(409, 'Catalog entry changed'));
+    render(<Admin notify={vi.fn()} refresh={vi.fn()} />);
+    const user = await fillDraft();
+    await user.click(screen.getByRole('button', { name: /Review character/ }));
+    await user.click(screen.getByRole('checkbox', { name: /I understand an existing ID/ }));
+    await user.click(screen.getByRole('button', { name: /Confirm & save/ }));
+    expect(screen.getByRole('alert')).toHaveTextContent(/review again/i);
+    expect(screen.getByRole('button', { name: /Confirm & save/ })).toBeDisabled();
+    expect(put).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole('button', { name: /Edit details/ }));
+    await user.click(screen.getByRole('button', { name: /Review character/ }));
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('button', { name: /Confirm & save/ })).toBeDisabled();
+    expect(put).toHaveBeenCalledOnce();
   });
 
   it('shows a definite authorization rejection without claiming an ambiguous write', async () => {
@@ -104,6 +157,7 @@ describe('catalogue review', () => {
     await user.click(screen.getByRole('checkbox', { name: /I understand an existing ID/ }));
     await user.click(screen.getByRole('button', { name: /Confirm & save/ }));
     expect(screen.getByRole('alert')).toHaveTextContent('Check the catalogue before trying again');
+    expect(screen.getByRole('button', { name: /Confirm & save/ })).toBeDisabled();
     expect(put).toHaveBeenCalledOnce();
     expect(notify).toHaveBeenCalledWith(expect.stringMatching(/could not be confirmed/), true);
   });
@@ -136,4 +190,32 @@ it('guards a catalogue draft across app navigation and browser unload', async ()
   region = screen.getByRole('region', { name: 'Discard catalogue draft' });
   await user.click(within(region).getByRole('button', { name: 'Discard and continue' }));
   await waitFor(() => expect(screen.getByRole('heading', { name: 'Meet the characters.' })).toBeInTheDocument());
+});
+
+it('prevents discarding a catalogue draft while its save is still in flight', async () => {
+  const player = { id: 42, first_name: 'Mika', username: null, points: 0, xp: 0, level: 1, catch_count: 0, unique_characters: 0, catalog_size: 0, streak: 0, last_daily: null, is_operator: true };
+  vi.mocked(api.get).mockImplementation(async path => {
+    if (path === '/bootstrap') return { preview: false } as never;
+    if (path === '/me') return player as never;
+    if (path.endsWith('/edit-state')) return { revision: 'a'.repeat(64), character: null } as never;
+    return [] as never;
+  });
+  let release: ((value: unknown) => void) | undefined;
+  vi.spyOn(api, 'put').mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  vi.stubGlobal('scrollTo', vi.fn());
+  window.history.replaceState(null, '', '#admin');
+  render(<App />);
+  await screen.findByLabelText('Character ID');
+  const user = await fillDraft();
+  await user.click(screen.getByRole('button', { name: /Review character/ }));
+  await user.click(screen.getByRole('checkbox', { name: /I understand an existing ID/ }));
+  await user.click(screen.getByRole('button', { name: /Confirm & save/ }));
+  const discover = within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', { name: 'Discover' });
+  await user.click(discover);
+  const region = screen.getByRole('region', { name: 'Discard catalogue draft' });
+  expect(region).toHaveTextContent(/operation is in progress/i);
+  expect(within(region).getByRole('button', { name: 'Discard and continue' })).toBeDisabled();
+  release?.({});
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Discard catalogue draft' })).not.toBeInTheDocument());
+  expect(screen.getByLabelText('Name')).toHaveValue('Aiko Tsukino');
 });

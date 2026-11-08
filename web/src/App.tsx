@@ -45,9 +45,9 @@ export default function App() {
   const [dailyBusy, setDailyBusy] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState<'note' | 'auto-reply' | null>(null);
-  const [catalogDraft, setCatalogDraft] = useState(false);
+  const [catalogDraft, setCatalogDraft] = useState<{ blocked: boolean } | null>(null);
   const reportGroupDraft = useCallback((value: boolean, kind: 'note' | 'auto-reply' = 'note') => setNoteDraft(value ? kind : null), []);
-  const reportCatalogDraft = useCallback((value: boolean) => setCatalogDraft(value), []);
+  const reportCatalogDraft = useCallback((value: { blocked: boolean } | null) => setCatalogDraft(value), []);
   const [pendingView, setPendingView] = useState<View | null>(null);
   const draftConfirmRef = useRef<HTMLDivElement>(null);
   const draftOpenerRef = useRef<HTMLElement | null>(null);
@@ -68,6 +68,9 @@ export default function App() {
   const notify = useCallback((message: string, isError = false) => setToast({ message, error: isError }), []);
   const openCollection = useCallback(() => navigate('collection'), [navigate]);
   useTelegramCollectionButton(Boolean(profile) && !loading && view === 'home' && !character && !moreOpen && !pendingView, collectionButtonEmoji, openCollection);
+  useEffect(() => {
+    if (view === 'admin' && pendingView && !catalogDraft) setPendingView(null);
+  }, [view, pendingView, catalogDraft]);
 
   useEffect(() => {
     let active = true;
@@ -121,6 +124,7 @@ export default function App() {
     : <div className="page-content"><EmptyState title="Not available" text="You don't have access to this area." /></div>;
   const draftType = view === 'admin' ? 'catalogue' : noteDraft === 'auto-reply' ? 'auto-reply' : 'note';
   const draftResource = view === 'admin' ? 'catalogue' : noteDraft === 'auto-reply' ? 'auto replies' : 'notes';
+  const draftBlocked = view === 'admin' && Boolean(catalogDraft?.blocked);
 
   return <div className="app-shell"><a className="skip-link" href="#main-content">Skip to main content</a><aside className="sidebar"><Brand /><div className="sidebar-divider" />
     <nav aria-label="Main navigation">{['YOUR SPACE', 'COMMUNITY', 'ACCOUNT'].map(group => <div className="nav-group" key={group}><span className="nav-label">{group}</span>{entries.filter(item => item.group === group).map(item => <button key={item.view} className={`nav-item ${view === item.view ? 'active' : ''}`} onClick={() => navigate(item.view)} aria-current={view === item.view ? 'page' : undefined}><item.icon size={18} strokeWidth={1.7} /><span>{item.label}</span>{view === item.view && <span className="nav-active-dot" />}</button>)}</div>)}</nav>
@@ -128,7 +132,7 @@ export default function App() {
   </aside>
   <main className="main-shell" id="main-content" tabIndex={-1}><header className="topbar"><div className="mobile-brand"><Brand compact /></div><div className="breadcrumbs"><span>YOUR SPACE</span><span>/</span><strong>{active.label}</strong></div><div className="topbar-actions"><button className="icon-button top-search" onClick={() => navigate('catalog')} aria-label="Search characters"><Search size={19} /></button><button className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button><span className="topbar-divider" /><button className="user-chip" onClick={() => navigate('profile')} aria-label="Open your profile"><span className="user-avatar">{profile.first_name.charAt(0).toUpperCase()}</span><span><strong>{profile.first_name}</strong><small>LEVEL {profile.level} COLLECTOR</small></span><ChevronDown size={14} /></button></div></header>
     {preview && <div className="preview-banner"><Sparkles size={14} /> Read-only preview <span>·</span> Sample characters and group data</div>}
-    {pendingView && <div ref={draftConfirmRef} tabIndex={-1} className="warning-confirm app-draft-warning" role="region" aria-label={`Discard ${draftType} draft`}><h4>Leave your {draftType} draft?</h4><p>Leaving will discard the draft. If a save is already in progress, it may still complete; review the {draftResource} before retrying.</p><div className="warning-confirm-actions"><button className="button button-subtle" type="button" onClick={() => { setPendingView(null); draftOpenerRef.current?.focus(); }}>Keep editing</button><button className="button button-primary" type="button" onClick={() => { const next = pendingView; setPendingView(null); setNoteDraft(null); setCatalogDraft(false); navigateNow(next); }}>Discard and continue</button></div></div>}
+    {pendingView && <div ref={draftConfirmRef} tabIndex={-1} className="warning-confirm app-draft-warning" role="region" aria-label={`Discard ${draftType} draft`}><h4>Leave your {draftType} draft?</h4><p>{draftBlocked ? 'A catalogue operation is in progress. Wait for it to finish before leaving.' : <>Leaving will discard the draft. If a save is already in progress, it may still complete; review the {draftResource} before retrying.</>}</p><div className="warning-confirm-actions"><button className="button button-subtle" type="button" onClick={() => { setPendingView(null); draftOpenerRef.current?.focus(); }}>Keep editing</button><button className="button button-primary" type="button" disabled={draftBlocked} onClick={() => { const next = pendingView; setPendingView(null); setNoteDraft(null); setCatalogDraft(null); navigateNow(next); }}>Discard and continue</button></div></div>}
     {page}<footer className="app-footer"><span>✦ &nbsp; A LITTLE UNIVERSE FOR COLLECTORS</span><span>SUMMON © {new Date().getFullYear()} &nbsp; · &nbsp; COLLECT. DISCOVER. SUMMON.</span></footer>
   </main>
   <nav className="mobile-nav" aria-label="Mobile navigation">{([['home', HomeIcon, 'Home'], ['collection', BookOpen, 'Collection'], ['catalog', Compass, 'Discover'], ['groups', Users, 'Groups']] as const).map(([name, IconComponent, label]) => <button key={name} className={view === name ? 'active' : ''} onClick={() => navigate(name)}><IconComponent size={19} /><span>{label}</span></button>)}<button className={moreOpen ? 'active' : ''} onClick={() => setMoreOpen(!moreOpen)} aria-expanded={moreOpen} aria-label="More navigation">{moreOpen ? <X size={19} /> : <Menu size={19} />}<span>More</span></button></nav>

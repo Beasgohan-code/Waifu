@@ -19,6 +19,7 @@ from summon.group_notes import (
     NOTE_REVISION_PATTERN,
     validate_note_content,
 )
+from summon.models import CharacterInput
 
 CharacterID = Annotated[str, Path(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")]
 
@@ -31,6 +32,12 @@ WarningGroupID = Annotated[int, Path(ge=-(2**53 - 1), lt=0)]
 WarningTargetID = Annotated[int, Path(gt=0, le=2**53 - 1)]
 
 NoteName = Annotated[str, Path(min_length=1, max_length=32, pattern=NOTE_NAME_PATTERN)]
+
+
+class CatalogReviewCommit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    character: CharacterInput
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class Toggle(BaseModel):

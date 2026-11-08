@@ -2,7 +2,20 @@ import { ArrowLeft, ArrowRight, Eye, Image, ShieldCheck } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { rarities, rarityLabel } from '../rarities';
-import type { Rarity } from '../types';
+import type { Character, Rarity } from '../types';
+
+type CatalogEntry = Pick<Character, 'id' | 'name' | 'category' | 'rarity' | 'image_url' | 'description' | 'active'>;
+type EditState = { revision: string; character: CatalogEntry | null };
+type DraftGuard = { blocked: boolean };
+
+function validEditState(value: EditState, id: string): boolean {
+  if (!value || !/^[0-9a-f]{64}$/.test(value.revision)) return false;
+  const entry = value.character;
+  return entry === null || Boolean(entry && entry.id === id && typeof entry.name === 'string'
+    && typeof entry.category === 'string' && typeof entry.rarity === 'string'
+    && typeof entry.image_url === 'string' && typeof entry.description === 'string'
+    && typeof entry.active === 'boolean');
+}
 
 // The server remains authoritative; this prevents loading clearly invalid schemes
 // or local application paths in a browser before the operator chooses to save.
@@ -26,20 +39,22 @@ function previewableArtwork(value: string): boolean {
 /** URL-based catalogue editing only; media hosting remains in the Telegram flow. */
 export default function Admin({ notify, refresh, onDraftChange, preview = false }: {
   notify: (message: string, error?: boolean) => void; refresh: () => void;
-  onDraftChange?: (dirty: boolean) => void; preview?: boolean;
+  onDraftChange?: (guard: DraftGuard | null) => void; preview?: boolean;
 }) {
   const [id, setId] = useState(''); const [name, setName] = useState(''); const [category, setCategory] = useState('');
   const [rarity, setRarity] = useState<Rarity>('common'); const [image, setImage] = useState(''); const [description, setDescription] = useState('');
   const [active, setActive] = useState(true); const [busy, setBusy] = useState(false);
   const [review, setReview] = useState(false); const [acknowledged, setAcknowledged] = useState(false);
+  const [editState, setEditState] = useState<EditState | null>(null); const [blockedSave, setBlockedSave] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [loadArtwork, setLoadArtwork] = useState(false); const [artworkError, setArtworkError] = useState(false);
   const [error, setError] = useState(''); const pending = useRef(false);
   const reviewHeading = useRef<HTMLHeadingElement>(null);
   const snapshot = JSON.stringify([id, name, category, rarity, image, description, active]);
   const [baseline, setBaseline] = useState(() => JSON.stringify(['', '', '', 'common', '', '', true]));
   const dirty = snapshot !== baseline;
-  useEffect(() => { onDraftChange?.(dirty || busy); }, [dirty, busy, onDraftChange]);
-  useEffect(() => () => { onDraftChange?.(false); }, [onDraftChange]);
+  useEffect(() => { onDraftChange?.(dirty || busy ? { blocked: busy } : null); }, [dirty, busy, onDraftChange]);
+  useEffect(() => () => { onDraftChange?.(null); }, [onDraftChange]);
   useEffect(() => {
     if (!dirty && !busy) return;
     function warn(event: BeforeUnloadEvent) { event.preventDefault(); event.returnValue = ''; }
@@ -48,8 +63,9 @@ export default function Admin({ notify, refresh, onDraftChange, preview = false 
   }, [dirty, busy]);
   useEffect(() => { if (review) reviewHeading.current?.focus(); }, [review]);
 
-  function reviewDraft(event: React.FormEvent) {
+  async function reviewDraft(event: React.FormEvent) {
     event.preventDefault();
+    if (pending.current) return;
     if (!name.trim() || !category.trim() || !image.trim()) {
       setError('Name, series and artwork URL cannot be blank.');
       return;
@@ -58,22 +74,33 @@ export default function Admin({ notify, refresh, onDraftChange, preview = false 
       setError('Use a public HTTPS artwork URL or a supported local artwork path.');
       return;
     }
-    setError(''); setAcknowledged(false); setLoadArtwork(false); setArtworkError(false); setReview(true);
+    pending.current = true; setBusy(true); setChecking(true); setError('');
+    try {
+      const state = await api.get<EditState>(`/admin/characters/${encodeURIComponent(id)}/edit-state`);
+      if (!validEditState(state, id)) throw new Error('Invalid review state');
+      setEditState(state); setAcknowledged(false); setBlockedSave(false);
+      setLoadArtwork(false); setArtworkError(false); setReview(true);
+    } catch {
+      setError('Could not check the current catalogue entry. Your draft has not been saved.');
+    } finally { pending.current = false; setBusy(false); setChecking(false); }
   }
 
   async function save() {
-    if (preview || !acknowledged || pending.current) return;
+    if (preview || !acknowledged || blockedSave || !editState || pending.current) return;
     pending.current = true; setBusy(true); setError('');
     try {
-      await api.put(`/admin/characters/${encodeURIComponent(id)}`, {
-        id, name: name.trim(), category: category.trim(), rarity, image_url: image.trim(),
-        description: description.trim(), active,
+      await api.put(`/admin/characters/${encodeURIComponent(id)}/reviewed`, {
+        character: { id, name: name.trim(), category: category.trim(), rarity, image_url: image.trim(), description: description.trim(), active },
+        expected_revision: editState.revision,
       });
       setBaseline(snapshot); notify('Character saved to the catalogue.'); refresh(); setReview(false);
     } catch (err) {
-      // A network/server error can occur after a successful write. Do not auto-retry.
-      const message = err instanceof ApiError && [400, 401, 403, 404, 409, 422, 429].includes(err.status)
-        ? err.message : 'Save could not be confirmed. Check the catalogue before trying again.';
+      // A timeout or server failure can occur after commit. Never automatically retry.
+      const definite = err instanceof ApiError && [400, 401, 403, 404, 409, 422, 429].includes(err.status);
+      const stale = err instanceof ApiError && err.status === 409;
+      const message = stale ? `${err.message}. Return to details and review again.`
+        : definite ? err.message : 'Save could not be confirmed. Check the catalogue before trying again.';
+      if (stale || !definite) setBlockedSave(true);
       setError(message); notify(message, true);
     } finally { pending.current = false; setBusy(false); }
   }
@@ -81,19 +108,20 @@ export default function Admin({ notify, refresh, onDraftChange, preview = false 
   return <div className="page-content"><div className="page-heading"><span className="eyebrow">CATALOGUE OPERATIONS</span><h1>Curate the universe.</h1><p>{preview ? 'Read-only sample editor; saving is disabled.' : 'Only server-authorized catalogue operators can make changes here.'}</p></div>
     <div className="studio-steps" aria-label="Catalogue editor steps"><span className={!review ? 'current' : ''}>01 · Details</span><span aria-hidden="true">—</span><span className={review ? 'current' : ''}>02 · Review &amp; save</span></div>
     {!review ? <form className="page-card group-panel" onSubmit={reviewDraft}><div className="panel-title"><div><span className="eyebrow">CHARACTER METADATA</span><h3>Add or update a character</h3><p>Enter an existing public photo URL. For videos and GIFs, use the bot's /upload flow.</p></div><ShieldCheck size={20} /></div>
-      <div className="form-grid group-form"><label>Character ID<input value={id} onChange={event => setId(event.target.value)} pattern="[a-z0-9][a-z0-9-]*" maxLength={64} required placeholder="e.g. aiko-tsukino" /></label><label>Name<input value={name} onChange={event => setName(event.target.value)} maxLength={120} required /></label><label>Series / category<input value={category} onChange={event => setCategory(event.target.value)} maxLength={120} required /></label><label>Rarity<select value={rarity} onChange={event => setRarity(event.target.value as Rarity)}>{rarities.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label><label className="wide-field">Artwork URL<input value={image} onChange={event => setImage(event.target.value)} maxLength={2048} required placeholder="https://… or /art/filename.webp" /></label><label className="wide-field">Description<textarea value={description} onChange={event => setDescription(event.target.value)} maxLength={1200} /></label></div>
+      <fieldset className="studio-fieldset" disabled={busy}><div className="form-grid group-form"><label>Character ID<input value={id} onChange={event => setId(event.target.value)} pattern="[a-z0-9][a-z0-9-]*" maxLength={64} required placeholder="e.g. aiko-tsukino" /></label><label>Name<input value={name} onChange={event => setName(event.target.value)} maxLength={120} required /></label><label>Series / category<input value={category} onChange={event => setCategory(event.target.value)} maxLength={120} required /></label><label>Rarity<select value={rarity} onChange={event => setRarity(event.target.value as Rarity)}>{rarities.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label><label className="wide-field">Artwork URL<input value={image} onChange={event => setImage(event.target.value)} maxLength={2048} required placeholder="https://… or /art/filename.webp" /></label><label className="wide-field">Description<textarea value={description} onChange={event => setDescription(event.target.value)} maxLength={1200} /></label></div>
       <label className="check-line"><input type="checkbox" checked={active} onChange={event => setActive(event.target.checked)} /> Available in the catalogue and for spawning</label>
       {error && <p className="studio-error" role="alert">{error}</p>}
-      <button className="button button-primary" type="submit">Review character <ArrowRight size={15} /></button>
+      <button className="button button-primary" type="submit">{checking ? 'Checking catalogue…' : 'Review character'} <ArrowRight size={15} /></button></fieldset>
     </form> : <section className="page-card group-panel studio-review" aria-labelledby="studio-review-heading">
-      <div className="panel-title"><div><span className="eyebrow">REVIEW BEFORE SAVING</span><h3 id="studio-review-heading" ref={reviewHeading} tabIndex={-1}>Check the details.</h3><p>Nothing has been published yet. An existing ID will be updated without changing ownership; concurrent edits may be overwritten.</p></div><Eye size={20} /></div>
+      <div className="panel-title"><div><span className="eyebrow">REVIEW BEFORE SAVING</span><h3 id="studio-review-heading" ref={reviewHeading} tabIndex={-1}>Check the details.</h3><p>Nothing has been published yet. Saving will update this ID without changing ownership; changes to editable details since review will be rejected.</p></div><Eye size={20} /></div>
+      {editState?.character ? <div className="studio-current"><h4>Current record for this ID</h4><dl><div><dt>Name</dt><dd>{editState.character.name}</dd></div><div><dt>Series</dt><dd>{editState.character.category}</dd></div><div><dt>Rarity</dt><dd>{rarityLabel(editState.character.rarity)}</dd></div><div><dt>Availability</dt><dd>{editState.character.active ? 'Active' : 'Inactive'}</dd></div><div><dt>Artwork URL</dt><dd className="studio-url">{editState.character.image_url}</dd></div><div><dt>Description</dt><dd>{editState.character.description || '—'}</dd></div></dl></div> : <p className="studio-current">No record used this ID when checked.</p>}
       <div className="studio-preview"><div className="studio-preview-art">
         {loadArtwork && !artworkError ? <img src={image.trim()} alt={`Artwork preview for ${name.trim()}`} onError={() => setArtworkError(true)} /> : <div><Image size={26} aria-hidden="true" /><span>{artworkError ? 'Artwork could not be loaded.' : 'Artwork is not loaded yet.'}</span><button className="text-action" type="button" onClick={() => { setArtworkError(false); setLoadArtwork(true); }}>{artworkError ? 'Try loading artwork' : 'Load artwork preview'}</button></div>}
       </div><div className="studio-preview-copy"><span className="eyebrow">{rarityLabel(rarity)}</span><h2>{name.trim()}</h2><p>{category.trim()}</p><dl><div><dt>Catalog ID</dt><dd>{id}</dd></div><div><dt>Availability</dt><dd>{active ? 'Active' : 'Inactive'}</dd></div><div><dt>Artwork URL</dt><dd className="studio-url">{image.trim()}</dd></div></dl>{description.trim() && <p className="studio-description">{description.trim()}</p>}</div></div>
       <p className="muted-small">Loading a preview contacts the artwork host from your browser. Use a trusted public URL and publish only artwork you have permission to share. The server validates the URL when saving.</p>
-      <label className="check-line"><input type="checkbox" checked={acknowledged} onChange={event => setAcknowledged(event.target.checked)} disabled={busy} /> I understand an existing ID will be updated, concurrent edits may be lost, and the artwork is public.</label>
+      <label className="check-line"><input type="checkbox" checked={acknowledged} onChange={event => setAcknowledged(event.target.checked)} disabled={busy} /> I understand an existing ID will be updated and the artwork is public.</label>
       {error && <p className="studio-error" role="alert">{error}</p>}
-      <div className="studio-actions"><button className="button button-subtle" type="button" disabled={busy} onClick={() => { setReview(false); setError(''); }}><ArrowLeft size={15} /> Edit details</button><button className="button button-primary" type="button" disabled={preview || busy || !acknowledged} onClick={save}>{preview ? 'Preview only' : busy ? 'Saving…' : 'Confirm & save'} <ArrowRight size={15} /></button></div>
+      <div className="studio-actions"><button className="button button-subtle" type="button" disabled={busy} onClick={() => { setReview(false); setError(''); }}><ArrowLeft size={15} /> Edit details</button><button className="button button-primary" type="button" disabled={preview || busy || blockedSave || !acknowledged} onClick={save}>{preview ? 'Preview only' : busy ? 'Saving…' : 'Confirm & save'} <ArrowRight size={15} /></button></div>
     </section>}
   </div>;
 }

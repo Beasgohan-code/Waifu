@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
 import re
 import secrets
 from typing import Any, cast
@@ -44,6 +46,61 @@ class CatalogNotFound(Exception):
     """A requested catalog record does not exist."""
 
 
+class CatalogStaleRevision(CatalogConflict):
+    """A reviewed catalog record changed before it could be saved."""
+
+
+class CatalogRevisionUnavailable(Exception):
+    """A catalog record cannot be safely compared for a reviewed save."""
+
+
+# Include every field a catalog upsert can replace, including nonpublic media IDs.
+# Presence is signed separately from null so legacy records compare correctly.
+_REVISION_FIELDS = (
+    "name",
+    "name_key",
+    "category",
+    "rarity",
+    "image_url",
+    "description",
+    "active",
+    "media_type",
+    "telegram_file_id",
+)
+_REVISION_TEXT_LIMITS = {
+    "name": 120,
+    "name_key": 4096,
+    "category": 120,
+    "rarity": 64,
+    "image_url": 2048,
+    "description": 1200,
+    "media_type": 32,
+    "telegram_file_id": 2048,
+}
+
+
+def catalog_revision(character_id: str, doc: dict[str, Any] | None, secret: str) -> str:
+    """Authenticate the editable state without exposing internal media IDs."""
+    if len(secret) < 32:
+        raise CatalogRevisionUnavailable("Catalog revision key is unavailable")
+    state: list[Any] = [character_id, doc is not None]
+    if doc is not None:
+        for field, maximum in _REVISION_TEXT_LIMITS.items():
+            value = doc.get(field)
+            if value is not None and (not isinstance(value, str) or len(value) > maximum):
+                raise CatalogRevisionUnavailable("Catalog record requires operator repair")
+        if "active" in doc and not isinstance(doc["active"], bool):
+            raise CatalogRevisionUnavailable("Catalog record requires operator repair")
+        state.extend((field, field in doc, doc.get(field)) for field in _REVISION_FIELDS)
+    try:
+        encoded = json.dumps(state, ensure_ascii=True, sort_keys=True, allow_nan=False).encode()
+    except (TypeError, ValueError) as exc:
+        raise CatalogRevisionUnavailable("Catalog record requires operator repair") from exc
+    return hmac.new(
+        secret.encode(), b"summon-catalog-revision-v1\0" + encoded, hashlib.sha256
+    ).hexdigest()
+
+
 def _check_artwork(artwork: Artwork | None, image_url: str | None) -> None:
     if artwork is not None and (
         image_url != artwork.path
@@ -61,9 +118,31 @@ class CatalogRepository:
         self.spawn_weight_store = SpawnWeightsRepository(database, client=client)
         self.rng = secrets.SystemRandom()
 
-    async def upsert_character(self, data: CharacterInput, *, actor_id: int) -> dict[str, Any]:
+    async def edit_state(self, character_id: str, *, secret: str) -> dict[str, Any]:
+        """Read an exact internal ID, including inactive records, for an operator review."""
+        projection = {field: 1 for field in (*_REVISION_FIELDS, "number")}
+        doc = await self.db.characters.find_one({"_id": character_id}, projection)
+        revision = catalog_revision(character_id, doc, secret)
+        try:
+            character = public_character(doc) if doc else None
+        except (KeyError, TypeError) as exc:
+            raise CatalogRevisionUnavailable("Catalog record requires operator repair") from exc
+        return {"revision": revision, "character": character}
+
+    async def upsert_character(
+        self,
+        data: CharacterInput,
+        *,
+        actor_id: int,
+        expected_revision: str | None = None,
+        revision_secret: str | None = None,
+    ) -> dict[str, Any]:
         if self.client is None:
             raise RuntimeError("Catalog writes require a transaction client")
+        if (expected_revision is None) != (revision_secret is None):
+            raise CatalogRevisionUnavailable("A revision and key are both required")
+        if expected_revision is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+            raise CatalogRevisionUnavailable("Invalid catalog revision")
         values = data.model_dump(exclude={"id"})
         values["name_key"] = normalize_name(data.name)
         now, random_key, event_id = utcnow(), self.rng.random(), uuid4().hex
@@ -72,6 +151,10 @@ class CatalogRepository:
 
         async def save(session: Any) -> dict[str, Any]:
             existing = await self.db.characters.find_one({"_id": data.id}, session=session)
+            if expected_revision is not None and revision_secret is not None:
+                current = catalog_revision(data.id, existing, revision_secret)
+                if not hmac.compare_digest(expected_revision, current):
+                    raise CatalogStaleRevision("The catalog record changed after review")
             number = (
                 existing.get("number") if existing else await numbers.allocate(data.id, session)
             )
