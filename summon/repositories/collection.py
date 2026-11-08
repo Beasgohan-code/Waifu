@@ -13,6 +13,7 @@ from pymongo.errors import DuplicateKeyError
 from summon.auth import TelegramUser
 from summon.models import GroupSettings, normalize_name
 from summon.repositories.base import allow_after, transaction
+from summon.repositories.group_insights import GroupInsightsRepository, GroupSummonInsights
 
 
 class DailyCharacterAlreadyClaimed(Exception):
@@ -27,6 +28,11 @@ class CollectionRepository:
     def __init__(self, client: Any, database: Any) -> None:
         self.client = client
         self.db = database
+
+    async def group_summon_insights(
+        self, group_id: int, user_id: int, now: datetime
+    ) -> GroupSummonInsights:
+        return await GroupInsightsRepository(self.client, self.db).read(group_id, user_id, now)
 
     async def record_message(
         self, group_id: int, title: str, user_id: int, now: datetime

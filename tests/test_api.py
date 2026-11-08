@@ -409,3 +409,55 @@ def test_preview_operator_can_review_fictional_catalog_but_cannot_save():
             headers={"X-Summon-Request": "1"},
         )
         assert response.status_code == 403
+
+
+def test_group_summon_insights_require_current_admin_and_bind_actor():
+    from summon.repositories.group_insights import GroupInsightsDataError
+
+    report = {
+        "window_days": 30,
+        "attempts": 4,
+        "caught": 2,
+        "expired": 1,
+        "delivery_rejected": 0,
+        "awaiting_resolution": 1,
+        "my_catches": 1,
+    }
+    collection = SimpleNamespace(group_summon_insights=AsyncMock(return_value=report))
+    groups = SimpleNamespace(get=AsyncMock(return_value={"_id": -100}))
+    store = SimpleNamespace(
+        collection=collection,
+        groups=groups,
+        users=SimpleNamespace(touch=AsyncMock()),
+        sessions=fake_sessions(),
+        auth=SimpleNamespace(consume=AsyncMock(return_value=True)),
+        limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
+    )
+    bot = SimpleNamespace(get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")))
+    settings = Settings(bot_token=TOKEN, session_secret=SECRET, _env_file=None)
+    with TestClient(create_app(settings=settings, store=store, telegram_bot=bot)) as client:
+        path = "/api/groups/-100/summon-insights"
+        assert client.get(path).status_code == 401
+        assert sign_in(client).status_code == 200
+        assert client.get(path).status_code == 403
+        collection.group_summon_insights.assert_not_awaited()
+        bot.get_chat_member.return_value = SimpleNamespace(status="administrator")
+        response = client.get(path + "?user_id=999")
+        assert response.status_code == 200
+        assert response.json()["data"]["my_catches"] == 1
+        assert collection.group_summon_insights.await_args.args[:2] == (-100, 123)
+        assert client.get("/api/groups/1/summon-insights").status_code == 422
+        collection.group_summon_insights.side_effect = GroupInsightsDataError()
+        assert client.get(path).status_code == 503
+        groups.get.return_value = None
+        assert client.get(path).status_code == 404
+
+
+def test_preview_group_summon_insights_are_fictional_and_group_scoped():
+    with TestClient(create_app(settings=Settings(preview_mode=True, _env_file=None))) as client:
+        response = client.get("/api/groups/-100/summon-insights")
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["window_days"] == 30 and data["attempts"] == 8
+        assert "claimed_by" not in data and "user_id" not in data
+        assert client.get("/api/groups/-999/summon-insights").status_code == 404

@@ -24,6 +24,7 @@ from summon.api.schemas import (
 )
 from summon.auth import TelegramUser
 from summon.models import GroupSettingsUpdate
+from summon.repositories.group_insights import GroupInsightsDataError
 from summon.repositories.groups import public_group
 from summon.services.auto_replies import AutoReplyService
 from summon.services.group_notes import GroupNotesService
@@ -82,6 +83,30 @@ async def group_detail(
     if not result["permissions"]["can_restrict_members"]:
         activity = [item for item in activity if item.get("kind") != "moderation"]
     result["recent_activity"] = activity
+    return {"data": result}
+
+
+@router.get("/groups/{group_id}/summon-insights")
+async def group_summon_insights(
+    group_id: WarningGroupID,
+    request: Request,
+    user: TelegramUser = Depends(get_current_user),
+    store: Any = Depends(get_store),
+) -> dict[str, Any]:
+    if request.app.state.settings.preview_mode:
+        if not await store.groups.preview_get(group_id):
+            raise HTTPException(404, "Group not found")
+    else:
+        await limit_action(request, user, "group_summon_insights", limit=20)
+        await require_group_admin(get_bot(request), group_id, user.id)
+        if not await store.groups.get(group_id):
+            raise HTTPException(404, "Group not found; use /manage in the group first")
+        if not await store.limiter.allow(f"group:{group_id}:summon-insights", limit=30, seconds=60):
+            raise HTTPException(429, "Too many requests; please try again shortly")
+    try:
+        result = await store.collection.group_summon_insights(group_id, user.id, datetime.now(UTC))
+    except (GroupInsightsDataError, PyMongoError, TimeoutError):
+        raise HTTPException(503, "Summon insights are temporarily unavailable") from None
     return {"data": result}
 
 

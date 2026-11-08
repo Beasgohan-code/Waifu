@@ -126,7 +126,10 @@ def register_collector_commands(
                         "/profile · /balance · /daily · /hclaim · /streak · /achievements · /top",
                     ),
                     ("Trade & gift", "Reply with /trade your-id their-id or /gift your-id"),
-                    ("Group", "/manage · /spawns · /spawn · /checkspawn · /rules · /notes"),
+                    (
+                        "Group",
+                        "/manage · /spawns · /spawn · /checkspawn · /groupstats · /rules · /notes",
+                    ),
                     ("Moderation", "/warn · /warnings · /unwarn · /ban"),
                     ("Other actions", "Use Telegram to mute, unmute, unban or kick."),
                 )

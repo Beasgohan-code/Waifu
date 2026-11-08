@@ -1468,3 +1468,77 @@ async def test_reviewed_catalog_writes_detect_concurrent_edits_and_preserve_owne
         await db.activity.count_documents({"kind": "character_saved", "character_id": "review-new"})
         == 1
     )
+
+
+async def test_group_summon_insights_are_scoped_and_classify_recorded_states(isolated_database):
+    from summon.repositories.group_insights import GroupInsightsDataError
+
+    client, db = isolated_database
+    now = datetime.now(UTC)
+    base = {"group_id": -100, "created_at": now - timedelta(hours=1)}
+    await db.spawns.insert_many(
+        [
+            {"_id": "mine", **base, "status": "claimed", "claimed_by": 101},
+            {"_id": "theirs", **base, "status": "claimed", "claimed_by": 102},
+            {
+                "_id": "expired-active",
+                **base,
+                "status": "active",
+                "expires_at": now - timedelta(seconds=1),
+            },
+            {"_id": "expired", **base, "status": "expired"},
+            {
+                "_id": "awaiting",
+                **base,
+                "status": "active",
+                "expires_at": now + timedelta(minutes=1),
+            },
+            {"_id": "rejected", **base, "status": "delivery_failed"},
+            {
+                "_id": "old",
+                **base,
+                "created_at": now - timedelta(days=31),
+                "status": "claimed",
+                "claimed_by": 101,
+            },
+            {
+                "_id": "future",
+                **base,
+                "created_at": now + timedelta(days=1),
+                "status": "claimed",
+                "claimed_by": 101,
+            },
+            {
+                "_id": "other-group",
+                **base,
+                "group_id": -200,
+                "status": "claimed",
+                "claimed_by": 101,
+            },
+        ]
+    )
+    repo = CollectionRepository(client, db)
+    report = await repo.group_summon_insights(-100, 101, now)
+    assert {
+        key: report[key]
+        for key in (
+            "attempts",
+            "caught",
+            "expired",
+            "delivery_rejected",
+            "awaiting_resolution",
+            "my_catches",
+        )
+    } == {
+        "attempts": 6,
+        "caught": 2,
+        "expired": 2,
+        "delivery_rejected": 1,
+        "awaiting_resolution": 1,
+        "my_catches": 1,
+    }
+    assert (await repo.group_summon_insights(-200, 101, now))["my_catches"] == 1
+    assert (await repo.group_summon_insights(-300, 101, now))["attempts"] == 0
+    await db.spawns.insert_one({"_id": "malformed", **base, "status": "active"})
+    with pytest.raises(GroupInsightsDataError):
+        await repo.group_summon_insights(-100, 101, now)

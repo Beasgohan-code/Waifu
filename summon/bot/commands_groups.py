@@ -15,6 +15,7 @@ from summon.bot.presentation import Card, Emoji
 from summon.bot.telegram_helpers import _duration, _group, _user, command_input
 from summon.group_notes import NoteConflict, NoteStorageError
 from summon.models import GroupSettings
+from summon.repositories.group_insights import GroupInsightsDataError
 from summon.services.group_notes import GroupNotesService
 from summon.services.moderation import ModerationService, PermissionDenied
 
@@ -173,6 +174,81 @@ def register_group_commands(
                     ("Messages remaining", str(max(0, config.spawn_every - count))),
                 ),
                 field_icons=(Emoji.SUMMON_BRAND, Emoji.STATS, Emoji.HOURGLASS),
+            ),
+            private=True,
+        )
+
+    @app.on_message(filters.incoming & filters.command(["groupstats"]))
+    async def group_stats(_client: Client, message: Message) -> None:
+        user = _user(message)
+        if not user:
+            return
+        if not _group(message):
+            await respond(
+                message,
+                Card(
+                    "Group summon insights",
+                    "Use /groupstats in a group to see its recent totals.",
+                    emoji=Emoji.STATS,
+                ),
+                private=True,
+            )
+            return
+        if command_input(message).args:
+            await respond(
+                message,
+                Card(
+                    "Group summon insights",
+                    "This command uses this group and your own catches only.",
+                    emoji=Emoji.STATS,
+                ),
+                private=True,
+            )
+            return
+        try:
+            if not await store.limiter.allow(
+                f"user:{user.id}:group-summon-insights", limit=10, seconds=60
+            ) or not await store.limiter.allow(
+                f"group:{message.chat.id}:summon-insights", limit=30, seconds=60
+            ):
+                await respond(
+                    message,
+                    Card("Please slow down", "Try again shortly.", emoji=Emoji.HOURGLASS),
+                    private=True,
+                )
+                return
+            result = await store.collection.group_summon_insights(
+                message.chat.id, user.id, datetime.now(UTC)
+            )
+        except (PyMongoError, GroupInsightsDataError, TimeoutError):
+            await respond(
+                message,
+                Card("Summon insights unavailable", "Try again later.", emoji=Emoji.WARNING),
+                private=True,
+            )
+            return
+        await respond(
+            message,
+            Card(
+                "Group summon insights",
+                "Last 30 days of recorded reservations. An attempt may not have been delivered.",
+                emoji=Emoji.STATS,
+                fields=(
+                    ("Attempts", str(result["attempts"])),
+                    ("Caught", str(result["caught"])),
+                    ("Expired", str(result["expired"])),
+                    ("Delivery rejected", str(result["delivery_rejected"])),
+                    ("Awaiting resolution", str(result["awaiting_resolution"])),
+                    ("Your catches here", str(result["my_catches"])),
+                ),
+                field_icons=(
+                    Emoji.SPARK,
+                    Emoji.CHECK,
+                    Emoji.HOURGLASS,
+                    Emoji.WARNING,
+                    Emoji.HOURGLASS,
+                    Emoji.OPEN_COLLECTION,
+                ),
             ),
             private=True,
         )

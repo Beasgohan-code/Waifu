@@ -39,6 +39,7 @@ COMMANDS = [
     _command("manage", "Connect a group you administer", Emoji.ADMIN_SHIELD),
     _command("spawn", "Try an eligible group summon", Emoji.SPARK),
     _command("checkspawn", "Check your group's summon status", Emoji.SEARCH),
+    _command("groupstats", "See your group's recent summon totals", Emoji.STATS),
     _command("rules", "Read group rules", Emoji.RULES),
     _command("notes", "List the group's public notes", Emoji.NOTE),
     _command("note", "Read a group note by name", Emoji.NOTE),

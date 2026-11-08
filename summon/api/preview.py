@@ -210,6 +210,22 @@ class PreviewCatalog:
         return next((item for item in _CHARACTERS if item["id"] == character_id), None)
 
 
+class PreviewCollection:
+    async def group_summon_insights(
+        self, group_id: int, user_id: int, now: datetime
+    ) -> dict[str, Any]:
+        return {
+            "window_days": 30,
+            "as_of": now,
+            "attempts": 8,
+            "caught": 5,
+            "expired": 1,
+            "delivery_rejected": 1,
+            "awaiting_resolution": 1,
+            "my_catches": 2,
+        }
+
+
 class PreviewUsers:
     async def profile(self, user_id: int) -> dict[str, Any]:
         return {
@@ -407,6 +423,7 @@ class PreviewGroups:
 class PreviewStore:
     def __init__(self) -> None:
         self.catalog = PreviewCatalog()
+        self.collection = PreviewCollection()
         self.users = PreviewUsers()
         self.trades = PreviewTrades()
         self.gifts = PreviewTrades()

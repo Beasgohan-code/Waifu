@@ -323,3 +323,83 @@ async def test_profile_privacy_fallback_contains_no_collection_details():
     card = public_send.await_args.args[2]
     assert card.title == "Open your private chat" and not card.fields
     assert "Start SUMMON privately" in card.body
+
+
+async def test_group_summon_insights_are_private_and_bound_to_group_and_sender():
+    store = make_store()
+    store.collection = SimpleNamespace(
+        group_summon_insights=AsyncMock(
+            return_value={
+                "attempts": 8,
+                "caught": 5,
+                "expired": 1,
+                "delivery_rejected": 1,
+                "awaiting_resolution": 1,
+                "my_catches": 2,
+            }
+        )
+    )
+    app = await native_app(store, Settings(_env_file=None, premium_emoji_enabled=False))
+    with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as send:
+        await find_handler(app, "group_stats")(make_message("supergroup"))
+    assert store.collection.group_summon_insights.await_args.args[:2] == (-100, 42)
+    card = send.await_args.args[3]
+    assert card.emoji is Emoji.STATS
+    assert dict(card.fields)["Your catches here"] == "2"
+    assert "may not have been delivered" in card.body
+    assert "999" not in card.telegram_html(premium=False)
+    store.collection.group_summon_insights.reset_mock()
+    with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock):
+        await find_handler(app, "group_stats")(
+            make_message("supergroup"), SimpleNamespace(args="999")
+        )
+    store.collection.group_summon_insights.assert_not_awaited()
+
+
+async def test_group_summon_insights_do_not_fall_back_to_public_private_content():
+    from wzgram.errors import BadRequest
+
+    store = make_store()
+    store.collection = SimpleNamespace(
+        group_summon_insights=AsyncMock(
+            return_value={
+                "attempts": 3,
+                "caught": 2,
+                "expired": 1,
+                "delivery_rejected": 0,
+                "awaiting_resolution": 0,
+                "my_catches": 2,
+            }
+        )
+    )
+    app = await native_app(store, Settings(_env_file=None))
+    with (
+        patch(
+            "summon.bot.handlers.send_ephemeral_card",
+            new_callable=AsyncMock,
+            side_effect=BadRequest("unavailable"),
+        ),
+        patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
+    ):
+        await find_handler(app, "group_stats")(make_message("supergroup"))
+    card = public.await_args.args[2]
+    assert card.title == "Open your private chat"
+    assert "Your catches here" not in card.telegram_html()
+
+
+async def test_group_summon_insights_rate_limit_and_sender_chat_fail_closed():
+    store = make_store()
+    store.collection = SimpleNamespace(group_summon_insights=AsyncMock())
+    store.limiter.allow = AsyncMock(return_value=False)
+    app = await native_app(store, Settings(_env_file=None))
+    with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as send:
+        await find_handler(app, "group_stats")(make_message("supergroup"))
+    assert send.await_args.args[3].title == "Please slow down"
+    store.collection.group_summon_insights.assert_not_awaited()
+    store.limiter.allow.reset_mock()
+    message = make_message("supergroup")
+    message.sender_chat = SimpleNamespace(id=-200)
+    with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as send:
+        await find_handler(app, "group_stats")(message)
+    send.assert_not_awaited()
+    store.limiter.allow.assert_not_awaited()

@@ -64,6 +64,10 @@ export interface GroupSettings {
   duplicate_enabled: boolean; duplicate_limit: number; mention_limit: number;
   blocked_keywords: string[]; warning_limit: number;
 }
+export interface GroupSummonInsights {
+  window_days: number; as_of: string; attempts: number; caught: number; expired: number;
+  delivery_rejected: number; awaiting_resolution: number; my_catches: number;
+}
 export interface Group {
   id: number; title: string; total_messages: number; settings: GroupSettings;
   permissions: { can_change_info: boolean; can_restrict_members: boolean };
