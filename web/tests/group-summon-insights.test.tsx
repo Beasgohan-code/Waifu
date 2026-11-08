@@ -25,6 +25,9 @@ it('loads aggregate group insights only on demand and shows only the viewer’s 
   expect(section).toHaveTextContent(/may not have been delivered/i);
   expect(section).toHaveTextContent(/no other member identities/i);
   expect(fetcher.mock.calls.some(([url]) => url === '/api/groups/-100/summon-insights')).toBe(true);
+  await user.click(within(section).getByRole('button', { name: 'Refresh insights' }));
+  await screen.findByText('Recorded attempts');
+  expect(fetcher.mock.calls.filter(([url]) => url.endsWith('/summon-insights'))).toHaveLength(2);
 });
 
 it('shows a recoverable error and retries the read without sending a mutation', async () => {

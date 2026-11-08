@@ -25,6 +25,7 @@ export default function GroupSummonInsights({ groupId, revision }: { groupId: nu
         <div className="page-card"><Activity size={18} /><span>Delivery rejected</span><strong>{data.delivery_rejected.toLocaleString()}</strong></div>
       </div>
       <p className="muted-small">As of <time dateTime={data.as_of}>{new Date(data.as_of).toUTCString()}</time>. Attempts are reservations and may not have been delivered; older or missing records are not included. No other member identities or rankings are shown.</p>
+      <button type="button" className="button button-subtle" onClick={() => setRetry(value => value + 1)}>Refresh insights</button>
     </>}
   </section>;
 }
