@@ -1092,3 +1092,89 @@ async def test_real_spawn_selection_uses_overrides_and_preserves_legacy_epic(iso
     await db.spawn_weights.update_one({"_id": "special-edition"}, {"$set": {"weight": 0}})
     assert await repo.choose() is None
     assert (await db.characters.find_one({"_id": "ren"}))["rarity"] == "epic"
+
+
+async def test_free_daily_character_is_once_per_actor_utc_day_and_preserves_daily_rewards(
+    isolated_database,
+):
+    from summon.repositories.collection import DailyCharacterAlreadyClaimed
+
+    client, db = isolated_database
+    now = datetime(2026, 4, 5, 12, tzinfo=UTC)
+    actor = TelegramUser(id=700, first_name="Collector")
+    users = UserRepository(client, db)
+    await users.touch(actor, now)
+    await db.users.update_one({"_id": actor.id}, {"$set": {"points": 120, "xp": 45}})
+    await users.daily(actor, now)
+    before = await db.users.find_one({"_id": actor.id})
+    await db.inventory.insert_one(
+        {"user_id": actor.id, "character_id": "aiko", "quantity": 2, "favorite": True}
+    )
+    repo = CollectionRepository(client, db)
+    results = await asyncio.gather(
+        *(repo.claim_daily_character(actor, "aiko", now) for _ in range(5)),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(isinstance(result, DailyCharacterAlreadyClaimed) for result in results) == 4
+    item = await db.inventory.find_one({"user_id": actor.id, "character_id": "aiko"})
+    assert item["quantity"] == 3 and item["favorite"] is True
+    after = await db.users.find_one({"_id": actor.id})
+    for field in ("points", "xp", "last_daily", "streak", "catch_count"):
+        assert after[field] == before[field]
+    assert await db.reward_history.count_documents({"kind": "daily_character", "user_id": 700}) == 1
+    assert await db.activity.count_documents({"kind": "daily_character", "user_id": 700}) == 1
+
+    # A different actor and the next UTC day have separate guarded claims.
+    other = TelegramUser(id=701, first_name="Other")
+    assert (await repo.claim_daily_character(other, "aiko", now))["id"] == "aiko"
+    assert (await repo.claim_daily_character(actor, "aiko", now + timedelta(days=1)))[
+        "id"
+    ] == "aiko"
+    assert (await db.inventory.find_one({"user_id": 700, "character_id": "aiko"}))["quantity"] == 4
+
+
+async def test_free_daily_character_ledger_and_ownership_rollback_together(isolated_database):
+    from types import SimpleNamespace
+
+    client, db = isolated_database
+    now = datetime(2026, 4, 5, 12, tzinfo=UTC)
+    actor = TelegramUser(id=700, first_name="Collector")
+
+    class FailingInventory:
+        async def update_one(self, *args, **kwargs):
+            await db.inventory.update_one(*args, **kwargs)
+            raise RuntimeError("injected inventory failure")
+
+    repo = CollectionRepository(
+        client,
+        SimpleNamespace(
+            characters=db.characters,
+            reward_history=db.reward_history,
+            users=db.users,
+            inventory=FailingInventory(),
+            activity=db.activity,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="injected inventory failure"):
+        await repo.claim_daily_character(actor, "aiko", now)
+    assert await db.users.find_one({"_id": actor.id}) is None
+    assert await db.inventory.find_one({"user_id": actor.id}) is None
+    assert await db.reward_history.find_one({"_id": "daily-character:700:2026-04-05"}) is None
+    assert await db.activity.find_one({"_id": "daily-character:700:2026-04-05"}) is None
+
+
+async def test_free_daily_character_rejects_deactivated_character_without_consuming_day(
+    isolated_database,
+):
+    from summon.repositories.collection import DailyCharacterUnavailable
+
+    client, db = isolated_database
+    now = datetime(2026, 4, 5, 12, tzinfo=UTC)
+    actor = TelegramUser(id=700, first_name="Collector")
+    await db.characters.update_one({"_id": "aiko"}, {"$set": {"active": False}})
+    repo = CollectionRepository(client, db)
+    with pytest.raises(DailyCharacterUnavailable):
+        await repo.claim_daily_character(actor, "aiko", now)
+    assert await db.reward_history.find_one({"_id": "daily-character:700:2026-04-05"}) is None
+    assert (await repo.claim_daily_character(actor, "mira", now))["id"] == "mira"

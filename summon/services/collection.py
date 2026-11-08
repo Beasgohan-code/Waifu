@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, cast
 
+from summon.auth import TelegramUser
 from summon.models import normalize_name
+from summon.repositories.collection import DailyCharacterUnavailable
 
 
 class GuessRateLimited(Exception):
@@ -36,6 +38,16 @@ class CollectionService:
         if not spawn:
             return None
         return {"spawn": spawn, "character": character}
+
+    async def claim_daily_character(self, user: TelegramUser, now: datetime) -> dict[str, Any]:
+        """Choose an active weighted character; the repository enforces the UTC-day claim."""
+        character = await self.catalog.choose()
+        if not character:
+            raise DailyCharacterUnavailable
+        return cast(
+            dict[str, Any],
+            await self.collection.claim_daily_character(user, character["_id"], now),
+        )
 
     async def guess(
         self, group_id: int, user: dict[str, Any], text: str, now: datetime

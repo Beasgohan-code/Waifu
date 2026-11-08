@@ -17,6 +17,7 @@ from summon.bot.telegram_helpers import _group, _user, callback_data, command_in
 from summon.config import Settings
 from summon.models import CollectionMode
 from summon.rarities import rarity_label
+from summon.repositories.collection import DailyCharacterAlreadyClaimed, DailyCharacterUnavailable
 from summon.repositories.rarity_weights import InvalidSpawnWeights
 from summon.repositories.users import DailyAlreadyClaimed, DailyStatusUnavailable, daily_status
 from summon.services.collection import CollectionService, GuessRateLimited
@@ -68,7 +69,10 @@ def register_collector_commands(
                 fields=(
                     ("Collect", "/summon name · /collection · /hmode · /search name · /check id"),
                     ("Favorites", "/favorites · /favorite id on|off · /fav id"),
-                    ("Progress", "/profile · /balance · /daily · /streak · /achievements · /top"),
+                    (
+                        "Progress",
+                        "/profile · /balance · /daily · /hclaim · /streak · /achievements · /top",
+                    ),
                     ("Trade & gift", "Reply with /trade your-id their-id or /gift your-id"),
                     ("Group", "/manage · /spawns · /spawn · /checkspawn · /rules · /notes"),
                     ("Moderation", "/warn · /warnings · /unwarn · /ban"),
@@ -397,7 +401,7 @@ def register_collector_commands(
             private=True,
         )
 
-    @app.on_message(filters.incoming & filters.command(["chancelist", "clist"]))
+    @app.on_message(filters.incoming & filters.command(["chancelist", "clist", "claimlist"]))
     async def rarity_weights(_client: Client, message: Message) -> None:
         user = _user(message)
         if not user or not await collector_rate_allowed(message, user.id, "rarity_weights"):
@@ -411,8 +415,9 @@ def register_collector_commands(
             message,
             Card(
                 "Summon rarity weights",
-                "Configured weights apply only to rarities with active characters; "
-                "the resulting odds change when a rarity has no active characters. "
+                "These weights apply to group summons and free /hclaim characters. "
+                "Only active, nonempty buckets participate, so the resulting odds change "
+                "when a rarity has no active characters. "
                 "Legacy Epic shares the Special Edition bucket.",
                 emoji=Emoji.RARITY_STAR,
                 fields=tuple((rarity_label(name), str(weight)) for name, weight in weights.items()),
@@ -637,6 +642,80 @@ def register_collector_commands(
                 f"{daily_message} The streak is recalculated on your next claim, using UTC.",
                 emoji=Emoji.SPARK,
                 fields=(("Last recorded streak", f"{data.get('streak', 0)} days"),),
+            ),
+            private=True,
+        )
+
+    @app.on_message(filters.incoming & filters.command(["hclaim", "claim"]))
+    async def daily_character(_client: Client, message: Message) -> None:
+        user = _user(message)
+        if not user:
+            return
+        if (command_input(message).args or "").strip():
+            await respond(
+                message,
+                Card("Free daily character", "Use /hclaim without arguments."),
+                private=True,
+            )
+            return
+        if not await collector_rate_allowed(message, user.id, "daily_character"):
+            return
+        try:
+            allowed = await store.limiter.allow("bot:daily-character", limit=100, seconds=60)
+        except (PyMongoError, OSError, TimeoutError):
+            await collector_read_error(message)
+            return
+        if not allowed:
+            await respond(message, Card("Please slow down", "Try again shortly."), private=True)
+            return
+        try:
+            character = await collection.claim_daily_character(user, datetime.now(UTC))
+        except DailyCharacterAlreadyClaimed:
+            await respond(
+                message,
+                Card(
+                    "Daily character already claimed",
+                    "You can claim another after 00:00 UTC.",
+                    emoji=Emoji.HOURGLASS,
+                ),
+                private=True,
+            )
+            return
+        except (DailyCharacterUnavailable, InvalidSpawnWeights):
+            await respond(
+                message,
+                Card(
+                    "No character is available",
+                    "There must be an active character in a nonzero rarity bucket. Try later.",
+                    emoji=Emoji.WARNING,
+                ),
+                private=True,
+            )
+            return
+        except (PyMongoError, OSError, TimeoutError):
+            await respond(
+                message,
+                Card(
+                    "Claim unconfirmed",
+                    "Check /collection before trying again; a claim may have succeeded.",
+                    emoji=Emoji.WARNING,
+                ),
+                private=True,
+            )
+            return
+        await respond(
+            message,
+            Card(
+                "Daily character claimed",
+                "Added to your collection for free. One character is available per UTC day.",
+                emoji=Emoji.GIFT_ACTION,
+                fields=(
+                    ("Name", character["name"]),
+                    ("ID", character["id"]),
+                    ("Series", character["category"]),
+                    ("Rarity", rarity_label(character["rarity"])),
+                ),
+                field_icons=(None, None, Emoji.SERIES_TAG, Emoji.RARITY_STAR),
             ),
             private=True,
         )

@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
 
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
+from summon.auth import TelegramUser
 from summon.models import GroupSettings, normalize_name
 from summon.repositories.base import allow_after, transaction
+
+
+class DailyCharacterAlreadyClaimed(Exception):
+    """A character has already been claimed for this actor's UTC day."""
+
+
+class DailyCharacterUnavailable(Exception):
+    """No active character can be awarded without changing ownership."""
 
 
 class CollectionRepository:
@@ -119,6 +129,76 @@ class CollectionRepository:
                     )
 
         await transaction(self.client, mark)
+
+    async def claim_daily_character(
+        self, user: TelegramUser, character_id: str, now: datetime
+    ) -> dict[str, Any]:
+        """Award one free character per actor and UTC day in a single transaction."""
+        if now.utcoffset() is None:
+            raise ValueError("A timezone-aware server timestamp is required")
+        now = now.astimezone(UTC)
+        if not isinstance(character_id, str) or not 1 <= len(character_id) <= 64:
+            raise ValueError("Invalid character ID")
+        event_id = f"daily-character:{user.id}:{now.date().isoformat()}"
+
+        async def claim(session: Any) -> dict[str, Any]:
+            character = await self.db.characters.find_one(
+                {"_id": character_id, "active": True}, session=session
+            )
+            if not character:
+                raise DailyCharacterUnavailable
+            try:
+                await self.db.reward_history.insert_one(
+                    {
+                        "_id": event_id,
+                        "user_id": user.id,
+                        "kind": "daily_character",
+                        "character_id": character_id,
+                        "created_at": now,
+                    },
+                    session=session,
+                )
+            except DuplicateKeyError:
+                # This specific unique ledger insert is the daily guard; a
+                # separate inventory conflict is not misreported as a claim.
+                raise DailyCharacterAlreadyClaimed from None
+            await self.db.users.update_one(
+                {"_id": user.id},
+                {
+                    "$set": {
+                        "first_name": user.first_name,
+                        "username": user.username,
+                        "last_seen": now,
+                    },
+                    "$setOnInsert": {"created_at": now, "points": 0, "xp": 0, "catch_count": 0},
+                },
+                upsert=True,
+                session=session,
+            )
+            await self.db.inventory.update_one(
+                {"user_id": user.id, "character_id": character_id},
+                {"$inc": {"quantity": 1}, "$setOnInsert": {"favorite": False, "acquired_at": now}},
+                upsert=True,
+                session=session,
+            )
+            await self.db.activity.insert_one(
+                {
+                    "_id": event_id,
+                    "user_id": user.id,
+                    "kind": "daily_character",
+                    "character_id": character_id,
+                    "created_at": now,
+                },
+                session=session,
+            )
+            return {
+                "id": character_id,
+                "name": character["name"],
+                "category": character["category"],
+                "rarity": character["rarity"],
+            }
+
+        return await transaction(self.client, claim)
 
     async def claim_spawn(
         self, group_id: int, user: dict[str, Any], answer: str, now: datetime

@@ -30,6 +30,7 @@ COMMANDS = [
     _command("profile", "View your collector profile", Emoji.STAR),
     _command("balance", "View your in-game points", Emoji.COIN),
     _command("daily", "Claim your daily reward", Emoji.GIFT_ACTION),
+    _command("hclaim", "Claim a free daily character", Emoji.OPEN_COLLECTION),
     _command("streak", "Check your daily streak", Emoji.HOURGLASS),
     _command("stats", "View aggregate community counts", Emoji.STATS),
     _command("trade", "Offer a character trade", Emoji.TRADE),

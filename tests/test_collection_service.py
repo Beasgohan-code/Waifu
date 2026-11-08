@@ -119,3 +119,118 @@ async def test_manual_try_spawn_does_not_count_activity_and_only_one_can_reserve
     results = await asyncio.gather(*(service.try_spawn(-100, now) for _ in range(5)))
     assert sum(result is not None for result in results) == 1
     assert repo.group["message_count"] == 0
+
+
+async def test_free_daily_character_selects_then_uses_authenticated_actor():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from summon.auth import TelegramUser
+
+    user = TelegramUser(id=7, first_name="Collector")
+    saved = {"id": "mika", "name": "Mika", "category": "Sky", "rarity": "rare"}
+    repo = SimpleNamespace(claim_daily_character=AsyncMock(return_value=saved))
+    now = datetime.now(UTC)
+    result = await CollectionService(repo, FakeCatalog()).claim_daily_character(user, now)
+    assert result == saved
+    repo.claim_daily_character.assert_awaited_once_with(user, "mika", now)
+
+
+async def test_free_daily_character_with_empty_catalog_never_writes():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from summon.auth import TelegramUser
+    from summon.repositories.collection import DailyCharacterUnavailable
+
+    repo = SimpleNamespace(claim_daily_character=AsyncMock())
+    catalog = SimpleNamespace(choose=AsyncMock(return_value=None))
+    with pytest.raises(DailyCharacterUnavailable):
+        await CollectionService(repo, catalog).claim_daily_character(
+            TelegramUser(id=7, first_name="Collector"), datetime.now(UTC)
+        )
+    repo.claim_daily_character.assert_not_awaited()
+
+
+def daily_character_database():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    return SimpleNamespace(
+        characters=SimpleNamespace(
+            find_one=AsyncMock(
+                return_value={"_id": "mika", "name": "Mika", "category": "Sky", "rarity": "rare"}
+            )
+        ),
+        users=SimpleNamespace(update_one=AsyncMock()),
+        inventory=SimpleNamespace(update_one=AsyncMock()),
+        reward_history=SimpleNamespace(insert_one=AsyncMock()),
+        activity=SimpleNamespace(insert_one=AsyncMock()),
+    )
+
+
+async def test_free_daily_character_uses_one_transaction_and_a_utc_ledger(monkeypatch):
+    from datetime import timezone
+
+    from summon.auth import TelegramUser
+    from summon.repositories.collection import CollectionRepository
+
+    async def fake_transaction(_client, callback):
+        return await callback("session")
+
+    monkeypatch.setattr("summon.repositories.collection.transaction", fake_transaction)
+    db = daily_character_database()
+    repo = CollectionRepository(object(), db)
+    user = TelegramUser(id=7, first_name="Collector")
+    local = datetime(2026, 1, 2, 0, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    result = await repo.claim_daily_character(user, "mika", local)
+    assert result == {"id": "mika", "name": "Mika", "category": "Sky", "rarity": "rare"}
+    ledger = db.reward_history.insert_one.await_args
+    assert ledger.args[0]["_id"] == "daily-character:7:2026-01-01"
+    assert ledger.kwargs["session"] == "session"
+    assert db.activity.insert_one.await_args.kwargs["session"] == "session"
+    assert db.inventory.update_one.await_args.kwargs["session"] == "session"
+    assert db.users.update_one.await_args.kwargs["session"] == "session"
+    assert db.inventory.update_one.await_args.args[1]["$inc"] == {"quantity": 1}
+    assert "$inc" not in db.users.update_one.await_args.args[1]
+
+
+async def test_free_daily_character_duplicate_ledger_aborts_before_inventory(monkeypatch):
+    from pymongo.errors import DuplicateKeyError
+
+    from summon.auth import TelegramUser
+    from summon.repositories.collection import CollectionRepository, DailyCharacterAlreadyClaimed
+
+    async def fake_transaction(_client, callback):
+        return await callback("session")
+
+    monkeypatch.setattr("summon.repositories.collection.transaction", fake_transaction)
+    db = daily_character_database()
+    db.reward_history.insert_one.side_effect = DuplicateKeyError("already claimed")
+    with pytest.raises(DailyCharacterAlreadyClaimed):
+        await CollectionRepository(object(), db).claim_daily_character(
+            TelegramUser(id=7, first_name="Collector"), "mika", datetime.now(UTC)
+        )
+    db.inventory.update_one.assert_not_awaited()
+    db.users.update_one.assert_not_awaited()
+    db.activity.insert_one.assert_not_awaited()
+
+
+async def test_unavailable_or_naive_daily_character_claim_never_touches_ledger(monkeypatch):
+    from summon.auth import TelegramUser
+    from summon.repositories.collection import CollectionRepository, DailyCharacterUnavailable
+
+    async def fake_transaction(_client, callback):
+        return await callback("session")
+
+    monkeypatch.setattr("summon.repositories.collection.transaction", fake_transaction)
+    db = daily_character_database()
+    repo = CollectionRepository(object(), db)
+    user = TelegramUser(id=7, first_name="Collector")
+    with pytest.raises(ValueError):
+        await repo.claim_daily_character(user, "mika", datetime(2026, 1, 1))
+    db.characters.find_one.return_value = None
+    with pytest.raises(DailyCharacterUnavailable):
+        await repo.claim_daily_character(user, "mika", datetime.now(UTC))
+    db.reward_history.insert_one.assert_not_awaited()
+    db.inventory.update_one.assert_not_awaited()

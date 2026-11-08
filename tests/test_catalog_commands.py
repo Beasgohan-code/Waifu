@@ -17,6 +17,7 @@ from wzgram.types import Chat, Message, Photo, User
 from summon.bot.commands_catalog import _event_id
 from summon.bot.handlers import register_handlers
 from summon.config import Settings
+from summon.rarities import RARITY_WEIGHTS
 from summon.services.artwork import MAX_ARTWORK_BYTES
 
 
@@ -29,8 +30,14 @@ def jpeg():
 async def setup(*, operators=(42,), **settings_overrides):
     store = SimpleNamespace(
         groups=SimpleNamespace(db=object(), get=AsyncMock(return_value=None)),
-        collection=object(),
+        collection=SimpleNamespace(
+            claim_daily_character=AsyncMock(
+                return_value={"id": "aiko", "name": "Aiko", "category": "Sky", "rarity": "rare"}
+            )
+        ),
         catalog=SimpleNamespace(
+            choose=AsyncMock(return_value={"_id": "aiko"}),
+            spawn_weights=AsyncMock(return_value=dict(RARITY_WEIGHTS)),
             create_character=AsyncMock(),
             update_character=AsyncMock(),
             catalog_event_exists=AsyncMock(return_value=False),
@@ -798,5 +805,109 @@ async def test_chance_accepts_bounded_zero_and_upper_limit(value):
             await dispatch(app, packet(f"/chance 3 {value}"))
         assert store.catalog.set_spawn_weight.await_args.args == ("special-edition", value)
         assert sent.await_args.args[2].title == "Summon weight saved"
+    finally:
+        await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize("command", ["hclaim", "claim"])
+async def test_free_daily_character_native_dispatch_binds_to_telegram_sender(command):
+    app, store = await setup()
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet(f"/{command}", user_id=7))
+        args = store.collection.claim_daily_character.await_args.args
+        assert args[0].id == 7 and args[1] == "aiko"
+        assert args[2].utcoffset().total_seconds() == 0
+        assert sent.await_args.args[2].title == "Daily character claimed"
+        assert "for free" in sent.await_args.args[2].body
+        assert store.limiter.allow.await_count == 2
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_free_daily_character_group_response_is_private():
+    app, store = await setup()
+    try:
+        with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private:
+            await dispatch(app, packet("/hclaim", group=True))
+        assert private.await_args.args[2] == 42
+        assert private.await_args.args[3].title == "Daily character claimed"
+        assert store.collection.claim_daily_character.await_args.args[0].id == 42
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_free_daily_character_invalid_arguments_never_choose_or_write():
+    app, store = await setup()
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet("/hclaim some-other-user"))
+        assert "without arguments" in sent.await_args.args[2].body
+        store.catalog.choose.assert_not_awaited()
+        store.collection.claim_daily_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_daily_character_failures_are_private_and_do_not_retry():
+    from summon.repositories.collection import (
+        DailyCharacterAlreadyClaimed,
+        DailyCharacterUnavailable,
+    )
+
+    for error, title in (
+        (DailyCharacterAlreadyClaimed(), "Daily character already claimed"),
+        (DailyCharacterUnavailable(), "No character is available"),
+        (AutoReconnect("PRIVATE_DATABASE_DETAIL"), "Claim unconfirmed"),
+    ):
+        app, store = await setup()
+        store.collection.claim_daily_character.side_effect = error
+        try:
+            with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+                await dispatch(app, packet("/hclaim"))
+            card = sent.await_args.args[2]
+            assert card.title == title and "PRIVATE_DATABASE_DETAIL" not in card.body
+            store.collection.claim_daily_character.assert_awaited_once()
+            if title == "Claim unconfirmed":
+                assert "/collection" in card.body
+        finally:
+            await app.dispatcher.stop()
+
+
+async def test_free_daily_character_global_limit_prevents_selection():
+    app, store = await setup()
+    store.limiter.allow.side_effect = [True, False]
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet("/hclaim"))
+        assert sent.await_args.args[2].title == "Please slow down"
+        store.catalog.choose.assert_not_awaited()
+        store.collection.claim_daily_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_free_daily_character_with_no_eligible_catalog_does_not_consume_claim():
+    app, store = await setup()
+    store.catalog.choose.return_value = None
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet("/hclaim"))
+        assert sent.await_args.args[2].title == "No character is available"
+        store.collection.claim_daily_character.assert_not_awaited()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_claimlist_uses_the_same_current_weights_as_daily_characters():
+    app, store = await setup()
+    store.catalog.spawn_weights.return_value = dict(RARITY_WEIGHTS) | {"rare": 0}
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet("/claimlist"))
+        card = sent.await_args.args[2]
+        assert card.title == "Summon rarity weights"
+        assert "free /hclaim" in card.body
+        assert ("Rare", "0") in card.fields
     finally:
         await app.dispatcher.stop()
