@@ -23,6 +23,7 @@ from wzgram.errors import RPCError
 
 from summon.api.context import Store
 from summon.api.dependencies import get_current_session, get_current_user, get_store
+from summon.api.session_cookies import clear_session_cookies, set_session_cookie
 from summon.api.static import PublicWebFiles
 from summon.auth import (
     AuthenticationError,
@@ -359,14 +360,11 @@ def create_app(
             user, launch_digest=fingerprint, session_id=session_id
         )
         await current_store.sessions.create(session_id, user.id, now, settings.session_max_age)
-        response.set_cookie(
-            "summon_session",
+        set_session_cookie(
+            response,
             signed_cookie,
-            httponly=True,
-            secure=settings.environment == "production",
-            samesite="strict",
             max_age=settings.session_max_age,
-            path="/api",
+            production=settings.environment == "production",
         )
         return {"data": {"first_name": user.first_name}}
 
@@ -377,13 +375,7 @@ def create_app(
         current_store: Any = Depends(get_store),
     ) -> dict[str, Any]:
         await current_store.sessions.revoke(session.session_id, session.user.id)
-        response.delete_cookie(
-            "summon_session",
-            path="/api",
-            httponly=True,
-            secure=settings.environment == "production",
-            samesite="strict",
-        )
+        clear_session_cookies(response, production=settings.environment == "production")
         return {"data": {"signed_out": True}}
 
     @app.get("/api/me")

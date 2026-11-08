@@ -272,11 +272,26 @@ def test_production_session_cookie_is_secure_and_requires_https():
     ) as client:
         response = sign_in(client)
         assert response.status_code == 200
-        cookie = response.headers["set-cookie"].lower()
-        assert "secure" in cookie and "httponly" in cookie and "samesite=strict" in cookie
+        cookies = response.headers.get_list("set-cookie")
+        assert len(cookies) == 2
+        cookie = next(value.lower() for value in cookies if value.startswith("summon_session_v2="))
+        assert "secure" in cookie and "httponly" in cookie and "samesite=none" in cookie
+        assert "partitioned" in cookie and "path=/api" in cookie
+        assert any(
+            value.startswith("summon_session=") and "Max-Age=0" in value for value in cookies
+        )
         assert client.get("/api/me").status_code == 200
         # This only checks client cookie behavior; real TLS/proxy setup is a release gate.
         assert client.get("http://miniapp.example/api/me").status_code == 401
+        logout = client.post("/api/auth/logout", headers={"X-Summon-Request": "1"})
+        cleared = logout.headers.get_list("set-cookie")
+        embedded = next(
+            value.lower() for value in cleared if value.startswith("summon_session_v2=")
+        )
+        assert "partitioned" in embedded and "max-age=0" in embedded and "secure" in embedded
+        assert any(
+            value.startswith("summon_session=") and "Max-Age=0" in value for value in cleared
+        )
 
 
 @pytest.mark.parametrize("premium", [True, False])

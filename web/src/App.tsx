@@ -46,6 +46,8 @@ export default function App() {
   const [moreOpen, setMoreOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState<'note' | 'auto-reply' | null>(null);
   const [catalogDraft, setCatalogDraft] = useState<{ blocked: boolean } | null>(null);
+  const groupMutationInFlight = useRef(false);
+  const reportGroupMutation = useCallback((value: boolean) => { groupMutationInFlight.current = value; }, []);
   const reportGroupDraft = useCallback((value: boolean, kind: 'note' | 'auto-reply' = 'note') => setNoteDraft(value ? kind : null), []);
   const reportCatalogDraft = useCallback((value: { blocked: boolean } | null) => setCatalogDraft(value), []);
   const [pendingView, setPendingView] = useState<View | null>(null);
@@ -56,6 +58,10 @@ export default function App() {
   const refresh = useCallback(() => setRevision(value => value + 1), []);
   const navigateNow = useCallback((next: View) => { setView(next); setMoreOpen(false); window.history.replaceState(null, '', `#${next}`); window.scrollTo({ top: 0, behavior: 'smooth' }); }, []);
   const navigate = useCallback((next: View) => {
+    if (view === 'groups' && next !== 'groups' && groupMutationInFlight.current) {
+      setToast({ message: 'Please wait for the group change to finish before leaving.', error: false });
+      return;
+    }
     if ((view === 'groups' && next !== 'groups' && noteDraft)
       || (view === 'admin' && next !== 'admin' && catalogDraft)) {
       draftOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -117,7 +123,7 @@ export default function App() {
     : view === 'trades' ? <Trading profile={profile} preview={preview} revision={revision} refresh={refresh} notify={notify} />
     : view === 'progress' ? <Progress preview={preview} revision={revision} daily={daily} dailyBusy={dailyBusy} />
     : view === 'leaderboard' ? <Leaderboard revision={revision} />
-    : view === 'groups' ? <Groups preview={preview} revision={revision} refresh={refresh} notify={notify} onNoteDraftChange={reportGroupDraft} />
+    : view === 'groups' ? <Groups preview={preview} revision={revision} refresh={refresh} notify={notify} onNoteDraftChange={reportGroupDraft} onMutationChange={reportGroupMutation} />
     : view === 'profile' ? <ProfilePage profile={profile} navigate={navigate} revision={revision} />
     : view === 'admin' && profile.is_operator ? <Admin notify={notify} refresh={refresh} onDraftChange={reportCatalogDraft} preview={preview} />
     : view === 'settings' ? <div className="page-content"><div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>Settings.</h1><p>A few little preferences for your SUMMON experience.</p></div><div className="page-card group-panel"><div className="panel-title"><div><span className="eyebrow">APPEARANCE</span><h3>Choose your theme</h3><p>Follow Telegram as it changes, or choose a theme for this device.</p></div></div><div className="segment theme-segment"><button className={preference === 'telegram' ? 'active' : ''} aria-pressed={preference === 'telegram'} onClick={() => chooseTheme('telegram')}>Follow Telegram</button><button className={preference === 'dark' ? 'active' : ''} aria-pressed={preference === 'dark'} onClick={() => chooseTheme('dark')}><Moon size={15} /> Dark</button><button className={preference === 'light' ? 'active' : ''} aria-pressed={preference === 'light'} onClick={() => chooseTheme('light')}><Sun size={15} /> Light</button></div></div><div className="page-card group-panel"><span className="eyebrow">YOUR SESSION</span><h3>Signed in with Telegram</h3><p className="muted-small">Your identity is verified on the server. Reopen the Mini App in Telegram when your session expires.</p><button className="button button-subtle" disabled={preview} onClick={logout}><LogOut size={15} /> Sign out</button></div></div>

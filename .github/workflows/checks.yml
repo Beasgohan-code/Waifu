@@ -73,9 +73,9 @@ jobs:
           export CHROMIUM_PATH
           SUMMON_PREVIEW_MODE=true OWNER_ID=1 .venv/bin/uvicorn summon.api.app:app --host 127.0.0.1 --port 8000 --no-access-log > "$RUNNER_TEMP/summon-api.log" 2>&1 &
           api_pid=$!
-          npm run dev --prefix web > "$RUNNER_TEMP/summon-vite.log" 2>&1 &
+          (cd web && exec ./node_modules/.bin/vite --host 127.0.0.1) > "$RUNNER_TEMP/summon-vite.log" 2>&1 &
           web_pid=$!
-          trap 'kill "$api_pid" "$web_pid" 2>/dev/null || true' EXIT
+          trap 'kill "$api_pid" "$web_pid" 2>/dev/null || true; wait "$api_pid" "$web_pid" 2>/dev/null || true' EXIT
           ready=false
           for _ in {1..60}; do
             if curl --fail --silent http://127.0.0.1:8000/health > /dev/null && curl --fail --silent http://127.0.0.1:5173/ > /dev/null; then ready=true; break; fi
@@ -104,6 +104,44 @@ jobs:
           run_smoke warnings npm run test:warning-browser
           run_smoke notes npm run test:notes-browser
           run_smoke auto-replies npm run test:auto-replies-browser
+      - name: Synthetic session and embedded-cookie browser tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROMIUM_PATH="$(command -v google-chrome || command -v chromium)"
+          export CHROMIUM_PATH
+          api_pid=''
+          web_pid=''
+          cleanup() {
+            for pid in "$api_pid" "$web_pid"; do
+              if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
+            done
+          }
+          trap cleanup EXIT
+          (cd web && exec ./node_modules/.bin/vite --host 127.0.0.1) > "$RUNNER_TEMP/summon-session-vite.log" 2>&1 &
+          web_pid=$!
+          start_fixture() {
+            local embedded="$1" ready=false
+            SUMMON_SESSION_TEST_FIXTURE=1 SUMMON_SESSION_TEST_EMBEDDED="$embedded" \
+              .venv/bin/python tests/browser_auth_fixture.py > "$RUNNER_TEMP/summon-session-api.log" 2>&1 &
+            api_pid=$!
+            for _ in {1..60}; do
+              if curl --fail --silent http://127.0.0.1:8000/health > /dev/null && curl --fail --silent http://127.0.0.1:5173/ > /dev/null; then ready=true; break; fi
+              if ! kill -0 "$api_pid" 2>/dev/null || ! kill -0 "$web_pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            if [[ "$ready" != true ]]; then
+              cat "$RUNNER_TEMP/summon-session-api.log" "$RUNNER_TEMP/summon-session-vite.log"
+              exit 1
+            fi
+          }
+          start_fixture 0
+          npm run test:session-browser --prefix web
+          kill "$api_pid"
+          wait "$api_pid" || true
+          api_pid=''
+          start_fixture 1
+          npm run test:embedded-browser --prefix web
 
   container:
     name: Container and same-origin preview

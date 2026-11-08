@@ -35,7 +35,7 @@ def binding(init_data: str) -> str:
     return hashlib.sha256(proof.encode("ascii")).hexdigest()
 
 
-def make_client() -> TestClient:
+def make_client(*, production: bool = False) -> TestClient:
     consumed: set[str] = set()
 
     async def consume(proof: str, *_args) -> bool:
@@ -74,8 +74,20 @@ def make_client() -> TestClient:
         auth=SimpleNamespace(consume=AsyncMock(side_effect=consume)),
         limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
     )
-    settings = Settings(bot_token=TOKEN, session_secret=SECRET, _env_file=None)
-    return TestClient(create_app(settings=settings, store=store))
+    production_values = (
+        {
+            "environment": "production",
+            "mongo_uri": "mongodb://example.invalid",
+            "webapp_url": "https://miniapp.example",
+            "telegram_api_id": 12345,
+            "telegram_api_hash": "synthetic-hash",
+        }
+        if production
+        else {}
+    )
+    settings = Settings(bot_token=TOKEN, session_secret=SECRET, _env_file=None, **production_values)
+    base_url = "https://miniapp.example" if production else "http://testserver"
+    return TestClient(create_app(settings=settings, store=store), base_url=base_url)
 
 
 def sign_in(client: TestClient, launch: str):
@@ -300,3 +312,33 @@ def test_session_creation_failure_does_not_issue_cookie_or_allow_replay():
         assert failure.status_code == 503
         assert "set-cookie" not in failure.headers
         assert sign_in(client, launch).status_code == 401
+
+
+def test_embedded_cookie_migration_is_bound_and_never_downgrades_to_legacy():
+    launch = telegram_launch(123)
+    headers = {"X-Summon-Launch": binding(launch)}
+    with make_client(production=True) as client:
+        assert sign_in(client, launch).status_code == 200
+        current = client.cookies.get("summon_session_v2")
+        assert current
+        client.cookies.clear()
+        # Existing signed and active legacy sessions remain usable until expiry.
+        client.cookies.set("summon_session", current, domain="miniapp.example", path="/api")
+        assert client.get("/api/me", headers=headers).json()["data"]["id"] == 123
+        # A present but invalid v2 cookie must not silently use the legacy one.
+        client.cookies.set("summon_session_v2", "invalid", domain="miniapp.example", path="/api")
+        assert client.get("/api/me", headers=headers).status_code == 401
+        client.cookies.set("summon_session_v2", current, domain="miniapp.example", path="/api")
+        assert client.get("/api/me", headers=headers).status_code == 200
+
+        # Cookie policy does not relax the CSRF origin and request-header checks.
+        logout_headers = {**headers, "X-Summon-Request": "1"}
+        denied = client.post(
+            "/api/auth/logout", headers={**logout_headers, "Origin": "https://attacker.example"}
+        )
+        assert denied.status_code == 403
+        assert client.post("/api/auth/logout", headers=headers).status_code == 403
+        assert client.post("/api/auth/logout", headers=logout_headers).status_code == 200
+        # A copied embedded cookie remains revoked after logout.
+        client.cookies.set("summon_session_v2", current, domain="miniapp.example", path="/api")
+        assert client.get("/api/me", headers=headers).status_code == 401

@@ -59,7 +59,15 @@ export function startSession(initData: string): Promise<Profile> {
       if (!(error instanceof ApiError) || error.status !== 401 || !initData) throw error;
     }
     await api.post('/auth/session', { init_data: initData });
-    return api.get<Profile>('/me');
+    try { return await api.get<Profile>('/me'); }
+    catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        // The one-time proof has already been consumed. Reloading it cannot fix
+        // a blocked or unavailable cookie and would only cause a replay error.
+        throw new ApiError(401, 'Sign-in could not be resumed. Cookies may be blocked; allow cookies or use another Telegram client, then reopen SUMMON.');
+      }
+      throw error;
+    }
   })();
   const promise = work.finally(() => { pendingSession = null; });
   pendingSession = { initData, promise };
