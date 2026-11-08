@@ -80,8 +80,26 @@ try {
   await page.getByRole('button', { name: 'View Aiko Tsukino' }).waitFor();
   assert.equal(await page.locator('.character-card').first().getByRole('button', { name: 'View Ren Aster' }).count(), 1);
 
+  await page.getByRole('button', { name: 'Catalogue admin' }).click();
+  await page.getByLabel('Character ID').fill('aiko');
+  await page.getByLabel('Name', { exact: true }).fill('Sample draft');
+  await page.getByLabel('Series / category').fill('Sample series');
+  await page.getByLabel('Artwork URL').fill('/art/aiko.webp');
+  await page.getByRole('button', { name: 'Review character' }).click();
+  await page.getByRole('heading', { name: 'Check the details.' }).waitFor();
+  await page.getByText('Current record for this ID').waitFor();
+  await page.getByRole('checkbox', { name: /I understand an existing ID/ }).check();
+  assert.ok(await page.getByRole('button', { name: 'Preview only' }).isDisabled());
   await page.getByRole('button', { name: 'Group manager' }).click();
+  await page.getByRole('region', { name: 'Discard catalogue draft' }).getByRole('button', { name: 'Discard and continue' }).click();
   await page.getByRole('heading', { name: "The Collector's Club" }).waitFor();
+  await page.getByRole('tab', { name: 'Summon insights' }).click();
+  const summonInsights = page.getByRole('region', { name: 'Summon insights' });
+  await summonInsights.getByText('Recorded attempts').waitFor();
+  assert.equal(await summonInsights.getByText('Your catches here').locator('..').getByText('2', { exact: true }).count(), 1);
+  assert.ok(await summonInsights.getByText(/may not have been delivered/).isVisible());
+  await summonInsights.getByRole('button', { name: 'Refresh insights' }).click();
+  await summonInsights.getByText('Recorded attempts').waitFor();
   await page.getByRole('tab', { name: 'Protection' }).click();
   assert.equal(await page.getByRole('button', { name: 'Save protection settings' }).isDisabled(), true);
   await page.getByRole('tab', { name: 'Welcome & rules' }).click();
@@ -135,6 +153,9 @@ try {
     await page.getByLabel('Sort collection').selectOption('copies');
     assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `collection filters fit ${width}px`);
     await mobileNav.getByRole('button', { name: 'Groups', exact: true }).click();
+    await page.getByRole('tab', { name: 'Summon insights' }).click();
+    await page.getByRole('region', { name: 'Summon insights' }).getByText('Recorded attempts').waitFor();
+    assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `summon insights fit ${width}px`);
     await page.getByRole('tab', { name: 'Welcome & rules' }).click();
     assert.ok(await page.getByLabel('Goodbye message').isDisabled());
     assert.ok(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth), `community settings fit ${width}px`);

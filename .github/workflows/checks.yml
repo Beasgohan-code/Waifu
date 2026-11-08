@@ -71,7 +71,7 @@ jobs:
           set -euo pipefail
           CHROMIUM_PATH="$(command -v google-chrome || command -v chromium)"
           export CHROMIUM_PATH
-          SUMMON_PREVIEW_MODE=true .venv/bin/uvicorn summon.api.app:app --host 127.0.0.1 --port 8000 --no-access-log > "$RUNNER_TEMP/summon-api.log" 2>&1 &
+          SUMMON_PREVIEW_MODE=true OWNER_ID=1 .venv/bin/uvicorn summon.api.app:app --host 127.0.0.1 --port 8000 --no-access-log > "$RUNNER_TEMP/summon-api.log" 2>&1 &
           api_pid=$!
           npm run dev --prefix web > "$RUNNER_TEMP/summon-vite.log" 2>&1 &
           web_pid=$!
