@@ -46,3 +46,14 @@ it('coalesces concurrent sign-ins so the one-time Telegram proof is not replayed
   expect(second.id).toBe(123);
   expect(fetcher.mock.calls.filter(call => call[0] === '/api/auth/session')).toHaveLength(1);
 });
+
+it('explains an unavailable cookie after sign-in without replaying the one-time launch', async () => {
+  vi.stubGlobal('crypto', webcrypto);
+  const fetcher = vi.fn()
+    .mockResolvedValueOnce(reply({ error: { message: 'Sign in required' } }, 401))
+    .mockResolvedValueOnce(reply({ data: { first_name: 'Mika' } }))
+    .mockResolvedValueOnce(reply({ error: { message: 'Sign in required' } }, 401));
+  vi.stubGlobal('fetch', fetcher);
+  await expect(startSession(`hash=${'b'.repeat(64)}`)).rejects.toThrow(/Cookies may be blocked.*reopen SUMMON/);
+  expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/me', '/api/auth/session', '/api/me']);
+});

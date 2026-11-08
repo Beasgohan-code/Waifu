@@ -1,4 +1,5 @@
-export type Rarity = 'common' | 'rare' | 'epic' | 'legendary';
+import type { Rarity } from './rarities';
+export type { Rarity } from './rarities';
 
 export interface Character {
   id: string;
@@ -6,6 +7,8 @@ export interface Character {
   category: string;
   rarity: Rarity;
   image_url: string;
+  media_type?: 'photo' | 'video' | 'animation';
+  number?: number;
   description: string;
   quantity: number;
   favorite: boolean;
@@ -25,12 +28,26 @@ export interface Profile {
   unique_characters: number;
   catalog_size: number;
   streak: number;
+  best_streak?: number;
   last_daily: string | null;
   is_operator: boolean;
 }
+export interface CollectionGoal { id: string; title: string; current: number; target: number; completed: boolean }
+export interface CollectionInsights {
+  unique_characters: number;
+  total_copies: number;
+  duplicate_copies: number;
+  favorite_characters: number;
+  active_owned: number;
+  catalog_size: number;
+  completion_percent: number | null;
+  rarity_breakdown: { rarity: Rarity | 'unknown'; unique: number; copies: number }[];
+  goals: CollectionGoal[];
+}
 export interface Achievement { id: string; title: string; description: string; current: number; target: number; completed: boolean }
 export interface DailyQuest { id: string; title: string; description: string; completed: boolean; reward: string }
-export interface Progression { achievements: Achievement[]; daily: DailyQuest[] }
+export interface DailyStatus { state: 'available' | 'claimed' | 'unavailable'; server_time: string; next_reset_at: string }
+export interface Progression { achievements: Achievement[]; daily: DailyQuest[]; daily_status?: DailyStatus }
 export interface Leader { name: string; catch_count: number; level: number }
 export interface Trade {
   id: string; sender_id: number; receiver_id: number; offer_id: string; request_id: string;
@@ -46,6 +63,10 @@ export interface GroupSettings {
   flood_enabled: boolean; flood_limit: number; flood_window_seconds: number;
   duplicate_enabled: boolean; duplicate_limit: number; mention_limit: number;
   blocked_keywords: string[]; warning_limit: number;
+}
+export interface GroupSummonInsights {
+  window_days: number; as_of: string; attempts: number; caught: number; expired: number;
+  delivery_rejected: number; awaiting_resolution: number; my_catches: number;
 }
 export interface Group {
   id: number; title: string; total_messages: number; settings: GroupSettings;

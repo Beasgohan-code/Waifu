@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
-from typing import Literal
+from typing import Any, Literal
 from unicodedata import category
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings.sources import EnvSettingsSource
 
 
 def _contains_unsafe_url_characters(value: str) -> bool:
@@ -53,10 +56,100 @@ def _browser_origin(parsed: SplitResult) -> str:
     return f"{parsed.scheme}://{host}{suffix}"
 
 
+# Within one source, existing SUMMON_* names win, then aliases in this order.
+# Process environment values take precedence over values from .env.
+_ENV_ALIASES: dict[str, tuple[str, ...]] = {
+    "environment": ("ENVIRONMENT",),
+    "bot_token": ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
+    "session_secret": ("SESSION_SECRET",),
+    "mongo_uri": ("MONGO_URL", "MONGO_URI", "MONGODB_URI", "MONGODB_URL", "MONGO_DB_URL"),
+    "mongo_database": ("MONGO_DB_NAME", "DB_NAME", "DATABASE_NAME"),
+    "webapp_url": ("WEBAPP_URL", "WEB_APP_URL"),
+    "telegram_api_id": ("API_ID", "TELEGRAM_API_ID"),
+    "telegram_api_hash": ("API_HASH", "TELEGRAM_API_HASH"),
+    "telegram_session_database": ("TELEGRAM_SESSION_DB",),
+    "artwork_backend": ("ARTWORK_BACKEND",),
+    "imgbb_key": ("IMGBB_KEY", "IMGBB_API_KEY"),
+    "catbox_userhash": ("CATBOX_USERHASH",),
+    "db_channel": ("DB_CHANNEL", "DB_CHANNEL_ID"),
+    "webhooks_disabled_confirmed": ("WEBHOOKS_DISABLED_CONFIRMED",),
+    "rich_enabled": ("RICH_ENABLED",),
+    "premium_emoji_enabled": ("PREMIUM_EMOJI_ENABLED",),
+    "operator_ids": ("OPERATOR_IDS", "OWNER_ID"),
+    "owner_id": ("OWNER_ID",),
+    "startup_dm_enabled": ("STARTUP_DM_ENABLED",),
+    "allowed_origins": ("ALLOWED_ORIGINS",),
+}
+
+
+class _AliasedEnvironment(PydanticBaseSettingsSource):
+    """Keep each source's precedence while normalizing aliases to field names."""
+
+    def __init__(self, source: EnvSettingsSource) -> None:
+        super().__init__(source.settings_cls)
+        self.source = source
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self.source.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = self.source()
+        for field, aliases in _ENV_ALIASES.items():
+            if field not in self.settings_cls.model_fields:
+                continue
+            # An explicitly empty prefixed value is still authoritative and will
+            # fail production validation rather than silently falling back.
+            if field in values:
+                continue
+            for alias in aliases:
+                key = alias if self.source.case_sensitive else alias.lower()
+                value = self.source.env_vars.get(key)
+                if value is not None:
+                    if field in {"operator_ids", "allowed_origins"}:
+                        text = value.strip()
+                        if not text:
+                            values[field] = []
+                        elif alias != "OWNER_ID" and text.startswith("["):
+                            try:
+                                values[field] = json.loads(text)
+                            except ValueError:
+                                raise ValueError(f"Invalid {alias} list") from None
+                        elif alias == "OWNER_ID":
+                            values[field] = [text]
+                        else:
+                            # Simple comma-separated lists are accepted in
+                            # addition to the existing SUMMON_* JSON lists.
+                            values[field] = [item.strip() for item in text.split(",")]
+                    else:
+                        values[field] = value
+                    break
+        return values
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SUMMON_", env_file=".env", extra="ignore", hide_input_in_errors=True
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        if not isinstance(env_settings, EnvSettingsSource) or not isinstance(
+            dotenv_settings, EnvSettingsSource
+        ):
+            raise RuntimeError("Unsupported environment source")
+        return (
+            init_settings,
+            _AliasedEnvironment(env_settings),
+            _AliasedEnvironment(dotenv_settings),
+            file_secret_settings,
+        )
 
     environment: Literal["development", "production"] = "development"
     bot_token: SecretStr = SecretStr("")
@@ -64,14 +157,27 @@ class Settings(BaseSettings):
     mongo_uri: SecretStr = SecretStr("")
     mongo_database: str = Field(default="summon", pattern=r"^[A-Za-z0-9_-]{1,63}$")
     webapp_url: str = ""
-    telegram_api_id: int | None = None
+    telegram_api_id: int | None = Field(default=None, gt=0, lt=2**31)
     telegram_api_hash: SecretStr = SecretStr("")
-    rich_enabled: bool = False
+    telegram_session_database: str = Field(
+        default="summon_telegram", pattern=r"^[A-Za-z0-9_-]{1,63}$"
+    )
+    artwork_backend: Literal["mongo", "imgbb"] = "mongo"
+    imgbb_key: SecretStr = SecretStr("")
+    catbox_userhash: SecretStr = SecretStr("")
+    db_channel: int | None = Field(default=None, lt=0, gt=-(2**63))
+    webhooks_disabled_confirmed: bool = False
+    rich_enabled: bool = True
     bot_api_rich_enabled: bool = True
     premium_emoji_enabled: bool = True
     allowed_origins: list[str] = []
     operator_ids: list[int] = []
+    # A single explicit owner is the only startup-notification recipient.
+    owner_id: int | None = None
+    startup_dm_enabled: bool = True
     preview_mode: bool = False
+    # Opt-in in ordinary Python installs; enabled by the Render Docker image.
+    run_bot_worker: bool = False
     session_max_age: int = Field(default=3600, ge=60, le=86400)
     init_data_max_age: int = Field(default=3600, ge=60, le=86400)
     mongo_max_pool_size: int = Field(default=50, ge=1, le=500)
@@ -81,10 +187,32 @@ class Settings(BaseSettings):
     poller_status_max_age_seconds: int = Field(default=120, ge=60, le=900)
     web_dist: str = ""
 
-    @field_validator("telegram_api_id", mode="before")
+    @field_validator("telegram_api_id", "db_channel", mode="before")
     @classmethod
-    def empty_api_id(cls, value: object) -> object:
+    def empty_optional_id(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("owner_id", mode="before")
+    @classmethod
+    def valid_notification_owner(cls, value: object) -> int | None:
+        # An optional notification must never prevent the API/bot from
+        # starting or send to an invalid, group, or unexpectedly coerced ID.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            owner_id = value
+        elif isinstance(value, str) and len(value) <= 32 and value.isascii() and value.isdecimal():
+            owner_id = int(value)
+        else:
+            return None
+        return owner_id if 0 < owner_id < 2**53 else None
+
+    @field_validator("operator_ids")
+    @classmethod
+    def valid_operator_ids(cls, value: list[int]) -> list[int]:
+        if any(not 0 < user_id < 2**53 for user_id in value):
+            raise ValueError("Operator IDs must be positive Telegram user IDs")
+        return list(dict.fromkeys(value))
 
     @field_validator("allowed_origins")
     @classmethod
@@ -149,6 +277,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security(self) -> Settings:
+        if self.artwork_backend == "imgbb" and not self.imgbb_key.get_secret_value().strip():
+            raise ValueError("IMGBB_KEY is required when ARTWORK_BACKEND is imgbb")
         if self.environment == "production":
             if self.preview_mode:
                 raise ValueError("Preview mode is not permitted in production")
@@ -169,10 +299,43 @@ class Settings(BaseSettings):
             raise ValueError(
                 "Polling health requires a bot token and a 32-character session secret"
             )
-        if self.rich_enabled and (
+        if self.telegram_session_database == self.mongo_database:
+            raise ValueError("Wzgram sessions require a separate MongoDB database")
+        if self.environment == "production" and (
             not self.telegram_api_id or not self.telegram_api_hash.get_secret_value()
         ):
-            raise ValueError(
-                "Outbound Wzgram requires SUMMON_TELEGRAM_API_ID and SUMMON_TELEGRAM_API_HASH"
-            )
+            raise ValueError("Wzgram requires SUMMON_TELEGRAM_API_ID and SUMMON_TELEGRAM_API_HASH")
+        return self
+
+
+class BackupConnectionSettings(BaseSettings):
+    """Only Mongo configuration is needed for the offline operator backup CLI."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SUMMON_", env_file=".env", extra="ignore", hide_input_in_errors=True
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return Settings.settings_customise_sources(
+            settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        )
+
+    mongo_uri: SecretStr = SecretStr("")
+    mongo_database: str = Field(default="summon", pattern=r"^[A-Za-z0-9_-]{1,63}$")
+    telegram_session_database: str = Field(
+        default="summon_telegram", pattern=r"^[A-Za-z0-9_-]{1,63}$"
+    )
+
+    @model_validator(mode="after")
+    def separate_session_database(self) -> BackupConnectionSettings:
+        if self.mongo_database == self.telegram_session_database:
+            raise ValueError("The Wzgram session database is excluded from backups")
         return self

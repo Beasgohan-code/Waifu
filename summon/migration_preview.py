@@ -23,6 +23,7 @@ from bson.json_util import object_hook
 from pydantic import ValidationError
 
 from summon.models import CharacterInput
+from summon.rarities import RARITY_VALUES
 
 MAX_CATALOG_DOCUMENTS = 200_000
 MAX_OWNER_DOCUMENTS = 1_000_000
@@ -34,7 +35,7 @@ MAX_JSONL_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MAPPING_BYTES = 32 * 1024 * 1024
 MAX_BSON_INT64 = (1 << 63) - 1
 _TARGET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
-_RARITIES = frozenset({"common", "rare", "epic", "legendary"})
+_RARITIES = frozenset(RARITY_VALUES)
 
 # Static keys prevent source field names, PII, or arbitrary error text from
 # leaking into the default report. Counts can overlap; none imply import safety.

@@ -71,11 +71,11 @@ jobs:
           set -euo pipefail
           CHROMIUM_PATH="$(command -v google-chrome || command -v chromium)"
           export CHROMIUM_PATH
-          SUMMON_PREVIEW_MODE=true .venv/bin/uvicorn summon.api.app:app --host 127.0.0.1 --port 8000 --no-access-log > "$RUNNER_TEMP/summon-api.log" 2>&1 &
+          SUMMON_PREVIEW_MODE=true OWNER_ID=1 .venv/bin/uvicorn summon.api.app:app --host 127.0.0.1 --port 8000 --no-access-log > "$RUNNER_TEMP/summon-api.log" 2>&1 &
           api_pid=$!
-          npm run dev --prefix web > "$RUNNER_TEMP/summon-vite.log" 2>&1 &
+          (cd web && exec ./node_modules/.bin/vite --host 127.0.0.1) > "$RUNNER_TEMP/summon-vite.log" 2>&1 &
           web_pid=$!
-          trap 'kill "$api_pid" "$web_pid" 2>/dev/null || true' EXIT
+          trap 'kill "$api_pid" "$web_pid" 2>/dev/null || true; wait "$api_pid" "$web_pid" 2>/dev/null || true' EXIT
           ready=false
           for _ in {1..60}; do
             if curl --fail --silent http://127.0.0.1:8000/health > /dev/null && curl --fail --silent http://127.0.0.1:5173/ > /dev/null; then ready=true; break; fi
@@ -104,6 +104,44 @@ jobs:
           run_smoke warnings npm run test:warning-browser
           run_smoke notes npm run test:notes-browser
           run_smoke auto-replies npm run test:auto-replies-browser
+      - name: Synthetic session and embedded-cookie browser tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROMIUM_PATH="$(command -v google-chrome || command -v chromium)"
+          export CHROMIUM_PATH
+          api_pid=''
+          web_pid=''
+          cleanup() {
+            for pid in "$api_pid" "$web_pid"; do
+              if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
+            done
+          }
+          trap cleanup EXIT
+          (cd web && exec ./node_modules/.bin/vite --host 127.0.0.1) > "$RUNNER_TEMP/summon-session-vite.log" 2>&1 &
+          web_pid=$!
+          start_fixture() {
+            local embedded="$1" ready=false
+            SUMMON_SESSION_TEST_FIXTURE=1 SUMMON_SESSION_TEST_EMBEDDED="$embedded" \
+              .venv/bin/python tests/browser_auth_fixture.py > "$RUNNER_TEMP/summon-session-api.log" 2>&1 &
+            api_pid=$!
+            for _ in {1..60}; do
+              if curl --fail --silent http://127.0.0.1:8000/health > /dev/null && curl --fail --silent http://127.0.0.1:5173/ > /dev/null; then ready=true; break; fi
+              if ! kill -0 "$api_pid" 2>/dev/null || ! kill -0 "$web_pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            if [[ "$ready" != true ]]; then
+              cat "$RUNNER_TEMP/summon-session-api.log" "$RUNNER_TEMP/summon-session-vite.log"
+              exit 1
+            fi
+          }
+          start_fixture 0
+          npm run test:session-browser --prefix web
+          kill "$api_pid"
+          wait "$api_pid" || true
+          api_pid=''
+          start_fixture 1
+          npm run test:embedded-browser --prefix web
 
   container:
     name: Container and same-origin preview
@@ -130,7 +168,7 @@ jobs:
           RUN test ! -e /context/.git && test ! -e /context/.env && test ! -e /context/web/.env.local \
               && test ! -e /context/summon/synthetic.session && test ! -e /context/private-export.txt \
               && test ! -e /context/migration-data && test -f /context/summon/bot/main.py \
-              && test -f /context/web/src/App.tsx && test -f /context/web/tests/setup.ts
+              && test ! -e /context/web
           DOCKERFILE
           docker build --file "$RUNNER_TEMP/context-check.Dockerfile" --tag summon-ci-context .
       - name: Build the pinned runtime image
@@ -152,13 +190,38 @@ jobs:
             docker logs --tail 30 summon-ci-web
             exit 1
           fi
-          docker exec summon-ci-web sh -c 'test "$(id -u)" -eq 10001 && test -r /app/web/dist/index.html && test ! -e /app/.env && test ! -d /app/web/node_modules'
+          docker exec summon-ci-web sh -c 'test "$(id -u)" -eq 10001 && test ! -e /app/.env && test ! -d /app/web/dist && test ! -d /app/web/node_modules'
           docker exec summon-ci-web python -c 'from summon.bot.main import main; assert callable(main)'
-          curl --fail --silent http://127.0.0.1:19090/ | grep -q '<div id="root">'
-          curl --fail --silent http://127.0.0.1:19090/art/aiko.webp > /dev/null
+          docker exec summon-ci-web python -c 'import ssl; c = ssl.create_default_context(); assert c.verify_mode == ssl.CERT_REQUIRED and c.check_hostname and c.get_ca_certs()'
+          curl --fail --silent http://127.0.0.1:19090/ | python -c 'import json,sys; assert json.load(sys.stdin)["bot_status"] == "disabled"'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19090/health/bot)" = 503
           curl --fail --silent http://127.0.0.1:19090/api/bootstrap | python -c 'import json,sys; assert json.load(sys.stdin)["data"]["preview"] is True'
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19090/api/not-a-route)" = 404
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST http://127.0.0.1:19090/api/auth/session)" = 403
+      - name: Bind the real HTTP port while the database is unavailable
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This is a closed port inside the test container, never a real database.
+          docker run --detach --name summon-ci-offline --publish 127.0.0.1:19091:10000 \
+            --env PORT=10000 --env 'MONGO_URL=mongodb://127.0.0.1:1/?directConnection=true' summon-ci
+          trap 'docker rm -f summon-ci-offline > /dev/null 2>&1 || true' EXIT
+          live=false
+          for _ in {1..20}; do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:19091/health > /dev/null; then live=true; break; fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' summon-ci-offline)" != true ]]; then break; fi
+            sleep 1
+          done
+          if [[ "$live" != true ]]; then docker logs --tail 30 summon-ci-offline; exit 1; fi
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/health/ready)" = 503
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/api/me)" = 503
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/health/bot)" = 503
+          curl --fail --silent --max-time 2 http://127.0.0.1:19091/ | python -c 'import json,sys; d=json.load(sys.stdin); assert d["bot_status"] == "waiting_for_database"'
+          curl --fail --silent --max-time 2 http://127.0.0.1:19091/api/bootstrap > /dev/null
+          # A failed selection/retry must not close the listening service.
+          sleep 7
+          curl --fail --silent --max-time 2 http://127.0.0.1:19091/health > /dev/null
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/health/ready)" = 503
 
   mongodb:
     name: Isolated MongoDB integration

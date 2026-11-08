@@ -2,18 +2,59 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import UTC, date, datetime, timedelta
+from typing import Any, cast
 
 from pymongo import DESCENDING
 
 from summon.auth import TelegramUser
-from summon.models import player_level
+from summon.models import CollectionMode, player_level
 from summon.repositories.base import transaction
+from summon.repositories.collection_insights import (
+    MAX_SAFE_INTEGER,
+    CollectionInsights,
+    CollectionInsightsRepository,
+)
 
 
 class DailyAlreadyClaimed(ValueError):
     pass
+
+
+class DailyStatusUnavailable(RuntimeError):
+    """The stored daily date is invalid or ahead of the current UTC day."""
+
+
+def _as_utc(now: datetime) -> datetime:
+    if now.utcoffset() is None:
+        raise ValueError("A timezone-aware server timestamp is required")
+    return now.astimezone(UTC)
+
+
+def _streak_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_SAFE_INTEGER:
+        raise DailyStatusUnavailable("Stored streak needs operator review")
+    return value
+
+
+def daily_status(last_daily: str | None, now: datetime) -> dict[str, str]:
+    """Evaluate daily eligibility using server UTC time, never a device clock."""
+    now = _as_utc(now)
+    today = now.date()
+    try:
+        last = date.fromisoformat(last_daily) if last_daily is not None else None
+        if last is not None and last.isoformat() != last_daily:
+            raise ValueError("Noncanonical daily date")
+        if last is None or last < today:
+            state = "available"
+        elif last == today:
+            state = "claimed"
+        else:
+            state = "unavailable"
+    except (TypeError, ValueError):
+        state = "unavailable"
+    reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return {"state": state, "server_time": now.isoformat(), "next_reset_at": reset.isoformat()}
 
 
 class UserRepository:
@@ -35,6 +76,21 @@ class UserRepository:
             upsert=True,
         )
 
+    async def collection_mode(self, user_id: int) -> CollectionMode:
+        row = await self.db.users.find_one({"_id": user_id}, {"collection_mode": 1})
+        value = row.get("collection_mode") if row else None
+        if isinstance(value, str) and value in {"recent", "copies", "favorites"}:
+            return cast(CollectionMode, value)
+        return "recent"
+
+    async def set_collection_mode(
+        self, user: TelegramUser, mode: CollectionMode, now: datetime
+    ) -> None:
+        if mode not in {"recent", "copies", "favorites"}:
+            raise ValueError("Unsupported collection mode")
+        await self.touch(user, now)
+        await self.db.users.update_one({"_id": user.id}, {"$set": {"collection_mode": mode}})
+
     async def profile(self, user_id: int) -> dict[str, Any]:
         doc = await self.db.users.find_one({"_id": user_id}) or {"_id": user_id}
         unique = await self.db.inventory.count_documents(
@@ -42,6 +98,8 @@ class UserRepository:
         )
         total_characters = await self.db.characters.count_documents({"active": True})
         xp = doc.get("xp", 0)
+        streak = _streak_count(doc.get("streak", 0))
+        best_streak = max(streak, _streak_count(doc.get("best_streak", streak)))
         return {
             "id": user_id,
             "first_name": doc.get("first_name", "Collector"),
@@ -52,8 +110,22 @@ class UserRepository:
             "catch_count": doc.get("catch_count", 0),
             "unique_characters": unique,
             "catalog_size": total_characters,
-            "streak": doc.get("streak", 0),
+            "streak": streak,
+            "best_streak": best_streak,
             "last_daily": doc.get("last_daily"),
+        }
+
+    async def collection_insights(self, user_id: int) -> CollectionInsights:
+        return await CollectionInsightsRepository(self.client, self.db).read(user_id)
+
+    async def community_counts(self) -> dict[str, int]:
+        """Bounded aggregate counts only; never return individual user or group data."""
+        return {
+            "collectors": await self.db.users.count_documents({}, maxTimeMS=2000),
+            "groups": await self.db.groups.count_documents({}, maxTimeMS=2000),
+            "characters": await self.db.characters.count_documents(
+                {"active": True}, maxTimeMS=2000
+            ),
         }
 
     async def leaderboard(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -72,19 +144,33 @@ class UserRepository:
         ]
 
     async def progression(self, user_id: int, now: datetime) -> dict[str, Any]:
+        now = _as_utc(now)
         profile = await self.profile(user_id)
+        status = daily_status(profile["last_daily"], now)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         caught_today = bool(
             await self.db.activity.find_one(
-                {"user_id": user_id, "kind": "catch", "created_at": {"$gte": start}}, {"_id": 1}
+                {
+                    "user_id": user_id,
+                    "kind": "catch",
+                    "created_at": {"$gte": start, "$lt": start + timedelta(days=1)},
+                },
+                {"_id": 1},
             )
         )
+        # Inventory rows are retained at quantity zero after a consensual gift or
+        # trade, so the first encounter remains recorded even if none are held now.
+        has_collected = bool(profile["unique_characters"] or profile["catch_count"])
+        if not has_collected:
+            has_collected = bool(
+                await self.db.inventory.find_one({"user_id": user_id}, {"_id": 1}, max_time_ms=2000)
+            )
         achievements = [
             {
                 "id": "first-summon",
                 "title": "First encounter",
                 "description": "Collect your first character",
-                "current": min(profile["catch_count"], 1),
+                "current": int(has_collected),
                 "target": 1,
             },
             {
@@ -98,7 +184,7 @@ class UserRepository:
                 "id": "streak-three",
                 "title": "A little ritual",
                 "description": "Reach a 3-day check-in streak",
-                "current": min(profile["streak"], 3),
+                "current": min(profile.get("best_streak", profile["streak"]), 3),
                 "target": 3,
             },
             {
@@ -112,13 +198,14 @@ class UserRepository:
         for item in achievements:
             item["completed"] = item["current"] >= item["target"]
         return {
+            "daily_status": status,
             "achievements": achievements,
             "daily": [
                 {
                     "id": "check-in",
                     "title": "Daily check-in",
                     "description": "Claim your daily points",
-                    "completed": profile["last_daily"] == now.date().isoformat(),
+                    "completed": status["state"] == "claimed",
                     "reward": "100+ points",
                 },
                 {
@@ -132,6 +219,7 @@ class UserRepository:
         }
 
     async def daily(self, user: TelegramUser, now: datetime) -> dict[str, Any]:
+        now = _as_utc(now)
         await self.touch(user, now)
         today = now.date().isoformat()
         yesterday = (now.date() - timedelta(days=1)).isoformat()
@@ -140,14 +228,20 @@ class UserRepository:
             doc = await self.db.users.find_one({"_id": user.id}, session=session)
             if not doc:
                 raise RuntimeError("Player missing during daily reward")
-            if doc.get("last_daily") == today:
+            state = daily_status(doc.get("last_daily"), now)["state"]
+            if state == "claimed":
                 raise DailyAlreadyClaimed("Today's reward has already been claimed")
-            streak = doc.get("streak", 0) + 1 if doc.get("last_daily") == yesterday else 1
+            if state != "available":
+                raise DailyStatusUnavailable("Daily status is unavailable; contact support")
+            previous_streak = _streak_count(doc.get("streak", 0))
+            previous_best = _streak_count(doc.get("best_streak", previous_streak))
+            streak = _streak_count(previous_streak + 1) if doc.get("last_daily") == yesterday else 1
+            best_streak = max(previous_best, previous_streak, streak)
             points = 100 + min(streak - 1, 6) * 10
             await self.db.users.update_one(
                 {"_id": user.id},
                 {
-                    "$set": {"last_daily": today, "streak": streak},
+                    "$set": {"last_daily": today, "streak": streak, "best_streak": best_streak},
                     "$inc": {"points": points, "xp": 20},
                 },
                 session=session,

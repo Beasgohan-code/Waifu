@@ -1,8 +1,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import SendMessage
+from wzgram.enums import ButtonStyle
 from wzgram.errors import BadRequest
 
 from summon.bot.presentation import Card, Emoji, send_card
@@ -24,31 +23,27 @@ def test_vobject_escapes_data_and_premium_has_unicode_fallback():
 
 async def test_rich_rejection_falls_back_to_standard_message():
     bot = AsyncMock()
-    client = AsyncMock()
-    client.send_rich_message.side_effect = BadRequest("BAD_REQUEST")
-    await send_card(bot, 123, Card("SUMMON", "Ready"), rich_client=client)
-    assert client.send_rich_message.await_count == 1
+    bot.send_rich_message.side_effect = BadRequest("BAD_REQUEST")
+    await send_card(bot, 123, Card("SUMMON", "Ready"), rich=True)
+    assert bot.send_rich_message.await_count == 1
     assert bot.send_message.await_count == 1
 
 
 async def test_ambiguous_rich_timeout_is_never_retried():
     bot = AsyncMock()
-    client = AsyncMock()
-    client.send_rich_message.side_effect = TimeoutError("uncertain delivery")
+    bot.send_rich_message.side_effect = TimeoutError("uncertain delivery")
     with pytest.raises(TimeoutError):
-        await send_card(bot, 123, Card("SUMMON", "Ready"), rich_client=client)
+        await send_card(bot, 123, Card("SUMMON", "Ready"), rich=True)
     bot.send_message.assert_not_awaited()
 
 
 async def test_rejected_premium_entity_retries_once_without_it():
     bot = AsyncMock()
     bot.send_message.side_effect = [
-        TelegramBadRequest(
-            method=SendMessage(chat_id=123, text="x"), message="CUSTOM_EMOJI_INVALID"
-        ),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         "sent",
     ]
-    result = await send_card(bot, 123, Card("SUMMON", "Ready", emoji=Emoji.SPARK))
+    result = await send_card(bot, 123, Card("SUMMON", "Ready", emoji=Emoji.SPARK), rich=False)
     assert result == "sent"
     assert bot.send_message.await_count == 2
     assert "tg-emoji" in bot.send_message.await_args_list[0].kwargs["text"]
@@ -57,16 +52,14 @@ async def test_rejected_premium_entity_retries_once_without_it():
 
 async def test_unrelated_bad_request_does_not_retry():
     bot = AsyncMock()
-    bot.send_message.side_effect = TelegramBadRequest(
-        method=SendMessage(chat_id=123, text="x"), message="chat not found"
-    )
-    with pytest.raises(TelegramBadRequest):
-        await send_card(bot, 123, Card("SUMMON", "Ready", emoji=Emoji.SPARK))
+    bot.send_message.side_effect = BadRequest("CHAT_NOT_FOUND")
+    with pytest.raises(BadRequest):
+        await send_card(bot, 123, Card("SUMMON", "Ready", emoji=Emoji.SPARK), rich=False)
     assert bot.send_message.await_count == 1
 
 
 async def test_rejected_button_icon_preserves_callback_and_unicode():
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -74,7 +67,7 @@ async def test_rejected_button_icon_preserves_callback_and_unicode():
                 InlineKeyboardButton(
                     text="Accept",
                     callback_data="trade:accept:abc",
-                    style="success",
+                    style=ButtonStyle.SUCCESS,
                     icon_custom_emoji_id=Emoji.CHECK.value[1],
                 )
             ]
@@ -82,12 +75,10 @@ async def test_rejected_button_icon_preserves_callback_and_unicode():
     )
     bot = AsyncMock()
     bot.send_message.side_effect = [
-        TelegramBadRequest(
-            method=SendMessage(chat_id=123, text="x"), message="CUSTOM_EMOJI_INVALID"
-        ),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         "sent",
     ]
-    await send_card(bot, 123, Card("Trade", "Ready"), reply_markup=markup)
+    await send_card(bot, 123, Card("Trade", "Ready"), reply_markup=markup, rich=False)
     fallback = bot.send_message.await_args_list[1].kwargs["reply_markup"].inline_keyboard[0][0]
     assert fallback.callback_data == "trade:accept:abc"
     assert fallback.text.startswith("✅")
@@ -100,9 +91,7 @@ async def test_ephemeral_rejection_falls_back_to_dm_not_public_group():
 
     bot = AsyncMock()
     bot.send_message.side_effect = [
-        TelegramBadRequest(
-            method=SendMessage(chat_id=-100, text="x"), message="EPHEMERAL_UNSUPPORTED"
-        ),
+        BadRequest("EPHEMERAL_UNSUPPORTED"),
         "private",
     ]
     result = await send_ephemeral_card(
@@ -133,20 +122,20 @@ async def test_rich_sender_uses_wzgram_signature_without_retrying_success():
         def __init__(self):
             self.received = None
 
-        async def send_rich_message(self, chat_id, rich_text, *, message_thread_id=None):
+        async def send_rich_message(
+            self, chat_id, rich_text, *, reply_markup=None, message_thread_id=None
+        ):
             self.received = (chat_id, rich_text, message_thread_id)
             return "sent"
 
     client = StrictWzgramClient()
-    bot = AsyncMock()
     result = await send_card(
-        bot, 123, Card("SUMMON", "Ready"), rich_client=client, premium=False, message_thread_id=5
+        client, 123, Card("SUMMON", "Ready"), rich=True, premium=False, message_thread_id=5
     )
     assert result == "sent"
     assert client.received[0] == 123
     assert isinstance(client.received[1], InputRichMessage)
     assert client.received[2] == 5
-    bot.send_message.assert_not_awaited()
 
 
 def test_installed_wzgram_rich_signature_is_supported():
@@ -196,22 +185,21 @@ def test_rich_table_uses_bot_api_10_3_attributes():
 
 
 async def test_bot_api_rich_card_preserves_keyboard_callbacks():
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage
+    from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage
 
     bot = AsyncMock()
     markup = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Accept", callback_data="gift:accept:abc")]]
     )
-    await send_card(bot, -100, Card("Gift"), reply_markup=markup, bot_api_rich=True)
+    await send_card(bot, -100, Card("Gift"), reply_markup=markup, rich=True)
     kwargs = bot.send_rich_message.await_args.kwargs
-    assert isinstance(kwargs["rich_message"], InputRichMessage)
+    assert isinstance(kwargs["rich_text"], InputRichMessage)
     assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "gift:accept:abc"
     bot.send_message.assert_not_awaited()
 
 
-async def test_bot_api_rich_rejection_falls_back_to_plain_keyboard_once():
-    from aiogram.methods import SendRichMessage
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage
+async def test_rich_layout_rejection_preserves_premium_in_standard_message():
+    from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     bot = AsyncMock()
     markup = InlineKeyboardMarkup(
@@ -220,33 +208,30 @@ async def test_bot_api_rich_rejection_falls_back_to_plain_keyboard_once():
                 InlineKeyboardButton(
                     text="Accept",
                     callback_data="gift:accept:abc",
-                    style="success",
+                    style=ButtonStyle.SUCCESS,
                     icon_custom_emoji_id=Emoji.CHECK.value[1],
                 )
             ]
         ]
     )
-    bot.send_rich_message.side_effect = TelegramBadRequest(
-        method=SendRichMessage(chat_id=-100, rich_message=InputRichMessage(html="<p>x</p>")),
-        message="unsupported rich message",
-    )
-    await send_card(bot, -100, Card("Gift"), reply_markup=markup, bot_api_rich=True)
+    bot.send_rich_message.side_effect = BadRequest("UNSUPPORTED_RICH_MESSAGE")
+    await send_card(bot, -100, Card("Gift"), reply_markup=markup, rich=True)
     button = bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.callback_data == "gift:accept:abc"
-    assert button.icon_custom_emoji_id is None
-    assert "tg-emoji" not in bot.send_message.await_args.kwargs["text"]
+    assert button.icon_custom_emoji_id == Emoji.CHECK.custom_id
+    assert "tg-emoji" in bot.send_message.await_args.kwargs["text"]
 
 
 async def test_bot_api_rich_timeout_does_not_retry():
     bot = AsyncMock()
     bot.send_rich_message.side_effect = TimeoutError("delivery unknown")
     with pytest.raises(TimeoutError):
-        await send_card(bot, 1, Card("Hello"), bot_api_rich=True)
+        await send_card(bot, 1, Card("Hello"), rich=True)
     bot.send_message.assert_not_awaited()
 
 
 async def test_generic_invalid_button_type_is_not_treated_as_emoji_rejection():
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     bot = AsyncMock()
     markup = InlineKeyboardMarkup(
@@ -260,11 +245,9 @@ async def test_generic_invalid_button_type_is_not_treated_as_emoji_rejection():
             ]
         ]
     )
-    bot.send_message.side_effect = TelegramBadRequest(
-        method=SendMessage(chat_id=123, text="x"), message="BUTTON_TYPE_INVALID"
-    )
-    with pytest.raises(TelegramBadRequest):
-        await send_card(bot, 123, Card("Ready", emoji=Emoji.GIFT), reply_markup=markup)
+    bot.send_message.side_effect = BadRequest("BUTTON_TYPE_INVALID")
+    with pytest.raises(BadRequest):
+        await send_card(bot, 123, Card("Ready", emoji=Emoji.GIFT), reply_markup=markup, rich=False)
     bot.send_message.assert_awaited_once()
 
 
@@ -272,26 +255,23 @@ async def test_standard_message_timeout_never_retries_premium_emoji():
     bot = AsyncMock()
     bot.send_message.side_effect = TimeoutError("delivery unknown")
     with pytest.raises(TimeoutError):
-        await send_card(bot, 123, Card("Ready", emoji=Emoji.SHIELD))
+        await send_card(bot, 123, Card("Ready", emoji=Emoji.SHIELD), rich=False)
     bot.send_message.assert_awaited_once()
 
 
 async def test_timeout_after_rejected_emoji_does_not_cause_a_third_send():
     bot = AsyncMock()
     bot.send_message.side_effect = [
-        TelegramBadRequest(
-            method=SendMessage(chat_id=123, text="x"), message="CUSTOM_EMOJI_INVALID"
-        ),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         TimeoutError("fallback delivery unknown"),
     ]
     with pytest.raises(TimeoutError):
-        await send_card(bot, 123, Card("Ready", emoji=Emoji.GIFT))
+        await send_card(bot, 123, Card("Ready", emoji=Emoji.GIFT), rich=False)
     assert bot.send_message.await_count == 2
 
 
 async def test_disabled_premium_rich_fallback_does_not_duplicate_unicode_prefix():
-    from aiogram.methods import SendRichMessage
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage
+    from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     from summon.bot.presentation import button_label
 
@@ -302,32 +282,29 @@ async def test_disabled_premium_rich_fallback_does_not_duplicate_unicode_prefix(
                 InlineKeyboardButton(
                     text=button_label("Accept", Emoji.GIFT, premium=False),
                     callback_data="gift:accept:abc",
-                    style="success",
+                    style=ButtonStyle.SUCCESS,
                 )
             ]
         ]
     )
-    bot.send_rich_message.side_effect = TelegramBadRequest(
-        method=SendRichMessage(chat_id=123, rich_message=InputRichMessage(html="<p>x</p>")),
-        message="unsupported rich message",
-    )
+    bot.send_rich_message.side_effect = BadRequest("UNSUPPORTED_RICH_MESSAGE")
     await send_card(
         bot,
         123,
         Card("Gift", emoji=Emoji.GIFT),
-        bot_api_rich=True,
+        rich=True,
         premium=False,
         reply_markup=markup,
     )
     button = bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.text == f"{Emoji.GIFT.value[0]} Accept"
     assert button.callback_data == "gift:accept:abc"
-    assert button.icon_custom_emoji_id is None and button.style is None
+    assert button.icon_custom_emoji_id is None and button.style == ButtonStyle.DEFAULT
     assert "tg-emoji" not in bot.send_message.await_args.kwargs["text"]
 
 
 async def test_rejected_new_pack_icons_fall_back_without_losing_webapp_or_callback():
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+    from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
     bot = AsyncMock()
     markup = InlineKeyboardMarkup(
@@ -337,25 +314,26 @@ async def test_rejected_new_pack_icons_fall_back_without_losing_webapp_or_callba
                     text="Accept gift",
                     callback_data="gift:accept:abc",
                     icon_custom_emoji_id=Emoji.GIFT.value[1],
-                    style="success",
+                    style=ButtonStyle.SUCCESS,
                 ),
                 InlineKeyboardButton(
                     text="Open",
                     web_app=WebAppInfo(url="https://miniapp.example"),
                     icon_custom_emoji_id=Emoji.CROWN.value[1],
-                    style="primary",
+                    style=ButtonStyle.PRIMARY,
                 ),
             ]
         ]
     )
     bot.send_message.side_effect = [
-        TelegramBadRequest(
-            method=SendMessage(chat_id=123, text="x"), message="CUSTOM_EMOJI_INVALID"
-        ),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         "sent",
     ]
     assert (
-        await send_card(bot, 123, Card("Ready", emoji=Emoji.SHIELD), reply_markup=markup) == "sent"
+        await send_card(
+            bot, 123, Card("Ready", emoji=Emoji.SHIELD), reply_markup=markup, rich=False
+        )
+        == "sent"
     )
     first, second = bot.send_message.await_args_list
     assert Emoji.SHIELD.value[1] in first.kwargs["text"]
@@ -367,3 +345,56 @@ async def test_rejected_new_pack_icons_fall_back_without_losing_webapp_or_callba
     assert opened.text == f"{Emoji.CROWN.value[0]} Open"
     assert accept.icon_custom_emoji_id is opened.icon_custom_emoji_id is None
     assert markup.inline_keyboard[0][0].icon_custom_emoji_id == Emoji.GIFT.value[1]
+
+
+def test_every_authored_field_and_details_receive_context_appropriate_icons():
+    card = Card(
+        "Summary",
+        fields=(("Rarity", "Rainy Edition"), ("Series", "Sky"), ("Other", "Value")),
+        details=("More", "User <content>"),
+    )
+    rich = card.rich_html(premium=True)
+    plain = card.telegram_html(premium=True)
+    assert Emoji.RAIN.custom_id in rich and Emoji.RAIN.custom_id in plain
+    assert Emoji.SERIES_TAG.custom_id in rich and Emoji.SPARK.custom_id in rich
+    assert Emoji.NOTE.custom_id in rich and "User &lt;content&gt;" in rich
+    assert "tg-emoji" not in card.telegram_html(premium=False)
+
+
+async def test_custom_emoji_rejection_in_rich_falls_back_to_unicode_once():
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = BadRequest("CUSTOM_EMOJI_INVALID")
+    await send_card(bot, 1, Card("Stats", fields=(("Series", "Sky"),)), rich=True)
+    assert "tg-emoji" not in bot.send_message.await_args.kwargs["text"]
+    bot.send_message.assert_awaited_once()
+
+
+def test_callback_and_menu_surfaces_use_plain_unicode_not_telegram_html():
+    from summon.bot.menu import COMMANDS
+    from summon.bot.presentation import callback_text
+
+    answer = callback_text("Done", emoji=Emoji.DONE)
+    assert answer == f"{Emoji.DONE.value[0]} Done"
+    assert "<tg-emoji" not in answer
+    assert len(callback_text("x" * 1000, emoji=Emoji.DONE)) <= 200
+    assert all("<tg-emoji" not in item.description for item in COMMANDS)
+    assert all(item.description[0] != "<" for item in COMMANDS)
+
+
+async def test_upload_review_keyboard_falls_back_without_changing_signed_actions():
+    from summon.bot.keyboards import upload_review_keyboard
+
+    publish, cancel = "catalog-publish:50:c:example-token", "catalog-cancel:50:c:example-token"
+    markup = upload_review_keyboard(publish, cancel, premium=True)
+    bot = AsyncMock()
+    bot.send_message.side_effect = [BadRequest("CUSTOM_EMOJI_INVALID"), "sent"]
+    await send_card(bot, 42, Card("Review"), reply_markup=markup, rich=False)
+    primary, fallback = bot.send_message.await_args_list
+    assert [
+        button.callback_data for button in primary.kwargs["reply_markup"].inline_keyboard[0]
+    ] == [publish, cancel]
+    buttons = fallback.kwargs["reply_markup"].inline_keyboard[0]
+    assert [button.callback_data for button in buttons] == [publish, cancel]
+    assert all(button.icon_custom_emoji_id is None for button in buttons)
+    assert buttons[0].text.startswith(Emoji.CHECK.value[0])
+    assert buttons[1].text.startswith(Emoji.CANCEL.value[0])

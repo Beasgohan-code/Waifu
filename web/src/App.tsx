@@ -45,7 +45,11 @@ export default function App() {
   const [dailyBusy, setDailyBusy] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState<'note' | 'auto-reply' | null>(null);
+  const [catalogDraft, setCatalogDraft] = useState<{ blocked: boolean } | null>(null);
+  const groupMutationInFlight = useRef(false);
+  const reportGroupMutation = useCallback((value: boolean) => { groupMutationInFlight.current = value; }, []);
   const reportGroupDraft = useCallback((value: boolean, kind: 'note' | 'auto-reply' = 'note') => setNoteDraft(value ? kind : null), []);
+  const reportCatalogDraft = useCallback((value: { blocked: boolean } | null) => setCatalogDraft(value), []);
   const [pendingView, setPendingView] = useState<View | null>(null);
   const draftConfirmRef = useRef<HTMLDivElement>(null);
   const draftOpenerRef = useRef<HTMLElement | null>(null);
@@ -54,17 +58,25 @@ export default function App() {
   const refresh = useCallback(() => setRevision(value => value + 1), []);
   const navigateNow = useCallback((next: View) => { setView(next); setMoreOpen(false); window.history.replaceState(null, '', `#${next}`); window.scrollTo({ top: 0, behavior: 'smooth' }); }, []);
   const navigate = useCallback((next: View) => {
-    if (view === 'groups' && next !== 'groups' && noteDraft) {
+    if (view === 'groups' && next !== 'groups' && groupMutationInFlight.current) {
+      setToast({ message: 'Please wait for the group change to finish before leaving.', error: false });
+      return;
+    }
+    if ((view === 'groups' && next !== 'groups' && noteDraft)
+      || (view === 'admin' && next !== 'admin' && catalogDraft)) {
       draftOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setPendingView(next); setMoreOpen(false);
       return;
     }
     navigateNow(next);
-  }, [view, noteDraft, navigateNow]);
+  }, [view, noteDraft, catalogDraft, navigateNow]);
   const closeCharacter = useCallback(() => setCharacter(null), []);
   const notify = useCallback((message: string, isError = false) => setToast({ message, error: isError }), []);
   const openCollection = useCallback(() => navigate('collection'), [navigate]);
   useTelegramCollectionButton(Boolean(profile) && !loading && view === 'home' && !character && !moreOpen && !pendingView, collectionButtonEmoji, openCollection);
+  useEffect(() => {
+    if (view === 'admin' && pendingView && !catalogDraft) setPendingView(null);
+  }, [view, pendingView, catalogDraft]);
 
   useEffect(() => {
     let active = true;
@@ -89,7 +101,7 @@ export default function App() {
     if (preview || dailyBusy) return;
     setDailyBusy(true);
     try { const reward = await api.post<{ points: number; xp: number }>('/daily'); notify(`Daily reward claimed: +${reward.points} points and +${reward.xp} XP.`); await refreshProfile(); refresh(); }
-    catch (err) { notify(err instanceof Error ? err.message : 'Could not claim your reward.', true); } finally { setDailyBusy(false); }
+    catch (err) { notify(err instanceof Error ? err.message : 'Could not claim your reward.', true); await refreshProfile(); refresh(); } finally { setDailyBusy(false); }
   }
   async function favorite(item: Character) {
     if (preview) return;
@@ -111,11 +123,14 @@ export default function App() {
     : view === 'trades' ? <Trading profile={profile} preview={preview} revision={revision} refresh={refresh} notify={notify} />
     : view === 'progress' ? <Progress preview={preview} revision={revision} daily={daily} dailyBusy={dailyBusy} />
     : view === 'leaderboard' ? <Leaderboard revision={revision} />
-    : view === 'groups' ? <Groups preview={preview} revision={revision} refresh={refresh} notify={notify} onNoteDraftChange={reportGroupDraft} />
-    : view === 'profile' ? <ProfilePage profile={profile} navigate={navigate} />
-    : view === 'admin' && profile.is_operator ? <Admin notify={notify} refresh={refresh} />
+    : view === 'groups' ? <Groups preview={preview} revision={revision} refresh={refresh} notify={notify} onNoteDraftChange={reportGroupDraft} onMutationChange={reportGroupMutation} />
+    : view === 'profile' ? <ProfilePage profile={profile} navigate={navigate} revision={revision} />
+    : view === 'admin' && profile.is_operator ? <Admin notify={notify} refresh={refresh} onDraftChange={reportCatalogDraft} preview={preview} />
     : view === 'settings' ? <div className="page-content"><div className="page-heading"><span className="eyebrow">MAKE IT YOURS</span><h1>Settings.</h1><p>A few little preferences for your SUMMON experience.</p></div><div className="page-card group-panel"><div className="panel-title"><div><span className="eyebrow">APPEARANCE</span><h3>Choose your theme</h3><p>Follow Telegram as it changes, or choose a theme for this device.</p></div></div><div className="segment theme-segment"><button className={preference === 'telegram' ? 'active' : ''} aria-pressed={preference === 'telegram'} onClick={() => chooseTheme('telegram')}>Follow Telegram</button><button className={preference === 'dark' ? 'active' : ''} aria-pressed={preference === 'dark'} onClick={() => chooseTheme('dark')}><Moon size={15} /> Dark</button><button className={preference === 'light' ? 'active' : ''} aria-pressed={preference === 'light'} onClick={() => chooseTheme('light')}><Sun size={15} /> Light</button></div></div><div className="page-card group-panel"><span className="eyebrow">YOUR SESSION</span><h3>Signed in with Telegram</h3><p className="muted-small">Your identity is verified on the server. Reopen the Mini App in Telegram when your session expires.</p><button className="button button-subtle" disabled={preview} onClick={logout}><LogOut size={15} /> Sign out</button></div></div>
     : <div className="page-content"><EmptyState title="Not available" text="You don't have access to this area." /></div>;
+  const draftType = view === 'admin' ? 'catalogue' : noteDraft === 'auto-reply' ? 'auto-reply' : 'note';
+  const draftResource = view === 'admin' ? 'catalogue' : noteDraft === 'auto-reply' ? 'auto replies' : 'notes';
+  const draftBlocked = view === 'admin' && Boolean(catalogDraft?.blocked);
 
   return <div className="app-shell"><a className="skip-link" href="#main-content">Skip to main content</a><aside className="sidebar"><Brand /><div className="sidebar-divider" />
     <nav aria-label="Main navigation">{['YOUR SPACE', 'COMMUNITY', 'ACCOUNT'].map(group => <div className="nav-group" key={group}><span className="nav-label">{group}</span>{entries.filter(item => item.group === group).map(item => <button key={item.view} className={`nav-item ${view === item.view ? 'active' : ''}`} onClick={() => navigate(item.view)} aria-current={view === item.view ? 'page' : undefined}><item.icon size={18} strokeWidth={1.7} /><span>{item.label}</span>{view === item.view && <span className="nav-active-dot" />}</button>)}</div>)}</nav>
@@ -123,7 +138,7 @@ export default function App() {
   </aside>
   <main className="main-shell" id="main-content" tabIndex={-1}><header className="topbar"><div className="mobile-brand"><Brand compact /></div><div className="breadcrumbs"><span>YOUR SPACE</span><span>/</span><strong>{active.label}</strong></div><div className="topbar-actions"><button className="icon-button top-search" onClick={() => navigate('catalog')} aria-label="Search characters"><Search size={19} /></button><button className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button><span className="topbar-divider" /><button className="user-chip" onClick={() => navigate('profile')} aria-label="Open your profile"><span className="user-avatar">{profile.first_name.charAt(0).toUpperCase()}</span><span><strong>{profile.first_name}</strong><small>LEVEL {profile.level} COLLECTOR</small></span><ChevronDown size={14} /></button></div></header>
     {preview && <div className="preview-banner"><Sparkles size={14} /> Read-only preview <span>·</span> Sample characters and group data</div>}
-    {pendingView && <div ref={draftConfirmRef} tabIndex={-1} className="warning-confirm app-draft-warning" role="region" aria-label={noteDraft === 'auto-reply' ? 'Discard auto-reply draft' : 'Discard note draft'}><h4>Leave your {noteDraft === 'auto-reply' ? 'auto-reply' : 'note'} draft?</h4><p>Leaving will discard the draft. If a save is already in progress, it may still complete; review the {noteDraft === 'auto-reply' ? 'auto replies' : 'notes'} before retrying.</p><div className="warning-confirm-actions"><button className="button button-subtle" type="button" onClick={() => { setPendingView(null); draftOpenerRef.current?.focus(); }}>Keep editing</button><button className="button button-primary" type="button" onClick={() => { const next = pendingView; setPendingView(null); setNoteDraft(null); navigateNow(next); }}>Discard and continue</button></div></div>}
+    {pendingView && <div ref={draftConfirmRef} tabIndex={-1} className="warning-confirm app-draft-warning" role="region" aria-label={`Discard ${draftType} draft`}><h4>Leave your {draftType} draft?</h4><p>{draftBlocked ? 'A catalogue operation is in progress. Wait for it to finish before leaving.' : <>Leaving will discard the draft. If a save is already in progress, it may still complete; review the {draftResource} before retrying.</>}</p><div className="warning-confirm-actions"><button className="button button-subtle" type="button" onClick={() => { setPendingView(null); draftOpenerRef.current?.focus(); }}>Keep editing</button><button className="button button-primary" type="button" disabled={draftBlocked} onClick={() => { const next = pendingView; setPendingView(null); setNoteDraft(null); setCatalogDraft(null); navigateNow(next); }}>Discard and continue</button></div></div>}
     {page}<footer className="app-footer"><span>✦ &nbsp; A LITTLE UNIVERSE FOR COLLECTORS</span><span>SUMMON © {new Date().getFullYear()} &nbsp; · &nbsp; COLLECT. DISCOVER. SUMMON.</span></footer>
   </main>
   <nav className="mobile-nav" aria-label="Mobile navigation">{([['home', HomeIcon, 'Home'], ['collection', BookOpen, 'Collection'], ['catalog', Compass, 'Discover'], ['groups', Users, 'Groups']] as const).map(([name, IconComponent, label]) => <button key={name} className={view === name ? 'active' : ''} onClick={() => navigate(name)}><IconComponent size={19} /><span>{label}</span></button>)}<button className={moreOpen ? 'active' : ''} onClick={() => setMoreOpen(!moreOpen)} aria-expanded={moreOpen} aria-label="More navigation">{moreOpen ? <X size={19} /> : <Menu size={19} />}<span>More</span></button></nav>

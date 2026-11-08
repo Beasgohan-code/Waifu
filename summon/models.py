@@ -6,12 +6,15 @@ import math
 import re
 import unicodedata
 from typing import Literal
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-Rarity = Literal["common", "rare", "epic", "legendary"]
+from summon.rarities import Rarity
+from summon.services.artwork import validate_external_url
+
 InventorySort = Literal["recent", "copies"]
+CollectionMode = Literal["recent", "copies", "favorites"]
+MediaType = Literal["photo", "video", "animation"]
 
 
 def normalize_name(value: str) -> str:
@@ -22,26 +25,78 @@ def player_level(xp: int) -> int:
     return 1 + math.isqrt(max(0, xp) // 100)
 
 
-class CharacterInput(BaseModel):
+class CharacterBasics(BaseModel):
+    """Validate catalog metadata before downloading an operator-provided photo."""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
     name: str = Field(min_length=1, max_length=120)
     category: str = Field(min_length=1, max_length=120)
     rarity: Rarity
+
+
+class CharacterInput(CharacterBasics):
     image_url: str = Field(max_length=2048)
+    media_type: MediaType = "photo"
+    telegram_file_id: str | None = Field(default=None, min_length=1, max_length=2048)
     description: str = Field(default="", max_length=1200)
     active: bool = True
+
+    @field_validator("telegram_file_id")
+    @classmethod
+    def valid_file_id(cls, value: str | None) -> str | None:
+        if value is not None and (not value.isascii() or not value.isprintable()):
+            raise ValueError("Invalid Telegram file ID")
+        return value
 
     @field_validator("image_url")
     @classmethod
     def valid_artwork(cls, value: str) -> str:
         if re.fullmatch(r"/art/[a-zA-Z0-9_-]+\.(?:png|jpe?g|webp)", value):
             return value
-        parts = urlsplit(value)
-        if parts.scheme == "https" and parts.hostname and not parts.username and not parts.password:
+        if re.fullmatch(r"/api/artwork/[0-9a-f]{64}", value):
             return value
-        raise ValueError("Artwork must use an HTTPS URL or an /art/ image path")
+        return validate_external_url(value)
+
+
+class CharacterMediaInput(BaseModel):
+    """Hosted replacement media; never accept a new binary blob or file-less record."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    image_url: str = Field(min_length=1, max_length=2048)
+    media_type: MediaType
+    telegram_file_id: str = Field(min_length=1, max_length=2048)
+
+    @field_validator("image_url")
+    @classmethod
+    def valid_public_url(cls, value: str) -> str:
+        return validate_external_url(value)
+
+    @field_validator("telegram_file_id")
+    @classmethod
+    def valid_file_id(cls, value: str) -> str:
+        if not value.isascii() or not value.isprintable():
+            raise ValueError("Invalid Telegram file ID")
+        return value
+
+
+class CharacterChanges(BaseModel):
+    """Explicit metadata updates; character IDs and ownership are immutable."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    category: str | None = Field(default=None, min_length=1, max_length=120)
+    rarity: Rarity | None = None
+    image_url: str | None = Field(default=None, max_length=2048)
+    description: str | None = Field(default=None, max_length=1200)
+
+    @field_validator("image_url")
+    @classmethod
+    def valid_artwork(cls, value: str | None) -> str | None:
+        return None if value is None else CharacterInput.valid_artwork(value)
 
 
 class GroupSettings(BaseModel):

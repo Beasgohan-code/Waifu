@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, cast
 
+from summon.auth import TelegramUser
 from summon.models import normalize_name
+from summon.repositories.collection import DailyCharacterUnavailable
 
 
 class GuessRateLimited(Exception):
@@ -25,6 +27,10 @@ class CollectionService:
             return None
         if group["message_count"] < group["settings"]["spawn_every"]:
             return None
+        return await self.try_spawn(group_id, now)
+
+    async def try_spawn(self, group_id: int, now: datetime) -> dict[str, Any] | None:
+        """Reserve only if MongoDB's atomic cadence, cooldown and active-spawn gates pass."""
         character = await self.catalog.choose()
         if not character:
             return None
@@ -32,6 +38,20 @@ class CollectionService:
         if not spawn:
             return None
         return {"spawn": spawn, "character": character}
+
+    async def claim_daily_character(
+        self, user: TelegramUser, now: datetime, *, message_id: str
+    ) -> dict[str, Any]:
+        """Choose an active weighted character; the repository enforces both claim guards."""
+        character = await self.catalog.choose()
+        if not character:
+            raise DailyCharacterUnavailable
+        return cast(
+            dict[str, Any],
+            await self.collection.claim_daily_character(
+                user, character["_id"], now, message_id=message_id
+            ),
+        )
 
     async def guess(
         self, group_id: int, user: dict[str, Any], text: str, now: datetime

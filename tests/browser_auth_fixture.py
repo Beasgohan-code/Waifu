@@ -72,12 +72,19 @@ def make_fixture_app():
     store.auth = FixtureAuth()
     store.limiter = FixtureLimiter()
     store.sessions = FixtureSessions()
+    embedded = os.environ.get("SUMMON_SESSION_TEST_EMBEDDED") == "1"
+    web_origin = "https://app.summon.test:19443"
     settings = Settings(
-        environment="development",
+        environment="production" if embedded else "development",
         preview_mode=False,
         rich_enabled=False,
         bot_token="123456:TEST_TOKEN_DO_NOT_USE",
         session_secret="test-session-secret-not-for-production",
+        mongo_uri="mongodb://example.invalid" if embedded else "",
+        webapp_url=web_origin if embedded else "",
+        allowed_origins=[web_origin] if embedded else [],
+        telegram_api_id=12345 if embedded else None,
+        telegram_api_hash="synthetic-hash" if embedded else "",
         _env_file=None,
     )
     return create_app(settings=settings, store=store)

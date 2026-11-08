@@ -12,7 +12,8 @@
     "test:warning-browser": "node tests/browser.warning.mjs",
     "test:notes-browser": "node tests/browser.notes.mjs",
     "test:auto-replies-browser": "node tests/browser.auto-replies.mjs",
-    "test:session-browser": "node tests/browser.session.mjs"
+    "test:session-browser": "node tests/browser.session.mjs",
+    "test:embedded-browser": "node tests/browser.embedded-session.mjs"
   },
   "dependencies": {
     "@fontsource/dm-sans": "5.3.0",

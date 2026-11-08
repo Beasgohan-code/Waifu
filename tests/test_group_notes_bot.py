@@ -1,15 +1,16 @@
 """Note commands are group-scoped, authorized, rate-limited and plain text."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
-from aiogram.methods import GetChatMember
 from pymongo.errors import AutoReconnect
+from wzgram import Client, raw
+from wzgram.types import User
 
-from summon.bot.handlers import build_router
+from summon.bot.handlers import register_handlers
 from summon.config import Settings
 from summon.group_notes import NoteConflict
 
@@ -26,7 +27,7 @@ NOTE = {
 }
 
 
-def setup():
+async def setup():
     notes = SimpleNamespace(
         list=AsyncMock(return_value=[NOTE]),
         get=AsyncMock(return_value=NOTE),
@@ -42,13 +43,24 @@ def setup():
         notes=notes,
         limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
     )
-    router = build_router(store, Settings(_env_file=None))
-    bot = SimpleNamespace(
-        id=99,
-        get_chat_member=AsyncMock(
-            return_value=SimpleNamespace(status="administrator", can_change_info=True)
-        ),
+    router = Client(
+        "offline-test",
+        api_id=123,
+        api_hash="test",
+        bot_token="123:fake",
+        in_memory=True,
+        workers=1,
+        skip_updates=True,
     )
+    router.me = User(id=99, is_bot=True, username="summon_test", first_name="Bot")
+    router.get_chat_member = AsyncMock(
+        return_value=SimpleNamespace(
+            status="administrator", privileges=SimpleNamespace(can_change_info=True)
+        )
+    )
+    bot = router
+    register_handlers(router, store, Settings(_env_file=None))
+    await asyncio.sleep(0)
     message = SimpleNamespace(
         from_user=SimpleNamespace(
             id=42, is_bot=False, first_name="Actor", last_name=None, username=None
@@ -58,16 +70,37 @@ def setup():
         message_thread_id=None,
         ephemeral_message_id=None,
         bot=bot,
+        text="/test",
+        caption=None,
+        command=["test"],
     )
     return router, store, bot, message
 
 
 def handler(router, name):
-    return next(item.callback for item in router.message.handlers if item.callback.__name__ == name)
+    callback = next(
+        item.callback for item in router.dispatcher.groups[0] if item.callback.__name__ == name
+    )
+
+    async def invoke(message, args=None):
+        command = {
+            "list_notes": "notes",
+            "show_note": "note",
+            "note_version": "noteinfo",
+            "save_note": "savenote",
+            "edit_note": "editnote",
+            "delete_note": "delnote",
+        }.get(name, name)
+        message.command = [command]
+        argument = getattr(args, "args", None)
+        message.text = "/" + command + (" " + argument if argument else "")
+        return await callback(router, message)
+
+    return invoke
 
 
 async def test_members_can_list_names_and_show_escaped_public_text_only():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     bot.get_chat_member.return_value = SimpleNamespace(status="member")
     with (
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
@@ -92,7 +125,7 @@ async def test_members_can_list_names_and_show_escaped_public_text_only():
 
 
 async def test_admin_create_only_and_edit_use_current_revision_and_private_result():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with (
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
@@ -108,14 +141,14 @@ async def test_admin_create_only_and_edit_use_current_revision_and_private_resul
 
 
 async def test_note_version_is_admin_only_and_delivers_revision_privately():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with (
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
     ):
         await handler(router, "note_version")(message, SimpleNamespace(args="hello"))
         bot.get_chat_member.return_value = SimpleNamespace(
-            status="administrator", can_change_info=False
+            status="administrator", privileges=SimpleNamespace(can_change_info=False)
         )
         await handler(router, "note_version")(message, SimpleNamespace(args="hello"))
     assert store.notes.get.await_count == 1
@@ -136,7 +169,7 @@ async def test_note_version_is_admin_only_and_delivers_revision_privately():
     ],
 )
 async def test_delete_requires_exact_revision_and_literal_confirmation(args):
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock):
         await handler(router, "delete_note")(message, SimpleNamespace(args=args))
     store.notes.delete.assert_not_awaited()
@@ -144,7 +177,7 @@ async def test_delete_requires_exact_revision_and_literal_confirmation(args):
 
 
 async def test_delete_uses_live_permission_current_revision_and_private_confirmation():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private:
         await handler(router, "delete_note")(message, SimpleNamespace(args=f"HELLO {REV} confirm"))
         bot.get_chat_member.return_value = SimpleNamespace(status="member")
@@ -155,7 +188,7 @@ async def test_delete_uses_live_permission_current_revision_and_private_confirma
 
 
 async def test_public_read_rejects_left_member_and_unauthorized_admin_changes():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with (
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock),
@@ -170,7 +203,7 @@ async def test_public_read_rejects_left_member_and_unauthorized_admin_changes():
 
 
 async def test_rate_limit_and_invalid_or_anonymous_input_do_not_hit_storage():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock):
         store.limiter.allow.return_value = False
         await handler(router, "show_note")(message, SimpleNamespace(args="hello"))
@@ -184,7 +217,7 @@ async def test_rate_limit_and_invalid_or_anonymous_input_do_not_hit_storage():
 
 
 async def test_uncertainty_conflict_and_lookup_failures_are_sanitized():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private:
         store.notes.save.side_effect = AutoReconnect("secret db details")
         await handler(router, "save_note")(message, SimpleNamespace(args="hello text"))
@@ -193,9 +226,7 @@ async def test_uncertainty_conflict_and_lookup_failures_are_sanitized():
         store.notes.save.side_effect = NoteConflict("Changed; reload notes")
         await handler(router, "save_note")(message, SimpleNamespace(args="hello text"))
         assert "reload" in private.await_args.args[3].telegram_html(premium=False).lower()
-        bot.get_chat_member.side_effect = TelegramNetworkError(
-            method=GetChatMember(chat_id=-100, user_id=42), message="secret network details"
-        )
+        bot.get_chat_member.side_effect = ConnectionError("secret network details")
         await handler(router, "note_version")(message, SimpleNamespace(args="hello"))
         assert "secret" not in private.await_args.args[3].telegram_html(premium=False)
     assert store.notes.save.await_count == 2
@@ -212,48 +243,54 @@ async def test_uncertainty_conflict_and_lookup_failures_are_sanitized():
         (f"/delnote hello {REV} confirm", "delete"),
     ],
 )
-async def test_aiogram_dispatches_each_note_command_once(text, method):
-    from aiogram import Bot, Dispatcher
-    from aiogram.types import Update
-
-    router, store, _, _ = setup()
+async def test_wzgram_dispatches_each_note_command_once(text, method):
+    router, store, _, _ = await setup()
     store.groups.get = AsyncMock(return_value=None)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = Dispatcher()
-    dp.include_router(router)
-    command = text.split()[0]
-    update = Update.model_validate(
-        {
-            "update_id": 123,
-            "message": {
-                "message_id": 10,
-                "date": int(NOW.timestamp()),
-                "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-                "from": {"id": 42, "is_bot": False, "first_name": "Actor"},
-                "text": text,
-                "entities": [{"type": "bot_command", "offset": 0, "length": len(command)}],
-            },
-        },
-        context={"bot": bot},
+    router.get_chat_member.return_value = SimpleNamespace(status="owner")
+    group = raw.types.Chat(
+        id=100,
+        title="Test",
+        photo=raw.types.ChatPhotoEmpty(),
+        participants_count=2,
+        date=int(NOW.timestamp()),
+        version=1,
     )
+    actor = raw.types.User(
+        id=42, first_name="Actor", access_hash=42, usernames=[], restriction_reason=[]
+    )
+    message = raw.types.Message(
+        id=10,
+        peer_id=raw.types.PeerChat(chat_id=100),
+        from_id=raw.types.PeerUser(user_id=42),
+        date=int(NOW.timestamp()),
+        message=text,
+        entities=[],
+        restriction_reason=[],
+    )
+    update = raw.types.UpdateNewMessage(message=message, pts=1, pts_count=1)
+    sent = asyncio.Event()
+
+    async def deliver(*_args, **_kwargs):
+        sent.set()
+
     with (
-        patch.object(
-            Bot,
-            "get_chat_member",
-            new_callable=AsyncMock,
-            return_value=SimpleNamespace(status="creator"),
+        patch(
+            "summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock, side_effect=deliver
         ),
-        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock),
-        patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
+        patch("summon.bot.handlers.send_card", new_callable=AsyncMock, side_effect=deliver),
     ):
-        await dp.feed_update(bot, update)
+        await router.dispatcher.start()
+        try:
+            await router.dispatcher.updates_queue.put((update, {42: actor}, {100: group}))
+            await asyncio.wait_for(sent.wait(), 2)
+        finally:
+            await router.dispatcher.stop()
     for name in ("list", "get", "save", "delete"):
         assert getattr(store.notes, name).await_count == (1 if name == method else 0)
-    await bot.session.close()
 
 
 async def test_note_menu_commands_give_private_chat_guidance_without_querying_other_groups():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     message.chat = SimpleNamespace(id=42, type="private", title=None)
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as response:
         await handler(router, "list_notes")(message)
@@ -269,15 +306,11 @@ async def test_note_menu_commands_give_private_chat_guidance_without_querying_ot
 
 
 async def test_public_notes_use_standard_escaped_text_even_when_rich_output_is_enabled():
-    _, store, bot, message = setup()
+    router, store, bot, message = await setup()
     bot.get_chat_member.return_value = SimpleNamespace(status="member")
-    router = build_router(
-        store, Settings(bot_api_rich_enabled=True, _env_file=None), rich_client=object()
-    )
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public:
         await handler(router, "show_note")(message, SimpleNamespace(args="hello"))
-    assert public.await_args.kwargs["rich_client"] is None
-    assert public.await_args.kwargs["bot_api_rich"] is False
+    assert public.await_args.kwargs["rich"] is False
     assert "&lt;b&gt;safe &amp; public&lt;/b&gt;\nSecond line" in public.await_args.args[
         2
     ].telegram_html(premium=False)
@@ -286,7 +319,7 @@ async def test_public_notes_use_standard_escaped_text_even_when_rich_output_is_e
 async def test_notes_and_guidance_use_ios_icons_without_changing_privacy():
     from summon.bot.presentation import Emoji
 
-    router, _, _, message = setup()
+    router, _, _, message = await setup()
     with (
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,

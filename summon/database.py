@@ -6,10 +6,17 @@ use a replica set or sharded cluster. No non-transactional fallback is provided.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
-from pymongo.errors import CollectionInvalid, OperationFailure
+from pymongo.errors import (
+    CollectionInvalid,
+    OperationFailure,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 from summon.auto_replies import (
     AUTO_REPLY_NAME_PATTERN,
@@ -20,6 +27,16 @@ from summon.auto_replies import (
 )
 from summon.config import Settings
 from summon.group_notes import MAX_NOTE_LENGTH, MAX_NOTES, NOTE_NAME_PATTERN, NOTE_REVISION_PATTERN
+from summon.rarities import MAX_SPAWN_WEIGHT, RARITY_VALUES, RARITY_WEIGHTS
+
+logger = logging.getLogger(__name__)
+
+# Retry the read-only startup ping for transient cluster/network availability.
+# The existing short per-operation server selection timeout remains unchanged.
+_MONGO_STARTUP_RETRY_DELAYS = (1, 2, 4, 5, 5)
+# The web API can stay live but unready while a read-only ping retries. After
+# short initial attempts, cap its background retry rate to avoid a tight loop.
+_MONGO_BACKGROUND_RETRY_DELAYS = (1, 2, 4, 5, 5, 30, 60, 120, 300)
 
 _NUMBER = ["int", "long"]
 COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -31,9 +48,43 @@ COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "name": {"bsonType": "string", "minLength": 1, "maxLength": 120},
             "name_key": {"bsonType": "string"},
             "category": {"bsonType": "string", "maxLength": 120},
-            "rarity": {"enum": ["common", "rare", "epic", "legendary"]},
+            "rarity": {"enum": list(RARITY_VALUES)},
+            "number": {"bsonType": _NUMBER, "minimum": 1, "maximum": 2**53 - 1},
+            "media_type": {"enum": ["photo", "video", "animation"]},
+            "telegram_file_id": {"bsonType": ["string", "null"], "maxLength": 2048},
             "active": {"bsonType": "bool"},
             "random_key": {"bsonType": "double", "minimum": 0, "maximum": 1},
+        },
+    },
+    "catalog_counters": {
+        "bsonType": "object",
+        "required": ["_id", "last_number"],
+        "additionalProperties": False,
+        "properties": {
+            "_id": {"enum": ["characters"]},
+            "last_number": {"bsonType": _NUMBER, "minimum": 0, "maximum": 2**53 - 1},
+        },
+    },
+    "spawn_weights": {
+        "bsonType": "object",
+        "required": ["_id", "weight", "updated_by", "updated_at"],
+        "additionalProperties": False,
+        "properties": {
+            "_id": {"enum": list(RARITY_WEIGHTS)},
+            "weight": {"bsonType": _NUMBER, "minimum": 0, "maximum": MAX_SPAWN_WEIGHT},
+            "updated_by": {"bsonType": _NUMBER, "minimum": 1, "maximum": 2**53 - 1},
+            "updated_at": {"bsonType": "date"},
+        },
+    },
+    "character_artworks": {
+        "bsonType": "object",
+        "required": ["_id", "content", "content_type", "created_at"],
+        "additionalProperties": False,
+        "properties": {
+            "_id": {"bsonType": "string", "pattern": "^[0-9a-f]{64}$"},
+            "content": {"bsonType": "binData"},
+            "content_type": {"enum": ["image/jpeg"]},
+            "created_at": {"bsonType": "date"},
         },
     },
     "inventory": {
@@ -175,6 +226,10 @@ COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
 # Every list/read path is bounded and uses one of these indexes or the _id index.
 INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
     "characters": [
+        (
+            [("number", ASCENDING)],
+            {"unique": True, "partialFilterExpression": {"number": {"$exists": True}}},
+        ),
         ([("active", ASCENDING), ("name_key", ASCENDING), ("_id", ASCENDING)], {}),
         (
             [
@@ -266,7 +321,7 @@ POLLER_HEALTH_SCHEMA: dict[str, Any] = {
     "required": ["_id", "observed_at", "expires_at"],
     "additionalProperties": False,
     "properties": {
-        "_id": {"bsonType": "string", "pattern": "^poller:[0-9a-f]{64}$"},
+        "_id": {"bsonType": "string", "pattern": "^(poller|mtproto):[0-9a-f]{64}$"},
         "observed_at": {"bsonType": "date"},
         "expires_at": {"bsonType": "date"},
     },
@@ -299,6 +354,47 @@ async def initialize_database(database: Any, *, include_poller_health: bool = Fa
 
 class DatabaseTopologyError(RuntimeError):
     """The connected deployment cannot be used for transactional writes."""
+
+
+class DatabaseStartupError(RuntimeError):
+    """A redacted runtime-startup failure; server details stay out of logs."""
+
+
+def safe_startup_error(exc: PyMongoError) -> DatabaseStartupError:
+    """Provide guidance without echoing driver messages, hosts or credentials.
+
+    The driver may include server addresses and other sensitive connection
+    details in its message. Inspect fixed markers only; callers must raise the
+    resulting error with `from None` to suppress the original exception chain.
+    """
+    if isinstance(exc, ServerSelectionTimeoutError):
+        detail = str(exc)[:16384].upper()
+        if "CERTIFICATE_VERIFY_FAILED" in detail:
+            return DatabaseStartupError(
+                "MongoDB TLS certificate verification failed. Check the cluster's certificate "
+                "and the runtime's trusted CA configuration; do not disable TLS verification."
+            )
+        if "SSL HANDSHAKE FAILED" in detail or "TLSV1_ALERT_INTERNAL_ERROR" in detail:
+            return DatabaseStartupError(
+                "MongoDB TLS handshake failed during server selection. Check the cluster is "
+                "active, its project IP access list includes all hosting-service outbound IP "
+                "ranges, and routing and TLS settings are correct. The cause cannot be "
+                "determined from this alert alone; do not disable TLS verification."
+            )
+        return DatabaseStartupError(
+            "MongoDB server selection timed out. Check the cluster is running, the "
+            "service's outbound IP access list, network routing, URI and TLS settings. "
+            "The cause cannot be determined from the timeout alone."
+        )
+    if isinstance(exc, OperationFailure) and exc.code in {13, 18}:
+        return DatabaseStartupError(
+            "MongoDB authentication or authorization failed. Check the configured database "
+            "user and permissions, without sharing credentials."
+        )
+    return DatabaseStartupError(
+        "MongoDB startup failed. Check the URI, network access, TLS, cluster status "
+        "and database-user permissions."
+    )
 
 
 async def require_transaction_topology(client: Any) -> None:
@@ -345,7 +441,53 @@ async def require_transaction_topology(client: Any) -> None:
         )
 
 
-async def connect_database(settings: Settings) -> tuple[AsyncMongoClient, Any]:
+async def _ping_with_startup_retries(
+    client: AsyncMongoClient, *, wait_until_available: bool = False
+) -> None:
+    """Retry only the read-only ping; never repeat schema or index writes.
+
+    Workers use bounded startup retries. The web API can instead continue with
+    capped backoff while serving liveness and reporting unready. Authentication
+    and recognized certificate-verification failures always fail immediately.
+    """
+    delays = _MONGO_BACKGROUND_RETRY_DELAYS if wait_until_available else _MONGO_STARTUP_RETRY_DELAYS
+    failures = 0
+    while True:
+        try:
+            await client.admin.command("ping")
+            return
+        except ServerSelectionTimeoutError as exc:
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc)[:16384].upper():
+                raise
+            if not wait_until_available and failures >= len(delays):
+                raise
+            delay = delays[min(failures, len(delays) - 1)]
+            failures += 1
+            if wait_until_available:
+                # Only fixed, redacted diagnostics reach logs; the driver
+                # exception can contain hosts, connection strings or secrets.
+                logger.warning(
+                    "API database is not ready (attempt %d). %s Retrying the read-only ping "
+                    "in %d seconds.",
+                    failures,
+                    safe_startup_error(exc),
+                    delay,
+                )
+            else:
+                logger.warning(
+                    "MongoDB server selection failed during startup (attempt %d of %d); "
+                    "retrying the read-only ping in %d seconds. Check cluster and network "
+                    "access if the failure persists.",
+                    failures,
+                    len(delays) + 1,
+                    delay,
+                )
+            await asyncio.sleep(delay)
+
+
+async def connect_database(
+    settings: Settings, *, wait_until_available: bool = False
+) -> tuple[AsyncMongoClient, Any]:
     if not settings.mongo_uri.get_secret_value():
         raise RuntimeError("SUMMON_MONGO_URI is required to connect to MongoDB")
     client: AsyncMongoClient = AsyncMongoClient(
@@ -357,7 +499,7 @@ async def connect_database(settings: Settings) -> tuple[AsyncMongoClient, Any]:
         retryWrites=True,
     )
     try:
-        await client.admin.command("ping")
+        await _ping_with_startup_retries(client, wait_until_available=wait_until_available)
         await require_transaction_topology(client)
         database = client[settings.mongo_database]
         await initialize_database(database, include_poller_health=settings.poller_heartbeat_enabled)

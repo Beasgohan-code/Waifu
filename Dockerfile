@@ -1,16 +1,9 @@
-# The frontend is built separately and only its output enters the runtime image.
-FROM node:22.23.4-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d AS frontend
-WORKDIR /build
-COPY web/package.json web/package-lock.json ./
-RUN npm ci
-COPY web/ ./
-RUN npm run build
-
+# Render runs only the backend and bot; Vercel builds the Mini App separately.
 FROM python:3.11.18-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39 AS runtime
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    SUMMON_WEB_DIST=/app/web/dist \
+    SUMMON_RUN_BOT_WORKER=true \
     PATH=/app/.venv/bin:$PATH
 
 COPY pyproject.toml uv.lock README.md ./
@@ -27,11 +20,11 @@ RUN printf '%s\n' 'uv==0.13.7 \
     && /usr/local/bin/python -m pip uninstall -y uv \
     && rm -rf /tmp/uv-requirements.txt /root/.cache
 
-COPY --from=frontend /build/dist/ /app/web/dist/
 RUN groupadd --system --gid 10001 summon \
     && useradd --system --uid 10001 --gid summon --home-dir /app --shell /usr/sbin/nologin summon
 USER 10001:10001
 EXPOSE 10000
-# Render supplies PORT; other environments default to 8000. For the separate
-# single-instance polling worker, override this command with summon-bot.
+# Render supplies PORT; other environments default to 8000. This API process
+# also supervises the single lease-coordinated native bot worker by default.
+# Static hosting remains opt-in; the Vercel Mini App is deployed separately.
 CMD ["summon-api"]

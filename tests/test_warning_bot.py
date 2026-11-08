@@ -1,15 +1,17 @@
 """Warning review commands reauthorize, scope targets and keep responses private."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
-from aiogram.methods import GetChatMember
 from pymongo.errors import AutoReconnect
+from wzgram import Client, raw
+from wzgram.enums import ChatType
+from wzgram.types import Chat, Message, User
 
-from summon.bot.handlers import build_router
+from summon.bot.handlers import register_handlers
 from summon.config import Settings
 
 WARNING_ID = "a" * 32
@@ -17,7 +19,7 @@ CURSOR = "b" * 32
 NOW = datetime(2026, 11, 5, tzinfo=UTC)
 
 
-def setup():
+async def setup():
     groups = SimpleNamespace(
         db=object(),
         list_warnings=AsyncMock(
@@ -44,13 +46,24 @@ def setup():
         groups=groups,
         limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
     )
-    router = build_router(store, Settings(_env_file=None))
-    bot = SimpleNamespace(
-        id=99,
-        get_chat_member=AsyncMock(
-            return_value=SimpleNamespace(status="administrator", can_restrict_members=True)
-        ),
+    router = Client(
+        "offline-test",
+        api_id=123,
+        api_hash="test",
+        bot_token="123:fake",
+        in_memory=True,
+        workers=1,
+        skip_updates=True,
     )
+    router.me = User(id=99, is_bot=True, username="summon_test", first_name="Bot")
+    router.get_chat_member = AsyncMock(
+        return_value=SimpleNamespace(
+            status="administrator", privileges=SimpleNamespace(can_restrict_members=True)
+        )
+    )
+    bot = router
+    register_handlers(router, store, Settings(_env_file=None))
+    await asyncio.sleep(0)
     message = SimpleNamespace(
         from_user=SimpleNamespace(
             id=42, is_bot=False, first_name="Actor", last_name=None, username=None
@@ -63,16 +76,30 @@ def setup():
         message_thread_id=None,
         ephemeral_message_id=None,
         bot=bot,
+        text="/test",
+        caption=None,
+        command=["test"],
     )
     return router, store, bot, message
 
 
 def handler(router, name):
-    return next(item.callback for item in router.message.handlers if item.callback.__name__ == name)
+    callback = next(
+        item.callback for item in router.dispatcher.groups[0] if item.callback.__name__ == name
+    )
+
+    async def invoke(message, args=None):
+        command = {"review_warnings": "warnings"}.get(name, name)
+        message.command = [command]
+        argument = getattr(args, "args", None)
+        message.text = "/" + command + (" " + argument if argument else "")
+        return await callback(router, message)
+
+    return invoke
 
 
 async def test_warning_list_checks_live_actor_and_sends_sensitive_result_privately():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with (
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
@@ -90,11 +117,11 @@ async def test_warning_list_checks_live_actor_and_sends_sensitive_result_private
 
 
 async def test_warning_list_cursor_is_bounded_and_role_rechecked_on_every_page():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock):
         await handler(router, "review_warnings")(message, SimpleNamespace(args=CURSOR))
         bot.get_chat_member.return_value = SimpleNamespace(
-            status="administrator", can_restrict_members=False
+            status="administrator", privileges=SimpleNamespace(can_restrict_members=False)
         )
         await handler(router, "review_warnings")(message, SimpleNamespace(args=CURSOR))
     assert store.groups.list_warnings.await_count == 1
@@ -104,7 +131,7 @@ async def test_warning_list_cursor_is_bounded_and_role_rechecked_on_every_page()
 
 @pytest.mark.parametrize("args", [None, WARNING_ID, f"{WARNING_ID} yes", f"{'x' * 32} confirm"])
 async def test_unwarn_requires_explicit_valid_id_and_confirm_keyword(args):
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock):
         await handler(router, "unwarn")(message, SimpleNamespace(args=args))
     store.groups.revoke_warning.assert_not_awaited()
@@ -112,7 +139,7 @@ async def test_unwarn_requires_explicit_valid_id_and_confirm_keyword(args):
 
 
 async def test_unwarn_uses_replied_target_current_actor_and_private_confirmation():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with (
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,
@@ -134,7 +161,7 @@ async def test_unwarn_uses_replied_target_current_actor_and_private_confirmation
 
 
 async def test_unwarn_denied_for_lost_permission_or_rate_limit():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock):
         bot.get_chat_member.return_value = SimpleNamespace(status="member")
         await handler(router, "unwarn")(message, SimpleNamespace(args=f"{WARNING_ID} confirm"))
@@ -145,7 +172,7 @@ async def test_unwarn_denied_for_lost_permission_or_rate_limit():
 
 
 async def test_reply_to_sender_chat_is_not_treated_as_a_user_target():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     message.reply_to_message.sender_chat = SimpleNamespace(id=-200)
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock):
         await handler(router, "unwarn")(message, SimpleNamespace(args=f"{WARNING_ID} confirm"))
@@ -156,10 +183,8 @@ async def test_reply_to_sender_chat_is_not_treated_as_a_user_target():
 
 
 async def test_telegram_lookup_error_is_sanitized_and_fails_closed():
-    router, store, bot, message = setup()
-    bot.get_chat_member.side_effect = TelegramNetworkError(
-        method=GetChatMember(chat_id=-100, user_id=42), message="secret network details"
-    )
+    router, store, bot, message = await setup()
+    bot.get_chat_member.side_effect = ConnectionError("secret network details")
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private:
         await handler(router, "review_warnings")(message, SimpleNamespace(args=None))
     assert "secret network details" not in private.await_args.args[3].telegram_html(premium=False)
@@ -167,7 +192,7 @@ async def test_telegram_lookup_error_is_sanitized_and_fails_closed():
 
 
 async def test_uncertain_revoke_is_not_retried_and_tells_admin_to_review():
-    router, store, bot, message = setup()
+    router, store, bot, message = await setup()
     store.groups.revoke_warning.side_effect = AutoReconnect("sensitive connection details")
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private:
         await handler(router, "unwarn")(message, SimpleNamespace(args=f"{WARNING_ID} confirm"))
@@ -184,55 +209,59 @@ async def test_uncertain_revoke_is_not_retried_and_tells_admin_to_review():
         (f"/unwarn {WARNING_ID} confirm Error", "revoke"),
     ],
 )
-async def test_aiogram_dispatches_each_warning_command_once(text, expected):
-    from aiogram import Bot, Dispatcher
-    from aiogram.types import Update
-
-    router, store, _, _ = setup()
+async def test_wzgram_dispatches_each_warning_command_once(text, expected):
+    router, store, _, _ = await setup()
     store.groups.get = AsyncMock(return_value=None)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = Dispatcher()
-    dp.include_router(router)
-    command = text.split()[0]
-    raw = {
-        "update_id": 123,
-        "message": {
-            "message_id": 10,
-            "date": int(NOW.timestamp()),
-            "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-            "from": {"id": 42, "is_bot": False, "first_name": "Actor"},
-            "text": text,
-            "entities": [{"type": "bot_command", "offset": 0, "length": len(command)}],
-            "reply_to_message": {
-                "message_id": 9,
-                "date": int(NOW.timestamp()),
-                "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-                "from": {"id": 55, "is_bot": False, "first_name": "Target"},
-                "text": "Hello",
-            },
-        },
-    }
-    update = Update.model_validate(raw, context={"bot": bot})
-    with (
-        patch.object(
-            Bot,
-            "get_chat_member",
-            new_callable=AsyncMock,
-            return_value=SimpleNamespace(status="creator"),
-        ),
-        patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
-    ):
-        await dp.feed_update(bot, update)
+    router.get_chat_member.return_value = SimpleNamespace(status="owner")
+    group = raw.types.Chat(
+        id=100,
+        title="Test",
+        photo=raw.types.ChatPhotoEmpty(),
+        participants_count=2,
+        date=int(NOW.timestamp()),
+        version=1,
+    )
+    actor = raw.types.User(
+        id=42, first_name="Actor", access_hash=42, usernames=[], restriction_reason=[]
+    )
+    target = User(id=55, is_bot=False, first_name="Target")
+    router.message_cache[(-100, 9)] = Message(
+        id=9, chat=Chat(id=-100, type=ChatType.GROUP), from_user=target
+    )
+    message = raw.types.Message(
+        id=10,
+        peer_id=raw.types.PeerChat(chat_id=100),
+        from_id=raw.types.PeerUser(user_id=42),
+        date=int(NOW.timestamp()),
+        message=text,
+        entities=[],
+        restriction_reason=[],
+        reply_to=raw.types.MessageReplyHeader(reply_to_msg_id=9),
+    )
+    update = raw.types.UpdateNewMessage(message=message, pts=1, pts_count=1)
+    sent = asyncio.Event()
+
+    async def deliver(*_args, **_kwargs):
+        sent.set()
+
+    with patch(
+        "summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock, side_effect=deliver
+    ) as private:
+        await router.dispatcher.start()
+        try:
+            await router.dispatcher.updates_queue.put((update, {42: actor}, {100: group}))
+            await asyncio.wait_for(sent.wait(), 2)
+        finally:
+            await router.dispatcher.stop()
     private.assert_awaited_once()
     assert store.groups.list_warnings.await_count == (1 if expected == "list" else 0)
     assert store.groups.revoke_warning.await_count == (1 if expected == "revoke" else 0)
-    await bot.session.close()
 
 
 async def test_warning_review_uses_summon_alert_without_making_content_public():
     from summon.bot.presentation import Emoji
 
-    router, _, _, message = setup()
+    router, _, _, message = await setup()
     with (
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as private,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as public,

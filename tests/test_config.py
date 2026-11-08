@@ -10,6 +10,8 @@ def test_default_config_contains_no_credentials_or_database_uri():
     assert settings.mongo_uri.get_secret_value() == ""
     assert settings.telegram_api_hash.get_secret_value() == ""
     assert settings.operator_ids == []
+    assert settings.owner_id is None
+    assert settings.startup_dm_enabled is True
 
 
 def test_production_requires_real_secret_and_database_settings():
@@ -25,14 +27,23 @@ def test_production_requires_real_secret_and_database_settings():
         session_secret="x" * 40,
         mongo_uri="mongodb://example.invalid/summon",
         webapp_url="https://summon.example/app",
+        telegram_api_id=12345,
+        telegram_api_hash="test-hash",
         _env_file=None,
     )
     assert settings.environment == "production"
 
 
-def test_rich_client_requires_telegram_application_credentials():
-    with pytest.raises(ValueError):
-        Settings(rich_enabled=True, _env_file=None)
+def test_production_wzgram_requires_telegram_application_credentials():
+    with pytest.raises(ValueError, match="SUMMON_TELEGRAM_API_ID"):
+        Settings(
+            environment="production",
+            bot_token="123:token",
+            session_secret="x" * 40,
+            mongo_uri="mongodb://example.invalid/summon",
+            webapp_url="https://summon.example",
+            _env_file=None,
+        )
 
 
 def test_origins_must_be_exact_hosts_and_https_in_production():
@@ -124,6 +135,8 @@ def test_production_environment_requires_url_before_startup(monkeypatch):
     with pytest.raises(ValueError, match="SUMMON_WEBAPP_URL"):
         Settings(_env_file=None)
     monkeypatch.setenv("SUMMON_WEBAPP_URL", "https://summon.example/app")
+    monkeypatch.setenv("SUMMON_TELEGRAM_API_ID", "12345")
+    monkeypatch.setenv("SUMMON_TELEGRAM_API_HASH", "test-hash")
     assert Settings(_env_file=None).webapp_url == "https://summon.example/app"
 
 
@@ -202,3 +215,254 @@ def test_allowlist_requires_browser_serialized_origins(origin):
 )
 def test_browser_serialized_origins_are_valid(origin):
     assert Settings(allowed_origins=[origin], _env_file=None).allowed_origins == [origin]
+
+
+def test_simple_environment_aliases_and_prefixed_precedence(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("SUMMON_MONGO_URI=mongodb://dotenv.invalid/db\nBOT_TOKEN=dotenv-token\n")
+    monkeypatch.setenv("MONGO_URL", "mongodb://environment.invalid/db")
+    monkeypatch.setenv("BOT_TOKEN", "alias-token")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 40)
+    monkeypatch.setenv("API_ID", "1234")
+    monkeypatch.setenv("API_HASH", "fake-hash")
+    monkeypatch.setenv("OWNER_ID", "42")
+    settings = Settings(_env_file=dotenv)
+    assert settings.mongo_uri.get_secret_value() == "mongodb://environment.invalid/db"
+    assert settings.bot_token.get_secret_value() == "alias-token"
+    assert settings.telegram_api_id == 1234
+    assert settings.operator_ids == [42]
+    assert settings.owner_id == 42
+    monkeypatch.setenv("SUMMON_MONGO_URI", "mongodb://prefixed.invalid/db")
+    monkeypatch.setenv("SUMMON_BOT_TOKEN", "")
+    settings = Settings(_env_file=dotenv)
+    assert settings.mongo_uri.get_secret_value() == "mongodb://prefixed.invalid/db"
+    assert settings.bot_token.get_secret_value() == ""
+    explicit = Settings(mongo_uri="mongodb://explicit.invalid/db", _env_file=dotenv)
+    assert explicit.mongo_uri.get_secret_value() == "mongodb://explicit.invalid/db"
+
+
+def test_embedded_bot_worker_is_opt_in_outside_the_docker_image(monkeypatch):
+    monkeypatch.delenv("SUMMON_RUN_BOT_WORKER", raising=False)
+    assert Settings(_env_file=None).run_bot_worker is False
+    monkeypatch.setenv("SUMMON_RUN_BOT_WORKER", "true")
+    assert Settings(_env_file=None).run_bot_worker is True
+    monkeypatch.setenv("SUMMON_RUN_BOT_WORKER", "false")
+    assert Settings(_env_file=None).run_bot_worker is False
+
+
+def test_owner_startup_notification_uses_a_separate_explicit_recipient(monkeypatch):
+    monkeypatch.setenv("OWNER_ID", "42")
+    monkeypatch.setenv("OPERATOR_IDS", "7,8")
+    settings = Settings(_env_file=None)
+    assert settings.owner_id == 42
+    assert settings.operator_ids == [7, 8]
+    monkeypatch.setenv("SUMMON_OWNER_ID", "99")
+    monkeypatch.setenv("SUMMON_STARTUP_DM_ENABLED", "false")
+    settings = Settings(_env_file=None)
+    assert settings.owner_id == 99
+    assert settings.operator_ids == [7, 8]
+    assert settings.startup_dm_enabled is False
+    monkeypatch.delenv("SUMMON_OWNER_ID")
+    monkeypatch.setenv("OWNER_ID", "")
+    assert Settings(_env_file=None).owner_id is None
+
+
+@pytest.mark.parametrize("value", ["0", "-1", str(2**53), "not-a-number", "9" * 100])
+def test_invalid_notification_owner_is_skipped_without_blocking_runtime(monkeypatch, value):
+    monkeypatch.setenv("OPERATOR_IDS", "7,8")
+    monkeypatch.setenv("SUMMON_OWNER_ID", value)
+    settings = Settings(_env_file=None)
+    assert settings.owner_id is None and settings.operator_ids == [7, 8]
+
+
+def test_reference_mongo_db_url_alias_and_existing_precedence(monkeypatch):
+    from summon.config import BackupConnectionSettings
+
+    for name in ("SUMMON_MONGO_URI", "MONGO_URL", "MONGO_URI", "MONGODB_URI", "MONGODB_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MONGO_DB_URL", "mongodb://reference.invalid/collection")
+    for model in (Settings, BackupConnectionSettings):
+        assert model(_env_file=None).mongo_uri.get_secret_value() == (
+            "mongodb://reference.invalid/collection"
+        )
+    monkeypatch.setenv("MONGO_URL", "mongodb://existing-alias.invalid/collection")
+    assert Settings(_env_file=None).mongo_uri.get_secret_value() == (
+        "mongodb://existing-alias.invalid/collection"
+    )
+    monkeypatch.setenv("SUMMON_MONGO_URI", "mongodb://prefixed.invalid/collection")
+    assert Settings(_env_file=None).mongo_uri.get_secret_value() == (
+        "mongodb://prefixed.invalid/collection"
+    )
+
+
+def test_bad_alias_values_are_not_exposed_in_errors(monkeypatch):
+    monkeypatch.setenv("OWNER_ID", "FAKE_SECRET_OWNER_SENTINEL")
+    with pytest.raises(ValueError) as error:
+        Settings(_env_file=None)
+    assert "FAKE_SECRET_OWNER_SENTINEL" not in str(error.value)
+
+
+def test_simple_mixed_case_names_and_multiple_operators(monkeypatch):
+    monkeypatch.setenv("Api_Id", "1234")
+    monkeypatch.setenv("API_Hash", "synthetic-hash")
+    monkeypatch.setenv("MONGODB_URL", "mongodb://example.invalid/summon")
+    monkeypatch.setenv("DB_NAME", "collection")
+    monkeypatch.setenv("TELEGRAM_SESSION_DB", "separate_sessions")
+    monkeypatch.setenv("OPERATOR_IDS", "42, 101,42")
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://app.example, https://other.example")
+    settings = Settings(_env_file=None)
+    assert settings.telegram_api_id == 1234
+    assert settings.telegram_api_hash.get_secret_value() == "synthetic-hash"
+    assert settings.mongo_uri.get_secret_value() == "mongodb://example.invalid/summon"
+    assert settings.mongo_database == "collection"
+    assert settings.telegram_session_database == "separate_sessions"
+    assert settings.operator_ids == [42, 101]
+    assert settings.allowed_origins == ["https://app.example", "https://other.example"]
+
+
+def test_simple_lists_allow_json_empty_and_single_owner(monkeypatch):
+    monkeypatch.setenv("OPERATOR_IDS", '[7, "8"]')
+    monkeypatch.setenv("OWNER_ID", "42")
+    monkeypatch.setenv("ALLOWED_ORIGINS", '["https://app.example"]')
+    assert Settings(_env_file=None).operator_ids == [7, 8]
+    assert Settings(_env_file=None).allowed_origins == ["https://app.example"]
+    monkeypatch.delenv("OPERATOR_IDS")
+    assert Settings(_env_file=None).operator_ids == [42]
+    monkeypatch.setenv("OWNER_ID", "")
+    assert Settings(_env_file=None).operator_ids == []
+
+
+@pytest.mark.parametrize("value", ["0", "-1", str(2**53), "42,,43"])
+def test_invalid_operator_aliases_are_rejected_without_reflecting_values(monkeypatch, value):
+    monkeypatch.setenv("OPERATOR_IDS", value)
+    with pytest.raises(ValueError) as error:
+        Settings(_env_file=None)
+    assert "42,,43" not in str(error.value)
+
+
+def test_invalid_alias_list_never_echoes_the_input(monkeypatch):
+    monkeypatch.setenv("OPERATOR_IDS", "[PRIVATE_TEST_SENTINEL")
+    with pytest.raises(ValueError) as error:
+        Settings(_env_file=None)
+    assert "PRIVATE_TEST_SENTINEL" not in str(error.value)
+
+
+def test_short_and_prefixed_aliases_keep_per_source_precedence(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("SUMMON_TELEGRAM_API_HASH=dotenv-hash\nSUMMON_OPERATOR_IDS=[5]\n")
+    monkeypatch.setenv("API_Hash", "environment-hash")
+    monkeypatch.setenv("OWNER_ID", "99")
+    settings = Settings(_env_file=dotenv)
+    assert settings.telegram_api_hash.get_secret_value() == "environment-hash"
+    assert settings.operator_ids == [99]
+    monkeypatch.setenv("SUMMON_TELEGRAM_API_HASH", "")
+    monkeypatch.setenv("SUMMON_OPERATOR_IDS", "[]")
+    settings = Settings(_env_file=dotenv)
+    assert settings.telegram_api_hash.get_secret_value() == ""
+    assert settings.operator_ids == []
+
+
+def test_example_env_loads_without_credentials_or_an_operator():
+    import os
+    from pathlib import Path
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(_env_file=Path(__file__).resolve().parents[1] / ".env.example")
+    assert settings.environment == "development"
+    assert settings.operator_ids == [] and settings.telegram_api_id is None
+    assert settings.bot_token.get_secret_value() == ""
+    assert settings.mongo_uri.get_secret_value() == ""
+    assert settings.telegram_session_database != settings.mongo_database
+
+
+def test_imgbb_and_channel_aliases_are_optional_and_mixed_case(monkeypatch):
+    monkeypatch.setenv("Imgbb_key", "FAKE_IMG_HOST_KEY")
+    monkeypatch.setenv("DB_CHANNEL", "-1001234567890")
+    settings = Settings(_env_file=None)
+    assert settings.artwork_backend == "mongo"  # The legacy backend stays unchanged.
+    assert settings.imgbb_key.get_secret_value() == "FAKE_IMG_HOST_KEY"
+    assert settings.db_channel == -1001234567890
+    assert "FAKE_IMG_HOST_KEY" not in repr(settings)
+    monkeypatch.setenv("ARTWORK_BACKEND", "imgbb")
+    assert Settings(_env_file=None).artwork_backend == "imgbb"
+    monkeypatch.setenv("SUMMON_IMGBB_KEY", "")
+    with pytest.raises(ValueError, match="IMGBB_KEY") as error:
+        Settings(_env_file=None)
+    assert "FAKE_IMG_HOST_KEY" not in str(error.value)
+
+
+def test_channel_and_host_configuration_fail_closed(monkeypatch):
+    monkeypatch.setenv("ARTWORK_BACKEND", "imgbb")
+    with pytest.raises(ValueError, match="IMGBB_KEY"):
+        Settings(_env_file=None)
+    monkeypatch.setenv("IMGBB_API_KEY", "test-key")
+    for bad in ("0", "123", str(-(2**63)), "not-an-id"):
+        monkeypatch.setenv("DB_CHANNEL_ID", bad)
+        with pytest.raises(ValueError):
+            Settings(_env_file=None)
+    monkeypatch.setenv("DB_CHANNEL_ID", "")
+    assert Settings(_env_file=None).db_channel is None
+
+
+def test_optional_catbox_userhash_alias_is_secret_and_prefixed_value_wins(monkeypatch):
+    monkeypatch.setenv("CATBOX_USERHASH", "FAKE_USERHASH")
+    settings = Settings(_env_file=None)
+    assert settings.catbox_userhash.get_secret_value() == "FAKE_USERHASH"
+    assert "FAKE_USERHASH" not in repr(settings)
+    monkeypatch.setenv("SUMMON_CATBOX_USERHASH", "")
+    assert Settings(_env_file=None).catbox_userhash.get_secret_value() == ""
+
+
+def test_backup_settings_need_only_mongo_and_exclude_session_database(monkeypatch):
+    from summon.config import BackupConnectionSettings
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("MONGO_URL", "mongodb://example.invalid/summon")
+    monkeypatch.setenv("MONGO_DB_NAME", "summon")
+    monkeypatch.setenv("TELEGRAM_SESSION_DB", "summon_telegram")
+    monkeypatch.setenv("OPERATOR_IDS", "not a list")
+    settings = BackupConnectionSettings(_env_file=None)
+    assert settings.mongo_uri.get_secret_value() == "mongodb://example.invalid/summon"
+    assert settings.mongo_database == "summon"
+    monkeypatch.setenv("TELEGRAM_SESSION_DB", "summon")
+    with pytest.raises(ValueError, match="session database"):
+        BackupConnectionSettings(_env_file=None)
+
+
+def test_synthetic_production_deployment_uses_the_documented_short_names(monkeypatch):
+    values = {
+        "ENVIRONMENT": "production",
+        "BOT_TOKEN": "123456:synthetic-bot-token",
+        "API_ID": "12345",
+        "API_HASH": "synthetic-app-hash",
+        "MONGO_URL": "mongodb://example.invalid:27017/?replicaSet=synthetic",
+        "MONGO_DB_NAME": "summon",
+        "TELEGRAM_SESSION_DB": "summon_telegram",
+        "SESSION_SECRET": "synthetic-session-secret-" + "x" * 32,
+        "WEBAPP_URL": "https://miniapp.example",
+        "OWNER_ID": "42",
+        "ALLOWED_ORIGINS": "https://miniapp.example",
+        "DB_CHANNEL": "-1001234567890",
+        "WEBHOOKS_DISABLED_CONFIRMED": "true",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    settings = Settings(_env_file=None)
+    assert settings.environment == "production"
+    assert settings.telegram_api_id == 12345 and settings.operator_ids == [42]
+    assert (
+        settings.mongo_database == "summon"
+        and settings.telegram_session_database == "summon_telegram"
+    )
+    assert settings.allowed_origins == [settings.webapp_url]
+    assert settings.webhooks_disabled_confirmed and settings.db_channel == -1001234567890
+    # Host and channel settings stay optional, and no credential is represented in logs.
+    assert (
+        settings.imgbb_key.get_secret_value() == ""
+        and settings.catbox_userhash.get_secret_value() == ""
+    )
+    assert all(
+        values[key] not in repr(settings)
+        for key in ("BOT_TOKEN", "API_HASH", "SESSION_SECRET", "MONGO_URL")
+    )

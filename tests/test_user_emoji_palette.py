@@ -1,7 +1,7 @@
 """User-supplied custom emoji IDs remain strings and retain Unicode fallbacks."""
 
 import pytest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from summon.bot.emoji_palette import VECTOR_ICONS, vector_icon
 from summon.bot.presentation import Card, Emoji, fallback_keyboard

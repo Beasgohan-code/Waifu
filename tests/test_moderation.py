@@ -11,7 +11,7 @@ from summon.services.moderation import (
 
 
 def member(status, **rights):
-    return SimpleNamespace(status=status, **rights)
+    return SimpleNamespace(status=status, privileges=SimpleNamespace(**rights))
 
 
 async def test_group_admin_is_checked_live_and_required_right_is_enforced():
@@ -30,10 +30,10 @@ async def test_group_admin_is_checked_live_and_required_right_is_enforced():
 
 async def test_owner_has_rights_but_cannot_target_an_admin():
     bot = SimpleNamespace(
-        id=99,
+        me=SimpleNamespace(id=99),
         get_chat_member=AsyncMock(
             side_effect=[
-                member("creator"),
+                member("owner"),
                 member("administrator", can_restrict_members=True),
                 member("administrator"),
             ]
@@ -45,9 +45,9 @@ async def test_owner_has_rights_but_cannot_target_an_admin():
 
 async def test_bot_must_have_actual_restriction_permission():
     bot = SimpleNamespace(
-        id=99,
+        me=SimpleNamespace(id=99),
         get_chat_member=AsyncMock(
-            side_effect=[member("creator"), member("administrator", can_restrict_members=False)]
+            side_effect=[member("owner"), member("administrator", can_restrict_members=False)]
         ),
     )
     with pytest.raises(PermissionDenied, match="bot"):
@@ -55,7 +55,7 @@ async def test_bot_must_have_actual_restriction_permission():
 
 
 async def test_self_and_bot_target_are_rejected_before_telegram_call():
-    bot = SimpleNamespace(id=99, get_chat_member=AsyncMock())
+    bot = SimpleNamespace(me=SimpleNamespace(id=99), get_chat_member=AsyncMock())
     with pytest.raises(PermissionDenied):
         await require_moderation_rights(bot, -100, 1, 1)
     with pytest.raises(PermissionDenied):

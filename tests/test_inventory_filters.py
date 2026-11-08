@@ -155,3 +155,80 @@ def test_read_only_preview_supports_real_duplicate_filter_and_sort():
         result = client.get("/api/inventory?sort=copies").json()["data"]
         assert [entry["id"] for entry in result["items"]] == ["ren", "aiko"]
         assert client.get("/api/inventory?sort=not-a-sort").status_code == 422
+
+
+def test_cursor_api_requires_session_scopes_to_actor_and_rate_limits():
+    repository = SimpleNamespace(
+        inventory_cursor=AsyncMock(
+            return_value={
+                "items": [],
+                "total": 0,
+                "page": 1,
+                "limit": 10,
+                "page_cursor": None,
+                "next_cursor": None,
+            }
+        )
+    )
+    limiter = SimpleNamespace(allow=AsyncMock(return_value=True))
+    store = SimpleNamespace(
+        catalog=repository,
+        users=SimpleNamespace(touch=AsyncMock()),
+        auth=SimpleNamespace(consume=AsyncMock(return_value=True)),
+        sessions=fake_sessions(),
+        limiter=limiter,
+    )
+    with TestClient(
+        create_app(
+            settings=Settings(bot_token=TOKEN, session_secret=SECRET, _env_file=None), store=store
+        )
+    ) as client:
+        assert client.get("/api/inventory/pages").status_code == 401
+        assert sign_in(client, 123).status_code == 200
+        response = client.get(
+            "/api/inventory/pages?user_id=999&favorite=true&duplicates=true&sort=copies&limit=10"
+        )
+        assert response.status_code == 200
+        repository.inventory_cursor.assert_awaited_once_with(
+            123, secret=SECRET, cursor=None, limit=10, favorite=True, duplicates=True, sort="copies"
+        )
+        assert limiter.allow.await_args.args[0] == "user:123:inventory-pages"
+        assert client.get("/api/inventory/pages?sort=invalid").status_code == 422
+        assert client.get("/api/inventory/pages?limit=51").status_code == 422
+        limiter.allow.return_value = False
+        assert client.get("/api/inventory/pages").status_code == 429
+
+
+def test_cursor_api_reports_invalid_expired_and_unsupported_explicitly():
+    from summon.repositories.inventory_paging import (
+        CursorDataError,
+        CursorExpired,
+        CursorInvalid,
+        CursorUnavailable,
+    )
+
+    repository = SimpleNamespace(inventory_cursor=AsyncMock())
+    store = SimpleNamespace(
+        catalog=repository,
+        users=SimpleNamespace(touch=AsyncMock()),
+        auth=SimpleNamespace(consume=AsyncMock(return_value=True)),
+        sessions=fake_sessions(),
+        limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
+    )
+    with TestClient(
+        create_app(
+            settings=Settings(bot_token=TOKEN, session_secret=SECRET, _env_file=None), store=store
+        )
+    ) as client:
+        assert sign_in(client, 123).status_code == 200
+        for error, status, text in [
+            (CursorInvalid("private detail"), 400, "Invalid collection cursor"),
+            (CursorExpired("private detail"), 409, "snapshot expired"),
+            (CursorUnavailable("private detail"), 503, "Stable collection pages"),
+            (CursorDataError("private detail"), 503, "needs repair"),
+        ]:
+            repository.inventory_cursor.side_effect = error
+            response = client.get("/api/inventory/pages?cursor=test")
+            assert response.status_code == status
+            assert text in response.json()["error"]["message"]
+            assert "private detail" not in response.text

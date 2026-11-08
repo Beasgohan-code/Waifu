@@ -108,7 +108,7 @@ it('wires the native shortcut to the real collection and hides it while a detail
     const data = url === '/api/bootstrap' ? { preview: true, collection_button_emoji: emoji } :
       url === '/api/me' ? profile : url === '/api/progression' ? { achievements: [], daily: [] } :
       url === '/api/characters/aiko' ? character : url.startsWith('/api/characters?') ? page :
-      url.startsWith('/api/inventory?') ? { ...page, items: [], total: 0 } : {};
+      url.startsWith('/api/inventory/pages?') ? { ...page, items: [], total: 0, page_cursor: null, next_cursor: null } : {};
     return Promise.resolve(new Response(JSON.stringify({ data }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
   });
   vi.stubGlobal('fetch', fetcher);
