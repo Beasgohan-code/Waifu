@@ -11,7 +11,10 @@ from summon.services.moderation import _has_right
 
 
 def get_store(request: Request) -> Any:
-    return request.app.state.store
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Database is not ready; try again")
+    return store
 
 
 async def get_current_session(request: Request) -> BoundSession:
@@ -34,7 +37,7 @@ async def get_current_session(request: Request) -> BoundSession:
         raise HTTPException(
             status_code=401, detail="Your session has expired; reopen SUMMON in Telegram"
         ) from exc
-    if not await request.app.state.store.sessions.is_active(
+    if not await get_store(request).sessions.is_active(
         session.session_id, session.user.id, datetime.now(UTC)
     ):
         raise HTTPException(401, "Your session has expired; reopen SUMMON in Telegram")
@@ -50,7 +53,7 @@ async def get_current_user(request: Request) -> TelegramUser:
 async def limit_action(
     request: Request, user: TelegramUser, action: str, *, limit: int = 30
 ) -> None:
-    if not await request.app.state.store.limiter.allow(
+    if not await get_store(request).limiter.allow(
         f"user:{user.id}:{action}", limit=limit, seconds=60
     ):
         raise HTTPException(status_code=429, detail="Too many requests; please try again shortly")

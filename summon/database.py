@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 # Retry the read-only startup ping for transient cluster/network availability.
 # The existing short per-operation server selection timeout remains unchanged.
 _MONGO_STARTUP_RETRY_DELAYS = (1, 2, 4, 5, 5)
+# The web API can stay live but unready while a read-only ping retries. After
+# short initial attempts, cap its background retry rate to avoid a tight loop.
+_MONGO_BACKGROUND_RETRY_DELAYS = (1, 2, 4, 5, 5, 30, 60, 120, 300)
 
 _NUMBER = ["int", "long"]
 COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -438,34 +441,53 @@ async def require_transaction_topology(client: Any) -> None:
         )
 
 
-async def _ping_with_startup_retries(client: AsyncMongoClient) -> None:
+async def _ping_with_startup_retries(
+    client: AsyncMongoClient, *, wait_until_available: bool = False
+) -> None:
     """Retry only the read-only ping; never repeat schema or index writes.
 
-    Authentication and known certificate-verification failures are not treated
-    as transient. Log only attempt numbers, never raw driver errors or hosts.
+    Workers use bounded startup retries. The web API can instead continue with
+    capped backoff while serving liveness and reporting unready. Authentication
+    and recognized certificate-verification failures always fail immediately.
     """
-    total_attempts = len(_MONGO_STARTUP_RETRY_DELAYS) + 1
-    for attempt, delay in enumerate(_MONGO_STARTUP_RETRY_DELAYS, start=1):
+    delays = _MONGO_BACKGROUND_RETRY_DELAYS if wait_until_available else _MONGO_STARTUP_RETRY_DELAYS
+    failures = 0
+    while True:
         try:
             await client.admin.command("ping")
             return
         except ServerSelectionTimeoutError as exc:
             if "CERTIFICATE_VERIFY_FAILED" in str(exc)[:16384].upper():
                 raise
-            logger.warning(
-                "MongoDB server selection failed during startup (attempt %d of %d); "
-                "retrying the read-only ping in %d seconds. Check cluster and network access "
-                "if the failure persists.",
-                attempt,
-                total_attempts,
-                delay,
-            )
+            if not wait_until_available and failures >= len(delays):
+                raise
+            delay = delays[min(failures, len(delays) - 1)]
+            failures += 1
+            if wait_until_available:
+                # Only fixed, redacted diagnostics reach logs; the driver
+                # exception can contain hosts, connection strings or secrets.
+                logger.warning(
+                    "API database is not ready (attempt %d). %s Retrying the read-only ping "
+                    "in %d seconds.",
+                    failures,
+                    safe_startup_error(exc),
+                    delay,
+                )
+            else:
+                logger.warning(
+                    "MongoDB server selection failed during startup (attempt %d of %d); "
+                    "retrying the read-only ping in %d seconds. Check cluster and network "
+                    "access if the failure persists.",
+                    failures,
+                    len(delays) + 1,
+                    delay,
+                )
             await asyncio.sleep(delay)
-    # The last failure is allowed to propagate to the redacting runtime entry point.
-    await client.admin.command("ping")
 
 
-async def connect_database(settings: Settings) -> tuple[AsyncMongoClient, Any]:
+async def connect_database(
+    settings: Settings, *, wait_until_available: bool = False
+) -> tuple[AsyncMongoClient, Any]:
     if not settings.mongo_uri.get_secret_value():
         raise RuntimeError("SUMMON_MONGO_URI is required to connect to MongoDB")
     client: AsyncMongoClient = AsyncMongoClient(
@@ -477,7 +499,7 @@ async def connect_database(settings: Settings) -> tuple[AsyncMongoClient, Any]:
         retryWrites=True,
     )
     try:
-        await _ping_with_startup_retries(client)
+        await _ping_with_startup_retries(client, wait_until_available=wait_until_available)
         await require_transaction_topology(client)
         database = client[settings.mongo_database]
         await initialize_database(database, include_poller_health=settings.poller_heartbeat_enabled)

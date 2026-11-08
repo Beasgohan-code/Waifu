@@ -62,7 +62,7 @@ _ENV_ALIASES: dict[str, tuple[str, ...]] = {
     "environment": ("ENVIRONMENT",),
     "bot_token": ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
     "session_secret": ("SESSION_SECRET",),
-    "mongo_uri": ("MONGO_URL", "MONGO_URI", "MONGODB_URI", "MONGODB_URL"),
+    "mongo_uri": ("MONGO_URL", "MONGO_URI", "MONGODB_URI", "MONGODB_URL", "MONGO_DB_URL"),
     "mongo_database": ("MONGO_DB_NAME", "DB_NAME", "DATABASE_NAME"),
     "webapp_url": ("WEBAPP_URL", "WEB_APP_URL"),
     "telegram_api_id": ("API_ID", "TELEGRAM_API_ID"),

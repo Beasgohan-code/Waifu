@@ -238,6 +238,26 @@ def test_simple_environment_aliases_and_prefixed_precedence(monkeypatch, tmp_pat
     assert explicit.mongo_uri.get_secret_value() == "mongodb://explicit.invalid/db"
 
 
+def test_reference_mongo_db_url_alias_and_existing_precedence(monkeypatch):
+    from summon.config import BackupConnectionSettings
+
+    for name in ("SUMMON_MONGO_URI", "MONGO_URL", "MONGO_URI", "MONGODB_URI", "MONGODB_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MONGO_DB_URL", "mongodb://reference.invalid/collection")
+    for model in (Settings, BackupConnectionSettings):
+        assert model(_env_file=None).mongo_uri.get_secret_value() == (
+            "mongodb://reference.invalid/collection"
+        )
+    monkeypatch.setenv("MONGO_URL", "mongodb://existing-alias.invalid/collection")
+    assert Settings(_env_file=None).mongo_uri.get_secret_value() == (
+        "mongodb://existing-alias.invalid/collection"
+    )
+    monkeypatch.setenv("SUMMON_MONGO_URI", "mongodb://prefixed.invalid/collection")
+    assert Settings(_env_file=None).mongo_uri.get_secret_value() == (
+        "mongodb://prefixed.invalid/collection"
+    )
+
+
 def test_bad_alias_values_are_not_exposed_in_errors(monkeypatch):
     monkeypatch.setenv("OWNER_ID", "FAKE_SECRET_OWNER_SENTINEL")
     with pytest.raises(ValueError) as error:

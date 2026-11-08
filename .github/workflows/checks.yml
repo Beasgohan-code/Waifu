@@ -192,11 +192,34 @@ jobs:
           fi
           docker exec summon-ci-web sh -c 'test "$(id -u)" -eq 10001 && test -r /app/web/dist/index.html && test ! -e /app/.env && test ! -d /app/web/node_modules'
           docker exec summon-ci-web python -c 'from summon.bot.main import main; assert callable(main)'
+          docker exec summon-ci-web python -c 'import ssl; c = ssl.create_default_context(); assert c.verify_mode == ssl.CERT_REQUIRED and c.check_hostname and c.get_ca_certs()'
           curl --fail --silent http://127.0.0.1:19090/ | grep -q '<div id="root">'
           curl --fail --silent http://127.0.0.1:19090/art/aiko.webp > /dev/null
           curl --fail --silent http://127.0.0.1:19090/api/bootstrap | python -c 'import json,sys; assert json.load(sys.stdin)["data"]["preview"] is True'
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19090/api/not-a-route)" = 404
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST http://127.0.0.1:19090/api/auth/session)" = 403
+      - name: Bind the real HTTP port while the database is unavailable
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This is a closed port inside the test container, never a real database.
+          docker run --detach --name summon-ci-offline --publish 127.0.0.1:19091:10000 \
+            --env PORT=10000 --env 'MONGO_URL=mongodb://127.0.0.1:1/?directConnection=true' summon-ci
+          trap 'docker rm -f summon-ci-offline > /dev/null 2>&1 || true' EXIT
+          live=false
+          for _ in {1..20}; do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:19091/health > /dev/null; then live=true; break; fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' summon-ci-offline)" != true ]]; then break; fi
+            sleep 1
+          done
+          if [[ "$live" != true ]]; then docker logs --tail 30 summon-ci-offline; exit 1; fi
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/health/ready)" = 503
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/api/me)" = 503
+          curl --fail --silent --max-time 2 http://127.0.0.1:19091/api/bootstrap > /dev/null
+          # A failed selection/retry must not close the listening service.
+          sleep 7
+          curl --fail --silent --max-time 2 http://127.0.0.1:19091/health > /dev/null
+          test "$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:19091/health/ready)" = 503
 
   mongodb:
     name: Isolated MongoDB integration

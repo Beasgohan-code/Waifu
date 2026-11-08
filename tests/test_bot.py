@@ -78,6 +78,7 @@ async def test_api_wzgram_client_is_outbound_only_and_in_memory():
         patch("summon.api.app.start_verified_client", AsyncMock()),
     ):
         async with app.router.lifespan_context(app):
+            await app.state.startup_task
             assert app.state.telegram_bot is bot
     assert factory.call_args.kwargs["no_updates"] is True
     storage = factory.call_args.kwargs["storage_engine"]
@@ -342,19 +343,21 @@ async def test_worker_refuses_incomplete_registration_before_connecting(monkeypa
     mongo.close.assert_awaited_once()
 
 
-async def test_api_lifespan_closes_mongo_if_store_initialization_fails():
+async def test_api_lifespan_closes_mongo_if_store_initialization_fails(caplog):
     from summon.api.app import create_app
 
     mongo = MagicMock(close=AsyncMock())
     app = create_app(settings=Settings(_env_file=None))
     with (
         patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
-        patch("summon.api.app.Store", side_effect=RuntimeError("synthetic setup failure")),
-        pytest.raises(RuntimeError, match="synthetic setup failure"),
+        patch("summon.api.app.Store", side_effect=RuntimeError("PRIVATE_SETUP_SENTINEL")),
     ):
         async with app.router.lifespan_context(app):
-            pytest.fail("startup must not finish")
+            await app.state.startup_task
+            assert app.state.store is None and app.state.database is None
     mongo.close.assert_awaited_once()
+    assert "initialization failed (RuntimeError)" in caplog.text
+    assert "PRIVATE_SETUP_SENTINEL" not in caplog.text
 
 
 async def test_api_lifespan_closes_resources_if_startup_is_cancelled():
@@ -375,7 +378,7 @@ async def test_api_lifespan_closes_resources_if_startup_is_cancelled():
 
     async def boot():
         async with app.router.lifespan_context(app):
-            pytest.fail("startup must not finish")
+            await asyncio.Event().wait()
 
     with (
         patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
@@ -409,6 +412,7 @@ async def test_api_lifespan_closes_mongo_even_if_telegram_shutdown_fails():
         pytest.raises(RuntimeError, match="synthetic shutdown failure"),
     ):
         async with app.router.lifespan_context(app):
+            await app.state.startup_task
             assert app.state.telegram_bot is bot
     mongo.close.assert_awaited_once()
 
@@ -432,6 +436,7 @@ async def test_api_reports_telegram_unavailable_without_echoing_startup_error(ca
         ),
     ):
         async with app.router.lifespan_context(app):
+            await app.state.startup_task
             assert app.state.telegram_bot is None
     bot.stop.assert_awaited_once()
     mongo.close.assert_awaited_once()

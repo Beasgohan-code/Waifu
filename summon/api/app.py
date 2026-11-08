@@ -52,7 +52,15 @@ class SessionRequest(BaseModel):
 
 
 def error_response(status: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"code": code, "message": message}},
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
 
 
 def create_app(
@@ -72,8 +80,80 @@ def create_app(
         client = None
         owned_bot = None
         candidate = None
+        startup_task: asyncio.Task[None] | None = None
+        app.state.settings = settings
+        app.state.store = None
+        app.state.database = None
+        app.state.telegram_bot = telegram_bot
+        app.state.startup_task = None
+
+        async def initialize_runtime() -> None:
+            nonlocal client, owned_bot, candidate
+            try:
+                # Only the read-only ping continues in the background; topology,
+                # schema and index initialization are still performed once.
+                client, database = await connect_database(settings, wait_until_available=True)
+                initialized_store = Store(client, database)
+                app.state.database = database
+                app.state.store = initialized_store
+                logger.info("MongoDB initialized; API database operations are available")
+            except PyMongoError as exc:
+                # Never log the driver exception: it may contain hosts or credentials.
+                logger.error("%s", safe_startup_error(exc))
+                return
+            except DatabaseTopologyError:
+                logger.error("MongoDB is not a supported writable transaction topology")
+                return
+            except Exception as exc:
+                logger.error("API database initialization failed (%s)", type(exc).__name__)
+                return
+            finally:
+                if client is not None and app.state.store is None:
+                    try:
+                        await client.close()
+                    except Exception as exc:
+                        logger.warning("MongoDB cleanup failed (%s)", type(exc).__name__)
+                    finally:
+                        client = None
+
+            if (
+                telegram_bot is not None
+                or not settings.bot_token.get_secret_value()
+                or not settings.telegram_api_id
+                or not settings.telegram_api_hash.get_secret_value()
+            ):
+                return
+            # The API session receives no updates and never replaces the single
+            # coordinated bot worker. Only peer records are shared with it.
+            connected_client = client
+            if connected_client is None:
+                return
+            token = settings.bot_token.get_secret_value()
+            try:
+                candidate = Client(
+                    "summon-api",
+                    api_id=settings.telegram_api_id,
+                    api_hash=settings.telegram_api_hash.get_secret_value(),
+                    bot_token=token,
+                    storage_engine=APIStorage(connected_client[settings.telegram_session_database]),
+                    no_updates=True,
+                )
+                async with asyncio.timeout(30):
+                    await start_verified_client(candidate, token, bot_id_from_token(token))
+            except Exception as exc:
+                logger.warning("Telegram group management unavailable (%s)", type(exc).__name__)
+                if candidate is not None:
+                    try:
+                        await candidate.stop()
+                    except Exception as stop_exc:
+                        logger.warning("Telegram cleanup failed (%s)", type(stop_exc).__name__)
+                    candidate = None
+            else:
+                owned_bot = candidate
+                app.state.telegram_bot = candidate
+                candidate = None
+
         try:
-            app.state.settings = settings
             if settings.preview_mode:
                 app.state.preview_cursor_secret = secrets.token_urlsafe(32)
             if store is not None:
@@ -83,54 +163,15 @@ def create_app(
 
                 app.state.store = PreviewStore()
             else:
-                try:
-                    client, database = await connect_database(settings)
-                except PyMongoError as exc:
-                    # Driver exceptions can contain hosts or connection details.
-                    raise safe_startup_error(exc) from None
-                app.state.database = database
-                app.state.store = Store(client, database)
-            if telegram_bot is not None:
-                app.state.telegram_bot = telegram_bot
-            elif (
-                store is None
-                and not settings.preview_mode
-                and client is not None
-                and settings.bot_token.get_secret_value()
-                and settings.telegram_api_id
-                and settings.telegram_api_hash.get_secret_value()
-            ):
-                # Each API process has its own in-memory, no-updates MTProto session.
-                # Only peer records, never auth keys or update state, are shared with
-                # the persistent worker session.
-                token = settings.bot_token.get_secret_value()
-                candidate = Client(
-                    "summon-api",
-                    api_id=settings.telegram_api_id,
-                    api_hash=settings.telegram_api_hash.get_secret_value(),
-                    bot_token=token,
-                    storage_engine=APIStorage(client[settings.telegram_session_database]),
-                    no_updates=True,
-                )
-                try:
-                    async with asyncio.timeout(30):
-                        await start_verified_client(candidate, token, bot_id_from_token(token))
-                except Exception as exc:
-                    logger.warning("Telegram group management unavailable (%s)", type(exc).__name__)
-                    await candidate.stop()
-                    candidate = None
-                    app.state.telegram_bot = None
-                else:
-                    owned_bot = candidate
-                    app.state.telegram_bot = candidate
-                    candidate = None
-            else:
-                app.state.telegram_bot = None
+                # Yield immediately so Uvicorn can bind PORT and serve /health;
+                # database-backed requests remain unavailable until initialized.
+                startup_task = asyncio.create_task(initialize_runtime())
+                app.state.startup_task = startup_task
             yield
         finally:
-            # Startup can fail or be cancelled after MongoDB connects but
-            # before the lifespan yields. Always close the no-updates
-            # client and MongoDB in that case, too.
+            if startup_task is not None:
+                startup_task.cancel()
+                await asyncio.gather(startup_task, return_exceptions=True)
             try:
                 if candidate is not None:
                     await candidate.stop()
@@ -141,14 +182,6 @@ def create_app(
                     await client.close()
 
     app = FastAPI(title="SUMMON API", version="0.1.0", lifespan=lifespan)
-    if settings.allowed_origins:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=settings.allowed_origins,
-            allow_credentials=True,
-            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-            allow_headers=["Content-Type", "X-Summon-Request", "X-Summon-Launch"],
-        )
 
     @app.middleware("http")
     async def security_and_logging(request: Request, call_next: Any) -> Response:
@@ -167,6 +200,12 @@ def create_app(
             same_origin = f"{request.url.scheme}://{request.headers.get('host', '')}"
             if origin and origin != same_origin and origin not in settings.allowed_origins:
                 return error_response(403, "csrf", "Cross-origin request rejected")
+        if (
+            request.url.path.startswith("/api/")
+            and request.url.path != "/api/bootstrap"
+            and getattr(request.app.state, "store", None) is None
+        ):
+            return error_response(503, "database_unavailable", "Database is not ready; try again")
         response: Response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -178,7 +217,7 @@ def create_app(
             # Content-addressed public artwork is immutable. Avoid making every
             # catalog view re-download multi-megabyte photos from MongoDB.
             response.headers["Cache-Control"] = "public, max-age=3600, immutable"
-        elif request.url.path.startswith("/api/") or request.url.path == "/health/poller":
+        elif request.url.path.startswith("/api/") or request.url.path.startswith("/health"):
             response.headers["Cache-Control"] = "no-store"
         route = request.scope.get("route")
         logger.info(
@@ -189,6 +228,17 @@ def create_app(
             int((time.monotonic() - started) * 1000),
         )
         return response
+
+    # CORS must wrap early 503/CSRF responses as well as normal routes; browser
+    # clients on an allowed origin should be able to read the actual error.
+    if settings.allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.allowed_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+            allow_headers=["Content-Type", "X-Summon-Request", "X-Summon-Launch"],
+        )
 
     @app.exception_handler(HTTPException)
     async def http_error(_request: Request, exc: HTTPException) -> JSONResponse:
@@ -275,11 +325,20 @@ def create_app(
 
     @app.get("/health/ready")
     async def readiness(request: Request) -> dict[str, str]:
-        if settings.preview_mode or not hasattr(request.app.state, "database"):
-            return {"status": "preview" if settings.preview_mode else "injected"}
+        if settings.preview_mode:
+            return {"status": "preview"}
+        if request.app.state.store is None:
+            raise HTTPException(503, "Database initialization has not completed")
         database = request.app.state.database
-        await database.command("ping")
-        await require_transaction_topology(database.client)
+        if database is None:
+            return {"status": "injected"}
+        try:
+            # Keep the readiness response bounded even if the database stalls.
+            async with asyncio.timeout(4):
+                await database.command("ping")
+                await require_transaction_topology(database.client)
+        except TimeoutError:
+            raise HTTPException(503, "Database readiness check timed out") from None
         return {"status": "ready"}
 
     @app.get("/health/poller", include_in_schema=False)

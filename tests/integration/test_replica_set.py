@@ -72,6 +72,45 @@ async def test_runtime_database_startup_on_isolated_replica_set(isolated_databas
         await client.close()
 
 
+async def test_api_becomes_ready_after_delayed_real_database_initialization(isolated_database):
+    from unittest.mock import patch
+
+    from httpx import ASGITransport, AsyncClient
+
+    from summon.api.app import create_app
+    from summon.database import _ping_with_startup_retries
+
+    _, database = isolated_database
+    settings = Settings(
+        mongo_uri=os.environ["SUMMON_TEST_MONGO_URI"],
+        mongo_database=database.name,
+        _env_file=None,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_ping(client, *, wait_until_available):
+        entered.set()
+        await release.wait()
+        await _ping_with_startup_retries(client, wait_until_available=wait_until_available)
+
+    app = create_app(settings=settings)
+    with patch("summon.database._ping_with_startup_retries", side_effect=delayed_ping):
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://testserver"
+            ) as http:
+                assert (await http.get("/health")).status_code == 200
+                assert (await http.get("/health/ready")).status_code == 503
+                assert (await http.get("/api/me")).status_code == 503
+                release.set()
+                await asyncio.wait_for(app.state.startup_task, timeout=30)
+                ready = await http.get("/health/ready")
+                assert ready.status_code == 200 and ready.json() == {"status": "ready"}
+                assert (await http.get("/api/me")).status_code == 401
+
+
 async def test_concurrent_spawn_claim_awards_exactly_one_player(isolated_database):
     client, db = isolated_database
     now = datetime.now(UTC)
