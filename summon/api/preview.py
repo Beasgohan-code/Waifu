@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from typing import Any
 
 from summon.models import GroupSettings, InventorySort
+from summon.repositories.inventory_paging import CursorCodec, CursorState
+from summon.repositories.users import daily_status
 
 _CHARACTERS: list[dict[str, Any]] = [
     {
@@ -107,6 +110,92 @@ class PreviewCatalog:
             "limit": limit,
         }
 
+    async def inventory_cursor(
+        self,
+        user_id: int,
+        *,
+        secret: str,
+        cursor: str | None = None,
+        limit: int = 24,
+        favorite: bool = False,
+        duplicates: bool = False,
+        sort: InventorySort = "recent",
+    ) -> dict[str, Any]:
+        codec = CursorCodec(secret)
+        state = (
+            codec.decode(
+                cursor,
+                user_id=user_id,
+                favorite=favorite,
+                duplicates=duplicates,
+                sort=sort,
+                limit=limit,
+                preview=True,
+            )
+            if cursor
+            else None
+        )
+        sample = await self.inventory(
+            user_id,
+            page=1,
+            limit=len(_CHARACTERS),
+            favorite=favorite,
+            duplicates=duplicates,
+            sort=sort,
+        )
+        offset = state.consumed if state else 0
+        page_number = state.page if state else 1
+        items = sample["items"][offset : offset + limit]
+        consumed = offset + len(items)
+        next_cursor = None
+        if consumed < sample["total"]:
+            next_cursor = codec.encode(
+                CursorState(
+                    user_id=user_id,
+                    favorite=favorite,
+                    duplicates=duplicates,
+                    sort=sort,
+                    limit=limit,
+                    snapshot_seconds=0,
+                    snapshot_increment=0,
+                    last_id=items[-1]["id"],
+                    last_value=None,
+                    page=page_number + 1,
+                    total=sample["total"],
+                    consumed=consumed,
+                    started_at=state.started_at if state else int(time.time()),
+                    preview=True,
+                )
+            )
+        page_cursor = None
+        if page_number == 1 and sample["total"]:
+            page_cursor = cursor or codec.encode(
+                CursorState(
+                    user_id=user_id,
+                    favorite=favorite,
+                    duplicates=duplicates,
+                    sort=sort,
+                    limit=limit,
+                    snapshot_seconds=0,
+                    snapshot_increment=0,
+                    last_id=None,
+                    last_value=None,
+                    page=1,
+                    total=sample["total"],
+                    consumed=0,
+                    started_at=state.started_at if state else int(time.time()),
+                    preview=True,
+                )
+            )
+        return {
+            "items": items,
+            "page": page_number,
+            "limit": limit,
+            "total": sample["total"],
+            "page_cursor": page_cursor,
+            "next_cursor": next_cursor,
+        }
+
     async def details(self, user_id: int, character_id: str) -> dict[str, Any] | None:
         return next((item for item in _CHARACTERS if item["id"] == character_id), None)
 
@@ -136,6 +225,7 @@ class PreviewUsers:
 
     async def progression(self, user_id: int, now: datetime) -> dict[str, Any]:
         return {
+            "daily_status": daily_status(None, now),
             "achievements": [
                 {
                     "id": "first-summon",

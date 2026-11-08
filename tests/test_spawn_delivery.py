@@ -1,22 +1,22 @@
 """A summon without its artwork must never masquerade as a fair challenge."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import pytest
-from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
-from aiogram.methods import SendPhoto
-from aiogram.types import Update
+from wzgram import Client, raw
+from wzgram.errors import BadRequest, Forbidden
+from wzgram.handlers import RawUpdateHandler
+from wzgram.types import User
 
-from summon.bot.handlers import build_router
+from summon.bot.handlers import register_handlers
 from summon.bot.presentation import Emoji
 from summon.config import Settings
 from summon.models import GroupSettings
 
 
-def setup_spawn(image_url, *, premium=False):
+async def setup_spawn(image_url, *, premium=False):
     character = {
         "_id": "aiko",
         "name": "Aiko",
@@ -44,135 +44,144 @@ def setup_spawn(image_url, *, premium=False):
         trades=object(),
         gifts=object(),
     )
-    dp = Dispatcher()
-    dp.include_router(
-        build_router(
-            store,
-            Settings(
-                _env_file=None,
-                webapp_url="",
-                bot_api_rich_enabled=False,
-                premium_emoji_enabled=premium,
-            ),
-        )
+    app = Client(
+        "offline-test",
+        api_id=123,
+        api_hash="test",
+        bot_token="123:fake",
+        in_memory=True,
+        workers=1,
+        skip_updates=True,
     )
-    return dp, store
+    app.me = User(id=123, is_bot=True, username="summon_test", first_name="Bot")
+    register_handlers(
+        app,
+        store,
+        Settings(_env_file=None, webapp_url="", rich_enabled=False, premium_emoji_enabled=premium),
+    )
+    await asyncio.sleep(0)
+    return app, store
 
 
-def ordinary_message(bot):
-    return Update.model_validate(
-        {
-            "update_id": 1,
-            "message": {
-                "message_id": 9,
-                "date": int(datetime.now(UTC).timestamp()),
-                "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-                "from": {"id": 42, "is_bot": False, "first_name": "Member"},
-                "text": "Hello everyone",
-            },
-        },
-        context={"bot": bot},
+async def dispatch_message(app):
+    """Use the native raw-update dispatcher and wait until all handler groups finish."""
+    finished = asyncio.Event()
+
+    async def after_update(_client, _update, _users, _chats):
+        finished.set()
+
+    app.add_handler(RawUpdateHandler(after_update), group=100)
+    await asyncio.sleep(0)
+    actor = raw.types.User(
+        id=42, first_name="Member", access_hash=42, usernames=[], restriction_reason=[]
     )
+    group = raw.types.Chat(
+        id=100,
+        title="Test",
+        photo=raw.types.ChatPhotoEmpty(),
+        participants_count=2,
+        date=int(datetime.now(UTC).timestamp()),
+        version=1,
+    )
+    message = raw.types.Message(
+        id=9,
+        peer_id=raw.types.PeerChat(chat_id=100),
+        from_id=raw.types.PeerUser(user_id=42),
+        date=int(datetime.now(UTC).timestamp()),
+        message="Hello everyone",
+        entities=[],
+        restriction_reason=[],
+    )
+    update = raw.types.UpdateNewMessage(message=message, pts=1, pts_count=1)
+    await app.dispatcher.start()
+    try:
+        await app.dispatcher.updates_queue.put((update, {42: actor}, {100: group}))
+        await asyncio.wait_for(finished.wait(), 2)
+    finally:
+        await app.dispatcher.stop()
 
 
 async def test_definitely_rejected_artwork_cancels_instead_of_posting_an_unguessable_spawn():
-    dp, store = setup_spawn("https://example.com/aiko.webp")
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    error = TelegramBadRequest(
-        method=SendPhoto(chat_id=-100, photo="https://example.com/aiko.webp"), message="bad image"
-    )
+    app, store = await setup_spawn("https://example.com/aiko.webp")
     with (
-        patch.object(Bot, "send_photo", new_callable=AsyncMock, side_effect=error) as photo,
+        patch.object(
+            app, "send_photo", new_callable=AsyncMock, side_effect=BadRequest("BAD_IMAGE")
+        ) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     photo.assert_awaited_once()
     store.collection.mark_delivery_failed.assert_awaited_once_with(-100, "spawn-one")
-    # If a notice is sent, it must not advertise a guessing challenge.
     if card.await_count:
         assert "Guess their name" not in card.await_args.args[2].body
-    await bot.session.close()
 
 
 async def test_local_artwork_without_a_public_url_cancels_spawn():
-    dp, store = setup_spawn("/art/aiko.webp")
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
+    app, store = await setup_spawn("/art/aiko.webp")
     with (
-        patch.object(Bot, "send_photo", new_callable=AsyncMock) as photo,
+        patch.object(app, "send_photo", new_callable=AsyncMock) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     photo.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_awaited_once_with(-100, "spawn-one")
     if card.await_count:
         assert "Guess their name" not in card.await_args.args[2].body
-    await bot.session.close()
 
 
 async def test_ambiguous_photo_timeout_does_not_cancel_or_duplicate_delivery():
-    dp, store = setup_spawn("https://example.com/aiko.webp")
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    error = TelegramNetworkError(
-        method=SendPhoto(chat_id=-100, photo="https://example.com/aiko.webp"), message="timeout"
-    )
+    app, store = await setup_spawn("https://example.com/aiko.webp")
     with (
-        patch.object(Bot, "send_photo", new_callable=AsyncMock, side_effect=error) as photo,
+        patch.object(
+            app, "send_photo", new_callable=AsyncMock, side_effect=TimeoutError("timeout")
+        ) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
-        pytest.raises(TelegramNetworkError),
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     photo.assert_awaited_once()
     card.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_not_awaited()
-    await bot.session.close()
 
 
 async def test_successful_artwork_keeps_spawn_active_without_a_second_message():
-    dp, store = setup_spawn("https://example.com/aiko.webp")
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
+    app, store = await setup_spawn("https://example.com/aiko.webp")
     with (
-        patch.object(Bot, "send_photo", new_callable=AsyncMock) as photo,
+        patch.object(app, "send_photo", new_callable=AsyncMock) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     photo.assert_awaited_once()
     assert photo.await_args.kwargs["photo"] == "https://example.com/aiko.webp"
     store.collection.mark_delivery_failed.assert_not_awaited()
     card.assert_not_awaited()
-    await bot.session.close()
 
 
 async def test_forbidden_photo_delivery_cancels_the_reservation():
-    from aiogram.exceptions import TelegramForbiddenError
-
-    dp, store = setup_spawn("https://example.com/aiko.webp")
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    error = TelegramForbiddenError(
-        method=SendPhoto(chat_id=-100, photo="https://example.com/aiko.webp"), message="forbidden"
-    )
+    app, store = await setup_spawn("https://example.com/aiko.webp")
     with (
-        patch.object(Bot, "send_photo", new_callable=AsyncMock, side_effect=error) as photo,
+        patch.object(
+            app, "send_photo", new_callable=AsyncMock, side_effect=Forbidden("FORBIDDEN")
+        ) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     photo.assert_awaited_once()
     card.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_awaited_once_with(-100, "spawn-one")
-    await bot.session.close()
 
 
 async def test_rejected_premium_caption_retries_photo_with_unicode_without_cancelling():
-    dp, store = setup_spawn("https://example.com/aiko.webp", premium=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    error = TelegramBadRequest(
-        method=SendPhoto(chat_id=-100, photo="https://example.com/aiko.webp"),
-        message="CUSTOM_EMOJI_INVALID",
-    )
+    app, store = await setup_spawn("https://example.com/aiko.webp", premium=True)
     with (
-        patch.object(Bot, "send_photo", new_callable=AsyncMock, side_effect=[error, True]) as photo,
+        patch.object(
+            app,
+            "send_photo",
+            new_callable=AsyncMock,
+            side_effect=[BadRequest("CUSTOM_EMOJI_INVALID"), True],
+        ) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     assert photo.await_count == 2
     first, second = photo.await_args_list
     assert first.kwargs["photo"] == second.kwargs["photo"] == "https://example.com/aiko.webp"
@@ -186,55 +195,39 @@ async def test_rejected_premium_caption_retries_photo_with_unicode_without_cance
     assert Emoji.RARITY_STAR.value[0] in second.kwargs["caption"]
     card.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_not_awaited()
-    await bot.session.close()
 
 
 async def test_timeout_on_premium_photo_fallback_is_not_retried_or_cancelled():
-    dp, store = setup_spawn("https://example.com/aiko.webp", premium=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    method = SendPhoto(chat_id=-100, photo="https://example.com/aiko.webp")
-    emoji_error = TelegramBadRequest(method=method, message="CUSTOM_EMOJI_INVALID")
-    timeout = TelegramNetworkError(method=method, message="timeout")
+    app, store = await setup_spawn("https://example.com/aiko.webp", premium=True)
+    errors = [BadRequest("CUSTOM_EMOJI_INVALID"), TimeoutError("timeout")]
     with (
-        patch.object(
-            Bot, "send_photo", new_callable=AsyncMock, side_effect=[emoji_error, timeout]
-        ) as photo,
+        patch.object(app, "send_photo", new_callable=AsyncMock, side_effect=errors) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
-        pytest.raises(TelegramNetworkError),
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     assert photo.await_count == 2
     card.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_not_awaited()
-    await bot.session.close()
 
 
 async def test_both_caption_attempts_definitely_rejected_cancel_once():
-    dp, store = setup_spawn("https://example.com/aiko.webp", premium=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    method = SendPhoto(chat_id=-100, photo="https://example.com/aiko.webp")
-    errors = [
-        TelegramBadRequest(method=method, message="CUSTOM_EMOJI_INVALID"),
-        TelegramBadRequest(method=method, message="bad image"),
-    ]
+    app, store = await setup_spawn("https://example.com/aiko.webp", premium=True)
+    errors = [BadRequest("CUSTOM_EMOJI_INVALID"), BadRequest("BAD_IMAGE")]
     with (
-        patch.object(Bot, "send_photo", new_callable=AsyncMock, side_effect=errors) as photo,
+        patch.object(app, "send_photo", new_callable=AsyncMock, side_effect=errors) as photo,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as card,
     ):
-        await dp.feed_update(bot, ordinary_message(bot))
+        await dispatch_message(app)
     assert photo.await_count == 2
     card.assert_not_awaited()
     store.collection.mark_delivery_failed.assert_awaited_once_with(-100, "spawn-one")
-    await bot.session.close()
 
 
 async def test_spawn_photo_contains_supplied_series_and_rarity_icons():
-    dp, _ = setup_spawn("https://example.com/aiko.webp", premium=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    with patch.object(Bot, "send_photo", new_callable=AsyncMock) as photo:
-        await dp.feed_update(bot, ordinary_message(bot))
+    app, _ = await setup_spawn("https://example.com/aiko.webp", premium=True)
+    with patch.object(app, "send_photo", new_callable=AsyncMock) as photo:
+        await dispatch_message(app)
     caption = photo.await_args.kwargs["caption"]
     assert Emoji.SERIES_TAG.value[1] in caption
     assert Emoji.RARITY_STAR.value[1] in caption
     assert "Sky" in caption and "Rare" in caption
-    await bot.session.close()

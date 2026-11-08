@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Literal
+from typing import Any, Literal
 from unicodedata import category
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings.sources import EnvSettingsSource
 
 
 def _contains_unsafe_url_characters(value: str) -> bool:
@@ -53,10 +55,71 @@ def _browser_origin(parsed: SplitResult) -> str:
     return f"{parsed.scheme}://{host}{suffix}"
 
 
+# Aliases are intentionally limited to common, unambiguous scalar credentials.
+# Within one source, existing SUMMON_* names win, then aliases in this order.
+_ENV_ALIASES: dict[str, tuple[str, ...]] = {
+    "bot_token": ("BOT_TOKEN",),
+    "session_secret": ("SESSION_SECRET",),
+    "mongo_uri": ("MONGO_URL", "MONGO_URI", "MONGODB_URI"),
+    "mongo_database": ("MONGO_DB_NAME", "DATABASE_NAME"),
+    "webapp_url": ("WEBAPP_URL",),
+    "telegram_api_id": ("API_ID",),
+    "telegram_api_hash": ("API_HASH",),
+    "operator_ids": ("OWNER_ID",),
+}
+
+
+class _AliasedEnvironment(PydanticBaseSettingsSource):
+    """Keep each source's precedence while normalizing aliases to field names."""
+
+    def __init__(self, source: EnvSettingsSource) -> None:
+        super().__init__(source.settings_cls)
+        self.source = source
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self.source.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = self.source()
+        for field, aliases in _ENV_ALIASES.items():
+            # An explicitly empty prefixed value is still authoritative and will
+            # fail production validation rather than silently falling back.
+            if field in values:
+                continue
+            for alias in aliases:
+                key = alias if self.source.case_sensitive else alias.lower()
+                value = self.source.env_vars.get(key)
+                if value is not None:
+                    # OWNER_ID is one Telegram ID, not a JSON array.
+                    values[field] = [value] if field == "operator_ids" else value
+                    break
+        return values
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SUMMON_", env_file=".env", extra="ignore", hide_input_in_errors=True
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        if not isinstance(env_settings, EnvSettingsSource) or not isinstance(
+            dotenv_settings, EnvSettingsSource
+        ):
+            raise RuntimeError("Unsupported environment source")
+        return (
+            init_settings,
+            _AliasedEnvironment(env_settings),
+            _AliasedEnvironment(dotenv_settings),
+            file_secret_settings,
+        )
 
     environment: Literal["development", "production"] = "development"
     bot_token: SecretStr = SecretStr("")
@@ -66,7 +129,11 @@ class Settings(BaseSettings):
     webapp_url: str = ""
     telegram_api_id: int | None = None
     telegram_api_hash: SecretStr = SecretStr("")
-    rich_enabled: bool = False
+    telegram_session_database: str = Field(
+        default="summon_telegram", pattern=r"^[A-Za-z0-9_-]{1,63}$"
+    )
+    webhooks_disabled_confirmed: bool = False
+    rich_enabled: bool = True
     bot_api_rich_enabled: bool = True
     premium_emoji_enabled: bool = True
     allowed_origins: list[str] = []
@@ -169,10 +236,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "Polling health requires a bot token and a 32-character session secret"
             )
-        if self.rich_enabled and (
+        if self.telegram_session_database == self.mongo_database:
+            raise ValueError("Wzgram sessions require a separate MongoDB database")
+        if self.environment == "production" and (
             not self.telegram_api_id or not self.telegram_api_hash.get_secret_value()
         ):
-            raise ValueError(
-                "Outbound Wzgram requires SUMMON_TELEGRAM_API_ID and SUMMON_TELEGRAM_API_HASH"
-            )
+            raise ValueError("Wzgram requires SUMMON_TELEGRAM_API_ID and SUMMON_TELEGRAM_API_HASH")
         return self

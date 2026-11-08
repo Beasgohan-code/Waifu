@@ -1,9 +1,58 @@
-from types import SimpleNamespace
-from unittest.mock import patch
+"""Native Wzgram handler registration and selected ownership-safety flows."""
 
-from summon.bot.handlers import COMMANDS, build_router
-from summon.bot.main import create_outbound_client
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from wzgram import Client
+from wzgram.errors import BadRequest
+
+from summon.bot.handlers import COMMANDS, group_commands, register_handlers
+from summon.bot.session_storage import APIStorage
 from summon.config import Settings
+
+
+def make_store(**overrides):
+    values = {
+        "collection": object(),
+        "catalog": object(),
+        "trades": object(),
+        "gifts": object(),
+        "groups": SimpleNamespace(db=object()),
+        "limiter": SimpleNamespace(allow=AsyncMock(return_value=True)),
+    }
+    return SimpleNamespace(**{**values, **overrides})
+
+
+async def registered(store):
+    client = Client(
+        "offline-test", api_id=123, api_hash="test", bot_token="123:fake", in_memory=True
+    )
+    register_handlers(client, store, Settings(_env_file=None))
+    await asyncio.sleep(0)
+    return client
+
+
+def handler(client, name):
+    return next(
+        item.callback for item in client.dispatcher.groups[0] if item.callback.__name__ == name
+    )
+
+
+def group_message(text, *, reply=None):
+    return SimpleNamespace(
+        text=text,
+        caption=None,
+        command=[text.split()[0][1:]],
+        from_user=SimpleNamespace(
+            id=42, is_bot=False, first_name="Test", last_name=None, username=None
+        ),
+        reply_to_message=reply,
+        sender_chat=None,
+        chat=SimpleNamespace(id=-100, type="supergroup"),
+        message_thread_id=None,
+        ephemeral_message_id=987,
+    )
 
 
 def test_command_menu_has_no_duplicate_commands():
@@ -12,65 +61,52 @@ def test_command_menu_has_no_duplicate_commands():
     assert {"start", "summon", "collection", "manage", "daily", "gift"} <= set(names)
 
 
-def test_wzgram_is_outbound_only_and_in_memory():
+async def test_api_wzgram_client_is_outbound_only_and_in_memory():
+    from summon.api.app import create_app
+
     settings = Settings(
-        bot_token="123:fake",
-        telegram_api_id=12345,
-        telegram_api_hash="hash",
-        rich_enabled=True,
-        _env_file=None,
+        bot_token="123:fake", telegram_api_id=12345, telegram_api_hash="hash", _env_file=None
     )
-    with patch("summon.bot.main.Client") as client:
-        create_outbound_client(settings)
-    assert client.call_args.kwargs["no_updates"] is True
-    assert client.call_args.kwargs["in_memory"] is True
+    mongo = MagicMock(close=AsyncMock())
+    bot = MagicMock(stop=AsyncMock())
+    app = create_app(settings=settings)
+    with (
+        patch("summon.api.app.connect_database", AsyncMock(return_value=(mongo, object()))),
+        patch("summon.api.app.Store", return_value=object()),
+        patch("summon.api.app.Client", return_value=bot) as factory,
+        patch("summon.api.app.start_verified_client", AsyncMock()),
+    ):
+        async with app.router.lifespan_context(app):
+            assert app.state.telegram_bot is bot
+    assert factory.call_args.kwargs["no_updates"] is True
+    storage = factory.call_args.kwargs["storage_engine"]
+    assert isinstance(storage, APIStorage) and storage.in_memory is True
+    bot.stop.assert_awaited_once()
+    mongo.close.assert_awaited_once()
 
 
-def test_router_is_created_once_with_no_duplicate_message_registration():
-    router = build_router(
-        store=SimpleNamespace(
-            collection=object(),
-            catalog=object(),
-            trades=object(),
-            gifts=object(),
-            groups=SimpleNamespace(db=object()),
-        ),
-        settings=Settings(_env_file=None),
-    )
-    callbacks = [handler.callback.__name__ for handler in router.message.handlers]
+async def test_native_handlers_are_registered_once_with_unique_callbacks():
+    app = await registered(make_store())
+    callbacks = [item.callback.__name__ for item in app.dispatcher.groups[0]]
     assert len(callbacks) == len(set(callbacks))
+    assert len(app.dispatcher.groups[-100]) == 2
 
 
 async def test_gift_callback_uses_telegram_actor_and_rejects_non_recipient():
-    from unittest.mock import AsyncMock
-
     from summon.services.gifting import GiftForbidden
 
     gifts = SimpleNamespace(
         confirm=AsyncMock(side_effect=GiftForbidden("Only the recipient can accept")),
         cancel=AsyncMock(),
     )
-    store = SimpleNamespace(
-        collection=object(),
-        catalog=object(),
-        trades=object(),
-        gifts=gifts,
-        groups=SimpleNamespace(db=object()),
-        limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
-    )
-    router = build_router(store=store, settings=Settings(_env_file=None))
-    handler = next(
-        item.callback
-        for item in router.callback_query.handlers
-        if item.callback.__name__ == "gift_callback"
-    )
+    app = await registered(make_store(gifts=gifts))
     callback = SimpleNamespace(
         data=f"gift:accept:{'a' * 32}",
         from_user=SimpleNamespace(id=42),
         message=None,
         answer=AsyncMock(),
     )
-    await handler(callback)
+    await handler(app, "gift_callback")(app, callback)
     assert gifts.confirm.await_args.args[:2] == ("a" * 32, 42)
     callback.answer.assert_awaited_once_with("Only the recipient can accept", show_alert=True)
 
@@ -94,149 +130,75 @@ def test_runtime_rejects_shared_pyrogram_distribution_conflict(monkeypatch):
         validate_runtime()
 
 
-async def test_actual_wzgram_client_has_no_updates_and_no_handlers():
+async def test_actual_api_wzgram_client_has_no_updates_and_no_handlers():
     from summon.bot.compat import validate_runtime
 
     validate_runtime()
-    settings = Settings(
+    storage = APIStorage(MagicMock())
+    client = Client(
+        "offline-api",
+        api_id=12345,
+        api_hash="hash",
         bot_token="123:fake",
-        telegram_api_id=12345,
-        telegram_api_hash="hash",
-        rich_enabled=True,
-        _env_file=None,
+        storage_engine=storage,
+        no_updates=True,
     )
-    client = create_outbound_client(settings)
     assert client.no_updates is True
-    assert client.in_memory is True
+    assert storage.in_memory is True
     assert not client.dispatcher.groups
 
 
-def test_group_menu_marks_only_private_flows_as_ephemeral():
-    from summon.bot.handlers import group_commands
-
-    commands = {item.command: item for item in group_commands()}
-    for name in ("collection", "profile", "daily", "manage"):
-        assert commands[name].is_ephemeral is True
-    for name in ("summon", "trade", "gift"):
-        assert commands[name].is_ephemeral is None
-    assert all(command.is_ephemeral is None for command in COMMANDS)
+def test_group_menu_does_not_use_misleading_ephemeral_command_flag():
+    # Wzgram's flag removes menu entries; it does not protect a response.
+    assert all(item.ephemeral is None for item in group_commands())
+    assert all(item.ephemeral is None for item in COMMANDS)
 
 
-async def test_command_registration_falls_back_for_older_bot_api():
-    from unittest.mock import AsyncMock
-
-    from aiogram.exceptions import TelegramBadRequest
-    from aiogram.methods import SetMyCommands
-
+async def test_menu_registration_handles_native_rejection_without_repeated_writes():
     from summon.bot.main import register_command_menus
 
     bot = AsyncMock()
-    bot.set_my_commands.side_effect = [
-        True,
-        TelegramBadRequest(method=SetMyCommands(commands=COMMANDS), message="unknown field"),
-        True,
-    ]
+    bot.set_bot_commands.side_effect = [True, BadRequest("MENU_REJECTED")]
     await register_command_menus(bot)
-    calls = bot.set_my_commands.await_args_list
-    assert len(calls) == 3
-    assert calls[1].kwargs["scope"].type == "all_group_chats"
-    assert any(item.is_ephemeral for item in calls[1].args[0])
-    assert all(item.is_ephemeral is None for item in calls[2].args[0])
+    assert bot.set_bot_commands.await_count == 2
 
 
 async def test_collection_passes_ephemeral_trigger_to_private_response():
-    from unittest.mock import AsyncMock
-
-    store = SimpleNamespace(
-        collection=object(),
+    store = make_store(
         catalog=SimpleNamespace(inventory=AsyncMock(return_value={"items": [], "total": 0})),
-        trades=object(),
-        gifts=object(),
-        groups=SimpleNamespace(db=object()),
         users=SimpleNamespace(touch=AsyncMock()),
     )
-    router = build_router(store=store, settings=Settings(_env_file=None))
-    handler = next(
-        item.callback
-        for item in router.message.handlers
-        if item.callback.__name__ == "show_collection"
-    )
-    message = SimpleNamespace(
-        from_user=SimpleNamespace(
-            id=42, is_bot=False, first_name="Test", last_name=None, username=None
-        ),
-        sender_chat=None,
-        chat=SimpleNamespace(id=-100, type="supergroup"),
-        message_thread_id=None,
-        ephemeral_message_id=987,
-        bot=AsyncMock(),
-    )
+    app = await registered(store)
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as send:
-        await handler(message)
+        await handler(app, "show_collection")(app, group_message("/collection"))
     assert send.await_args.kwargs["incoming_ephemeral_id"] == 987
 
 
 async def test_exchange_callbacks_are_rate_limited_before_ownership_operations():
-    from unittest.mock import AsyncMock
-
     gifts = SimpleNamespace(confirm=AsyncMock(), cancel=AsyncMock())
-    store = SimpleNamespace(
-        collection=object(),
-        catalog=object(),
-        trades=object(),
-        gifts=gifts,
-        groups=SimpleNamespace(db=object()),
-        limiter=SimpleNamespace(allow=AsyncMock(return_value=False)),
-    )
-    router = build_router(store=store, settings=Settings(_env_file=None))
-    handler = next(
-        item.callback
-        for item in router.callback_query.handlers
-        if item.callback.__name__ == "gift_callback"
-    )
+    limiter = SimpleNamespace(allow=AsyncMock(return_value=False))
+    store = make_store(gifts=gifts, limiter=limiter)
+    app = await registered(store)
     callback = SimpleNamespace(
         data=f"gift:accept:{'a' * 32}",
         from_user=SimpleNamespace(id=42),
         message=None,
         answer=AsyncMock(),
     )
-    await handler(callback)
+    await handler(app, "gift_callback")(app, callback)
     gifts.confirm.assert_not_awaited()
     assert "too many" in callback.answer.await_args.args[0].lower()
-    assert store.limiter.allow.await_args.args[0] == "user:42:gift"
+    assert limiter.allow.await_args.args[0] == "user:42:gift"
 
 
 async def test_trade_proposal_is_rate_limited_before_creating_offer():
-    from unittest.mock import AsyncMock
-
     trades = SimpleNamespace(create=AsyncMock())
-    store = SimpleNamespace(
-        collection=object(),
-        catalog=object(),
-        trades=trades,
-        gifts=object(),
-        groups=SimpleNamespace(db=object()),
-        limiter=SimpleNamespace(allow=AsyncMock(return_value=False)),
-    )
-    router = build_router(store=store, settings=Settings(_env_file=None))
-    handler = next(
-        item.callback
-        for item in router.message.handlers
-        if item.callback.__name__ == "propose_trade"
-    )
-    message = SimpleNamespace(
-        from_user=SimpleNamespace(
-            id=42, is_bot=False, first_name="Test", last_name=None, username=None
-        ),
-        reply_to_message=SimpleNamespace(from_user=SimpleNamespace(id=43, is_bot=False)),
-        sender_chat=None,
-        chat=SimpleNamespace(id=-100, type="supergroup"),
-        message_thread_id=None,
-        ephemeral_message_id=None,
-        bot=AsyncMock(),
-    )
+    limiter = SimpleNamespace(allow=AsyncMock(return_value=False))
+    app = await registered(make_store(trades=trades, limiter=limiter))
+    target = SimpleNamespace(from_user=SimpleNamespace(id=43, is_bot=False), sender_chat=None)
+    message = group_message("/trade aiko ren", reply=target)
     with patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as response:
-        await handler(message, SimpleNamespace(args="aiko ren"))
+        await handler(app, "propose_trade")(app, message)
     trades.create.assert_not_awaited()
     assert "too many" in response.await_args.args[3].body.lower()
-    assert store.limiter.allow.await_args.args[0] == "user:42:trade"
+    assert limiter.allow.await_args.args[0] == "user:42:trade"

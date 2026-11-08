@@ -12,13 +12,14 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs
 
-from aiogram import Bot
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo.errors import PyMongoError
+from wzgram import Client
+from wzgram.errors import RPCError
 
 from summon.api.context import Store
 from summon.api.dependencies import get_current_session, get_current_user, get_store
@@ -32,6 +33,7 @@ from summon.auth import (
     verify_init_data,
 )
 from summon.bot.emoji_palette import palette_icon
+from summon.bot.session_storage import APIStorage, bot_id_from_token, start_verified_client
 from summon.config import Settings
 from summon.database import DatabaseTopologyError, connect_database, require_transaction_topology
 from summon.repositories.poller_health import PollerHealthRepository
@@ -64,6 +66,8 @@ def create_app(
         client = None
         owned_bot = None
         app.state.settings = settings
+        if settings.preview_mode:
+            app.state.preview_cursor_secret = secrets.token_urlsafe(32)
         if store is not None:
             app.state.store = store
         elif settings.preview_mode:
@@ -76,16 +80,43 @@ def create_app(
             app.state.store = Store(client, database)
         if telegram_bot is not None:
             app.state.telegram_bot = telegram_bot
-        elif store is None and not settings.preview_mode and settings.bot_token.get_secret_value():
-            owned_bot = Bot(settings.bot_token.get_secret_value())
-            app.state.telegram_bot = owned_bot
+        elif (
+            store is None
+            and not settings.preview_mode
+            and client is not None
+            and settings.bot_token.get_secret_value()
+            and settings.telegram_api_id
+            and settings.telegram_api_hash.get_secret_value()
+        ):
+            # Each API process has its own in-memory, no-updates MTProto session.
+            # Only peer records, never auth keys or update state, are shared with
+            # the persistent worker session.
+            token = settings.bot_token.get_secret_value()
+            candidate = Client(
+                "summon-api",
+                api_id=settings.telegram_api_id,
+                api_hash=settings.telegram_api_hash.get_secret_value(),
+                bot_token=token,
+                storage_engine=APIStorage(client[settings.telegram_session_database]),
+                no_updates=True,
+            )
+            try:
+                async with asyncio.timeout(30):
+                    await start_verified_client(candidate, token, bot_id_from_token(token))
+            except Exception as exc:
+                logger.warning("Telegram group management unavailable (%s)", type(exc).__name__)
+                await candidate.stop()
+                app.state.telegram_bot = None
+            else:
+                owned_bot = candidate
+                app.state.telegram_bot = candidate
         else:
             app.state.telegram_bot = None
         try:
             yield
         finally:
             if owned_bot is not None:
-                await owned_bot.session.close()
+                await owned_bot.stop()
             if client is not None:
                 await client.close()
 
@@ -119,7 +150,15 @@ def create_app(
         response: Response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith("/api/") or request.url.path == "/health/poller":
+        if (
+            request.url.path.startswith("/api/artwork/")
+            and request.method == "GET"
+            and response.status_code == 200
+        ):
+            # Content-addressed public artwork is immutable. Avoid making every
+            # catalog view re-download multi-megabyte photos from MongoDB.
+            response.headers["Cache-Control"] = "public, max-age=3600, immutable"
+        elif request.url.path.startswith("/api/") or request.url.path == "/health/poller":
             response.headers["Cache-Control"] = "no-store"
         route = request.scope.get("route")
         logger.info(
@@ -156,9 +195,18 @@ def create_app(
             503, "database_unavailable", "The database is unavailable; please try again"
         )
 
+    @app.exception_handler(RPCError)
+    @app.exception_handler(ConnectionError)
+    @app.exception_handler(TimeoutError)
+    async def telegram_error(_request: Request, exc: Exception) -> JSONResponse:
+        logger.warning("Telegram operation unavailable (%s)", type(exc).__name__)
+        return error_response(
+            503, "telegram_unavailable", "Could not verify current Telegram access"
+        )
+
     from summon.auto_replies import AutoReplyConflict, AutoReplyStorageError
     from summon.group_notes import NoteConflict, NoteStorageError
-    from summon.repositories.users import DailyAlreadyClaimed
+    from summon.repositories.users import DailyAlreadyClaimed, DailyStatusUnavailable
     from summon.services.gifting import GiftConflict, GiftForbidden, GiftNotFound
     from summon.services.moderation import PermissionDenied
     from summon.services.trading import TradeConflict, TradeForbidden, TradeNotFound
@@ -176,6 +224,12 @@ def create_app(
     @app.exception_handler(AutoReplyConflict)
     async def conflict_error(_request: Request, exc: Exception) -> JSONResponse:
         return error_response(409, "conflict", str(exc))
+
+    @app.exception_handler(DailyStatusUnavailable)
+    async def daily_status_error(_request: Request, _exc: DailyStatusUnavailable) -> JSONResponse:
+        return error_response(
+            503, "daily_unavailable", "Daily status is unavailable; please contact support"
+        )
 
     @app.exception_handler(NoteStorageError)
     async def note_storage_error(_request: Request, _exc: NoteStorageError) -> JSONResponse:
@@ -235,11 +289,11 @@ def create_app(
         except Exception as exc:
             # Monitoring failures never become an apparently healthy result,
             # and underlying database errors may contain sensitive details.
-            logger.warning("Polling health lookup failed (%s)", type(exc).__name__)
+            logger.warning("Connection health lookup failed (%s)", type(exc).__name__)
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return JSONResponse(
             status_code=200 if recent else 503,
-            content={"status": "recent_poll" if recent else "no_recent_poll"},
+            content={"status": "recent_connection" if recent else "no_recent_connection"},
         )
 
     @app.get("/api/bootstrap")

@@ -2,68 +2,67 @@
 
 **Collect. Discover. Summon.**
 
-An async Telegram character-collection bot, group-management backend, and mobile-first Mini App. SUMMON is an original implementation informed by read-only review of the reference projects; their bot implementations and user data were **not copied**. A small MIT-licensed Richgram builder subset was adapted with attribution, as separately agreed.
+SUMMON is an async Telegram character-collection bot, MongoDB-backed group-management service, and mobile-first Mini App. Collection, daily rewards, progression, favorites, search, consent-based trades and gifts, group settings, public notes, and opt-in auto replies are implemented without gambling, deposits, or cash-out.
 
-> **Status: prototype, not deployment-ready.** Local checks and a disposable single-member MongoDB CI suite pass, but production/multi-node behavior, Telegram delivery, premium-emoji eligibility, a production proxy, backup restoration, and legacy-data migration have not been verified. No upstream repository or user data was changed. See [testing and release gates](docs/TESTING.md) and [the tracker](todo.md).
+> **Prototype, not deployment-ready.** This Wzgram migration has not been tested against live Telegram or a real MongoDB deployment. The old aiogram-specific test suites have not yet been migrated and the full Python suite currently fails collection. See [todo.md](todo.md) for current release gates.
 
-## What is here
+## Telegram behavior
 
-- **Collection:** activity-triggered group spawns, name guesses, duplicate quantities, rarity tiers, favourites, wishlists, catalogue search, profiles, and leaderboards. The Mini App can show only characters with extra copies and sort the full inventory by copy count or when the inventory record was first added. Groups opt in to spawning. Points and XP are earned through catches and daily check-ins; there is no betting, wagering, deposit, cash-out, or casino.
-- **Trading and gifts:** offers expire after 15 minutes; only the intended recipient can accept. Ownership is rechecked and the transfer, offer state, and history are written in a MongoDB transaction. Selected concurrent transfers pass against a disposable single-member replica set; production failover and broader contention remain unverified.
-- **Group tools:** live Telegram administrator and bot permission checks for moderation, configurable spawns, welcome/goodbye messages and rules, and link, flood, duplicate, mention and keyword controls. Admins with change-info rights can manage public text notes and opt-in exact-match auto replies with revision checks; members can request notes with `/note`. Auto replies start disabled and depend on ordinary messages being delivered to the bot. Anyone who can see group messages may read or share the content, so never save secrets there. Restrict-authorized admins can review and explicitly revoke active warnings; corrections retain audit records and do not alter Telegram restrictions. Protection runs before delivered group commands and checks edits, subject to Telegram delivery and content limits. Warning escalation and several advanced workflows remain open.
-- **Mini App:** Telegram-themed responsive views for the catalogue, collection, progression, trades/gifts, group controls and authorized catalogue operators. Signed Telegram launches are bound to revocable server-side sessions so different launches sharing browser cookies do not silently see each other's accounts. The local sample preview is visibly read-only.
-- **Telegram presentation:** aiogram is the only update ingress. Native Bot API rich messages work without MTProto credentials; optional Wzgram is outbound-only. Adapted Richgram builders supply headings, compact tables and details. The registry retains 978 user-supplied glyph/ID pairs from seven palettes; selected icons appear in relevant cards, photo captions and buttons. A Telegram-native Mini App collection shortcut can also use a supplied icon on supported clients, while ordinary navigation remains available. Set `SUMMON_PREMIUM_EMOJI_ENABLED=false` for Unicode fallbacks. Pack rights, eligibility and live rendering have not been verified.
-- **Hosting safeguards:** the bot has an in-process `getUpdates` progress watchdog and an optional, protected [last-poll monitor](docs/POLLING_MONITORING.md), not a self-pinger or a distributed poller lock. The monitor is not proof of current liveness, message delivery or handler health; an independent alerting service is still needed. A multi-stage Dockerfile can serve the built Mini App and API together; the bot remains a separate process. The [Render guide](docs/RENDER.md) covers paid worker/disk costs, free web sleep, overlapping deploys and remaining unverified gates.
-- **Offline migration preview:** inspect authorized legacy JSONL exports, explicit ID mappings and an optional target inventory snapshot without connecting or writing. It is not an importer or proof of migration readiness; see [migration and backup](docs/MIGRATION_BACKUP.md).
+The bot registers message, edited-message, and callback handlers **directly with Wzgram**; there is no aiogram dispatcher or bridge. Group protection runs before commands, and ownership-changing operations retain their MongoDB transaction and consent checks. API workers use separate Wzgram sessions with updates disabled, not a second update consumer.
 
-## Try the read-only preview
+The group worker keeps its Wzgram session, update state, and known peers in a separate MongoDB database. A majority-write lease coordinates workers configured against the same application database and bot ID. It is not fencing for every in-flight operation and does not guarantee exactly-once delivery. Wzgram's bounded dispatcher queue can drop updates during sustained saturation. Recovery is limited by stored MTProto state and Telegram's retention; Bot API updates from before the initial cutover are not automatically migrated.
 
-Requires Python 3.11+ and Node.js 22+. Use two terminals from the repository root:
+Private group results attempt Wzgram's ephemeral messages, then a private chat; a public fallback contains only a prompt to open the bot, not the private result. Rich messages and selected premium emoji IDs have readable Unicode fallbacks after definite rejections. Telegram account eligibility, pack permissions, and live ephemeral/rich rendering remain unverified. Normal command-menu entries do not imply that a command itself is private.
+
+**Mute, unmute, unban and kick are intentionally unavailable in SUMMON:** Wzgram restriction writes can clear a ban, and there is no atomic guard against another administrator banning the target between a membership check and the write. Use Telegram's own group controls for these actions. The commands and API action names still return an explicit denial; ban and warning records remain available subject to permissions. Public group notes and auto replies are visible to group members and must never contain secrets.
+
+## Read-only preview
+
+Requires Python 3.11+ and Node.js 22+. From the repository root:
 
 ```bash
-# Keep the lockfile tool separate from the project environment it manages.
 python3 -m venv .bootstrap
-.bootstrap/bin/python -m pip install --upgrade 'pip==26.3' 'setuptools==84.2.1' 'uv==0.13.7'
+.bootstrap/bin/python -m pip install 'uv==0.13.7'
 .bootstrap/bin/uv sync --locked --extra dev --python 3.11 --no-python-downloads
 cd web && npm ci && cd ..
 
-# Terminal 1: sample API, no database or Telegram credentials used
+# Terminal 1: fictional, read-only API; no Telegram or MongoDB credentials
 SUMMON_PREVIEW_MODE=true .venv/bin/uvicorn summon.api.app:app --host 0.0.0.0 --port 8000 --no-access-log
 
-# Terminal 2: frontend; /api is proxied to the sample API
+# Terminal 2: browser frontend, with /api proxied to the sample API
 cd web && npm run dev
 ```
 
-Open the Vite URL shown in the terminal. The preview contains fictional examples, rejects all API mutations, and cannot be enabled when `SUMMON_ENVIRONMENT=production`. It is not a test of a real Telegram account or database. `uv.lock` pins direct and transitive Python dependencies; plain `pip install -e '.[dev]'` does not enforce that lock. See [deployment](docs/DEPLOYMENT.md) for production installs and the build-hash/platform limits.
+The preview rejects mutations and cannot be enabled in production. It is not an end-to-end Telegram or MongoDB test. `uv.lock` pins the Python dependency graph; plain pip installs do not enforce that lock.
 
-## Run against your own infrastructure
+## Deployment configuration and cutover
 
-Read [deployment](docs/DEPLOYMENT.md) and [migration / backup](docs/MIGRATION_BACKUP.md) first. A MongoDB **replica set or sharded cluster**, a bot token, an HTTPS Mini App origin and a high-entropy session secret are required. Startup and readiness reject clearly unsupported transaction topologies, but that check does not prove transactions, session consistency or permissions work. Configure secrets only in the runtime environment or a private `.env` copied from `.env.example`; never place them in frontend code, Git, Telegram messages or logs. Start exactly one `summon-bot` process per token, including during redeploys, and one or more `summon-api` processes. Serve `web/dist` and proxy `/api` on the same HTTPS origin, or use the optional same-origin container. The [Render guide](docs/RENDER.md) explains its paid worker and singleton-deploy requirements; no live deployment has been verified. Existing pre-upgrade cookies are invalidated; users must reopen the Mini App from Telegram.
+No deployment or cutover has been performed. For an authorized isolated rehearsal, configure `.env.example` values in a secret manager, including the bot token, Telegram application API ID/hash, a random session secret, a MongoDB replica set or sharded cluster, and an HTTPS Mini App URL. Production validation requires the Telegram application credentials on both API and bot processes. Keep all credentials out of frontend bundles, Git, chat, URLs, and logs.
 
-The optional example catalogue is **not** installed automatically. `summon-seed` alone prints a plan and does not connect. With an explicitly chosen database and operator approval, `summon-seed --apply --confirm INSERT-SAMPLE` inserts only missing sample IDs; it does not overwrite catalogue entries or touch ownership. Applying also runs normal database validator/index initialization. No legacy importer is implemented or has been run.
+Common aliases `BOT_TOKEN`, `SESSION_SECRET`, `MONGO_URL`, `MONGO_DB_NAME`, `WEBAPP_URL`, `API_ID`, `API_HASH`, and `OWNER_ID` (a single Telegram ID) are accepted alongside existing `SUMMON_*` names. An explicit process environment value takes precedence over `.env`; within a single source, the `SUMMON_*` spelling wins, including an explicitly empty value. Do not set conflicting names or expose secret values.
 
-## Checks
+Catalog models now recognize the 18 reference rarity tiers while retaining stored `epic` values; legacy Epic and Special Edition share one spawn bucket. Weights use the reference's initialization defaults, including AMV 10; another reference fallback specifies 100, and a running reference instance can have customized values. Photo-upload storage is work in progress: no Telegram upload command is registered yet.
 
-```bash
-.bootstrap/bin/uv lock --check
-.venv/bin/pytest -q
-.venv/bin/ruff check summon tests
-.venv/bin/mypy summon
-.venv/bin/python -m pip check
-.venv/bin/pip-audit --skip-editable
-(cd web && npm ci && npm test && npm run typecheck && npm run build && npm audit)
-```
+Run one `summon-bot` worker per bot token and one or more `summon-api` workers. Configure the same bot token, application MongoDB database, separate `SUMMON_TELEGRAM_SESSION_DATABASE`, and session secret consistently. The bot must have read/write/index permissions for its dedicated session database; API workers need read access to its `peers` collection, not the session auth-key collection. That database and its backups contain credential-bearing MTProto session data and sensitive peer metadata. Restrict and encrypt access; never share one MTProto auth session concurrently across workers.
 
-The browser smoke tests need a compatible Chromium executable and separate preview or synthetic-auth fixtures; see [testing](docs/TESTING.md). Results recorded there distinguish mocked tests from real infrastructure.
+**Before starting the Wzgram worker**, stop all previous consumers and have an authorized operator remove any existing Bot API webhook while preserving pending updates according to the operator's cutover plan. Wzgram cannot inspect or remove that webhook. Only after verifying this, set `SUMMON_WEBHOOKS_DISABLED_CONFIRMED=true` on the bot worker. The confirmation is an operator assertion, not an automatic check. On first cutover, audit any queued Bot API updates separately; do not assume they were delivered to MTProto.
 
-## Important owner actions
+For group operations the API loads known peer access hashes from the worker's cache, then checks current Telegram membership/rights. Unknown or inaccessible peers fail closed rather than granting access; have the affected group/member interact with the bot and retry. Cross-session access hashes, fresh role changes, and API/worker startup and recovery require live verification.
 
-The read-only audit found previously committed credentials and an unsafe backup command in the **reference** `egoist0690/Waifu-bot-` deployment. If it is running, disable `/mongobackup`, restrict database access, rotate/revoke every exposed credential and session, inspect logs, and follow GitHub's secret-removal guidance. This session cannot perform or confirm those actions on the reference repository. Do not reuse exposed values.
+A Render web service can run `summon-api` using `PORT`; a separate worker can run `summon-bot`. The Dockerfile can also serve `web/dist` on the same origin using `SUMMON_WEB_DIST`. On Vercel, set the project root to `web` and set the server-side `SUMMON_BACKEND_ORIGIN` to the Render API's HTTPS origin with no path, query, or credentials. `web/api/[...path].js` forwards same-origin `/api/*` requests and cookies to that origin, with a 64 KiB body limit. Configure Render's `SUMMON_ALLOWED_ORIGINS` to include the exact Vercel HTTPS origin, and set `SUMMON_WEBAPP_URL` to that frontend. The proxy does not trust client-supplied forwarding headers; IP-based sign-in throttles may aggregate users behind shared proxy egress. Vercel routing, Render networking, cookie behavior, and rate limiting require an authorized live rehearsal.
 
-## Documentation
+`/health/ready` checks database reachability/topology, not Telegram delivery. When explicitly enabled, the protected `/health/poller` endpoint now reports `recent_connection` or `no_recent_connection` based on a successful MTProto `GetState` RPC; this is **not** a poll, lease, delivery, or handler-health guarantee. Keep its dedicated monitoring token in a secret header only. External alerting and real outage/failover checks remain necessary.
 
-- [Repository audit](docs/REPOSITORY_AUDIT.md) · [Reference inventory](docs/REFERENCE_MODULE_INVENTORY.md)
-- [Architecture](docs/ARCHITECTURE.md) · [Database schema](docs/DATABASE_SCHEMA.md)
-- [Telegram, Richgram & Wzgram compatibility](docs/TELEGRAM_COMPATIBILITY.md) · [Commands](docs/COMMANDS.md)
-- [Deployment](docs/DEPLOYMENT.md) · [Render guide](docs/RENDER.md) · [Polling monitor](docs/POLLING_MONITORING.md) · [Migration and backup](docs/MIGRATION_BACKUP.md) · [Testing](docs/TESTING.md)
-- [Third-party notices](docs/THIRD_PARTY_NOTICES.md) · [Living tracker](todo.md)
+## Migration and recovery safety
+
+No production data, session, log, backup, restore, migration, or credential rotation was performed here. Treat credentials previously committed anywhere as exposed and rotate them through the authorized operator. Never send database URIs or backups through Telegram.
+
+There is no importer. `summon-migration-preview` only analyzes explicitly authorized local JSONL exports and mappings; it does not connect, import, or prove that an export is complete. Protect exports and reports, and do not commit them. Before any actual migration or destructive restore: obtain explicit authorization and confirmation, stop source writers, create encrypted backups, verify an isolated restore, map IDs and quantities without collisions, reconcile ownership and totals, and rehearse rollback. Never overwrite, rename, drop, or dual-write the source as an implicit fallback.
+
+## Attribution and licenses
+
+SUMMON's product and bot implementation is independently written. The reference repositories `egoist0690/Waifu-bot-`, `Beasgohan-code/Summon-bot`, and `Beasgohan-code/Videl0` were inspected read-only; no bot implementation or user data was copied. The reference MIT notice remains at `docs/licenses/Waifu-bot-reference-MIT.txt`.
+
+The separately approved Richgram 0.2.0 heading/table/details builder subset is adapted from `Badmunda05/richgram` (commit `c95cc39`); its MIT notice is retained at `summon/_vendor/RICHGRAM_LICENSE`. Wzgram is LGPL-3.0-or-later and WarpCrypto is Apache-2.0; satisfy their full distribution terms and those of other dependencies.
+
+The 978 supplied emoji glyph/ID pairs are retained across seven palettes. The user attributed the Emoji_Fan/EmojiPersian, rijif, Boseh/NewEmojis, News Emoji, Summon bot, and Telegram iOS lists to @TgEmojis. IDs do not contain artwork; attribution does not establish licensing, pack availability, bot entitlement, or permission. Verify rights and eligibility before use.

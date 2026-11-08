@@ -1,130 +1,56 @@
-"""Supervise the sole aiogram poller without creating another update consumer.
-
-A successful getUpdates response (including an empty long poll) is the progress
-signal. This does not establish handler, MongoDB, or end-to-end delivery health.
-"""
+"""Observe MTProto responsiveness; this is not proof of update delivery."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
-from aiogram import Bot, Dispatcher
-from aiogram.client.session.middlewares.base import NextRequestMiddlewareType
-from aiogram.methods import GetUpdates, Response, TelegramMethod
-from aiogram.methods.base import TelegramType
+from wzgram import Client, raw
+
+from summon.bot.ingress import IngressLease
 
 logger = logging.getLogger(__name__)
 
 
-class PollingStalled(RuntimeError):
-    """No successful Telegram long poll was observed within the configured window."""
+class TelegramConnectionStalled(RuntimeError):
+    """Telegram stopped answering the native Wzgram connection check."""
 
 
-class PollingHeartbeat:
-    def __init__(
-        self,
-        *,
-        timeout_seconds: float,
-        clock: Callable[[], float] = time.monotonic,
-        on_success: Callable[[], None] | None = None,
-    ) -> None:
-        if timeout_seconds <= 0:
-            raise ValueError("Polling watchdog timeout must be positive")
-        self.timeout_seconds = timeout_seconds
-        self.clock = clock
-        self.on_success = on_success
-        self.last_success = clock()
-
-    async def __call__(
-        self,
-        make_request: NextRequestMiddlewareType[TelegramType],
-        bot: Bot,
-        method: TelegramMethod[TelegramType],
-    ) -> Response[TelegramType]:
-        response = await make_request(bot, method)
-        if isinstance(method, GetUpdates):
-            # An empty successful long poll is healthy in a quiet group.
-            self.last_success = self.clock()
-            if self.on_success is not None:
-                try:
-                    self.on_success()
-                except Exception as exc:
-                    # Monitoring must never turn a successful fetch into a retry.
-                    logger.warning("Polling health observation failed (%s)", type(exc).__name__)
-        return response
-
-    async def wait_until_stale(self) -> None:
-        while True:
-            remaining = self.timeout_seconds - (self.clock() - self.last_success)
-            if remaining <= 0:
-                return
-            # Re-evaluate at the deadline: another poll may have completed meanwhile.
-            await asyncio.sleep(remaining)
-
-
-async def _stop_polling(
-    dispatcher: Dispatcher, polling: asyncio.Task[None], shutdown_timeout: float
-) -> None:
-    if polling.done():
-        return
-    try:
-        # aiogram's normal stop cancels its own internal getUpdates task and
-        # runs shutdown callbacks; cancelling start_polling directly can leak it.
-        await asyncio.wait_for(dispatcher.stop_polling(), timeout=shutdown_timeout)
-    except (TimeoutError, RuntimeError):
-        logger.error("Could not stop polling gracefully; cancelling the polling task")
-    if not polling.done():
-        polling.cancel()
-    await asyncio.gather(polling, return_exceptions=True)
-
-
-async def run_supervised_polling(
-    dispatcher: Dispatcher,
-    bot: Bot,
+async def monitor_connection(
+    client: Client,
+    lease: IngressLease,
     *,
     timeout_seconds: float,
-    shutdown_timeout: float = 15,
-    on_success: Callable[[], None] | None = None,
+    health_repository: Any | None = None,
+    interval_seconds: float = 30,
 ) -> None:
-    """Run exactly one poller; stop and fail on sustained getUpdates failure.
-
-    A process manager is responsible for restarting the process after failure.
-    This coroutine never starts a replacement or coordinates other processes.
-    """
-    if shutdown_timeout <= 0:
-        raise ValueError("Polling shutdown timeout must be positive")
-    heartbeat = PollingHeartbeat(timeout_seconds=timeout_seconds, on_success=on_success)
-    bot.session.middleware.register(heartbeat)
-    polling: asyncio.Task[None] | None = None
-    monitor: asyncio.Task[None] | None = None
-    try:
-        polling = asyncio.create_task(
-            dispatcher.start_polling(
-                bot, allowed_updates=dispatcher.resolve_used_update_types(), close_bot_session=False
-            )
-        )
-        monitor = asyncio.create_task(heartbeat.wait_until_stale())
-        done, _pending = await asyncio.wait({polling, monitor}, return_when=asyncio.FIRST_COMPLETED)
-        if polling in done:
-            # Propagate a real polling error; normal SIGTERM remains a normal exit.
-            await polling
-            return
-        await monitor
-        logger.error(
-            "No successful Telegram getUpdates for %.0f seconds; stopping the bot process",
-            timeout_seconds,
-        )
-        await _stop_polling(dispatcher, polling, shutdown_timeout)
-        raise PollingStalled("Telegram getUpdates made no progress within the watchdog window")
-    finally:
-        if monitor is not None:
-            monitor.cancel()
-            await asyncio.gather(monitor, return_exceptions=True)
+    if timeout_seconds <= 0 or interval_seconds <= 0:
+        raise ValueError("Connection monitoring intervals must be positive")
+    last_success = asyncio.get_running_loop().time()
+    while True:
+        if not lease.valid():
+            raise TelegramConnectionStalled("Update-worker coordination is no longer valid")
         try:
-            if polling is not None and not polling.done():
-                await _stop_polling(dispatcher, polling, shutdown_timeout)
-        finally:
-            bot.session.middleware.unregister(heartbeat)
+            if not client.is_connected or not client.is_initialized:
+                raise ConnectionError("Wzgram client is not connected")
+            async with asyncio.timeout(15):
+                # A successful GetState proves an RPC response, not that updates
+                # were delivered, dispatched, or processed successfully.
+                await client.invoke(raw.functions.updates.GetState())
+        except Exception as exc:
+            logger.warning("Telegram connection check failed (%s)", type(exc).__name__)
+            if asyncio.get_running_loop().time() - last_success >= timeout_seconds:
+                raise TelegramConnectionStalled(
+                    "Telegram stopped answering connection checks"
+                ) from exc
+        else:
+            last_success = asyncio.get_running_loop().time()
+            if health_repository is not None and lease.valid():
+                try:
+                    async with asyncio.timeout(3):
+                        await health_repository.record(datetime.now(UTC))
+                except Exception as exc:
+                    logger.warning("Connection health publication failed (%s)", type(exc).__name__)
+        await asyncio.sleep(interval_seconds)

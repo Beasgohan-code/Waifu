@@ -6,8 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
-from aiogram.methods import GetChatMember
 from fastapi.testclient import TestClient
 from pymongo.errors import AutoReconnect
 
@@ -227,7 +225,9 @@ async def test_transaction_retry_reuses_revision_and_audit_identifier(repository
 
 
 def member(change=True):
-    return SimpleNamespace(status="administrator", can_change_info=change)
+    return SimpleNamespace(
+        status="administrator", privileges=SimpleNamespace(can_change_info=change)
+    )
 
 
 async def test_service_checks_current_admin_right_for_every_operation():
@@ -373,9 +373,7 @@ def test_api_limits_errors_and_uncertain_writes_are_sanitized():
         store.limiter.allow.return_value = False
         assert client.get("/api/groups/-100/auto-replies").status_code == 429
         store.limiter.allow.return_value = True
-        bot.get_chat_member.side_effect = TelegramNetworkError(
-            method=GetChatMember(chat_id=-100, user_id=123), message="private network details"
-        )
+        bot.get_chat_member.side_effect = ConnectionError("private network details")
         result = client.get("/api/groups/-100/auto-replies")
         assert result.status_code == 503 and "private network" not in result.text
 

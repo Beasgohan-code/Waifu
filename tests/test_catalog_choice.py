@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+from summon.rarities import RARITY_WEIGHTS
 from summon.repositories.catalog import CatalogRepository
 
 
@@ -28,13 +29,18 @@ class FakeCharacters:
         self.rows = rows
         self.find_calls = []
 
+    def matches(self, row, query):
+        rarity = query["rarity"]
+        accepted = rarity["$in"] if isinstance(rarity, dict) else [rarity]
+        return row["active"] and row["rarity"] in accepted
+
     async def count_documents(self, query):
-        return len([row for row in self.rows if row["active"] and row["rarity"] == query["rarity"]])
+        return len([row for row in self.rows if self.matches(row, query)])
 
     async def find_one(self, query, *, sort, skip):
         self.find_calls.append((query, sort, skip))
         rows = sorted(
-            [row for row in self.rows if row["active"] and row["rarity"] == query["rarity"]],
+            [row for row in self.rows if self.matches(row, query)],
             key=lambda x: x["_id"],
         )
         return rows[skip] if skip < len(rows) else None
@@ -62,10 +68,26 @@ async def test_empty_rarity_is_removed_and_remaining_weights_are_preserved():
     assert (await repo.choose())["_id"] == "a"
     names, weights = repo.rng.requested[1]
     assert "legendary" not in names
-    assert dict(zip(names, weights, strict=True)) == {"common": 55, "rare": 25, "epic": 15}
+    assert dict(zip(names, weights, strict=True)) == {
+        name: weight for name, weight in RARITY_WEIGHTS.items() if name != "legendary"
+    }
 
 
 async def test_empty_catalog_has_no_spawn():
     repo = CatalogRepository(SimpleNamespace(characters=FakeCharacters([])))
-    repo.rng = DeterministicRng(["common", "rare", "epic", "legendary"], [])
+    repo.rng = DeterministicRng(list(RARITY_WEIGHTS), [])
     assert await repo.choose() is None
+
+
+async def test_legacy_epic_remains_spawnable_in_special_edition_pool():
+    rows = [
+        {"_id": "a", "rarity": "epic", "active": True},
+        {"_id": "b", "rarity": "special-edition", "active": True},
+    ]
+    characters = FakeCharacters(rows)
+    repo = CatalogRepository(SimpleNamespace(characters=characters))
+    repo.rng = DeterministicRng(["special-edition", "special-edition"], [0, 1])
+    assert (await repo.choose())["_id"] == "a"
+    assert (await repo.choose())["_id"] == "b"
+    assert rows[0]["rarity"] == "epic"  # Selection never rewrites existing records.
+    assert characters.find_calls[0][0]["rarity"] == {"$in": ["special-edition", "epic"]}

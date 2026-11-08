@@ -89,7 +89,7 @@ export default function App() {
     if (preview || dailyBusy) return;
     setDailyBusy(true);
     try { const reward = await api.post<{ points: number; xp: number }>('/daily'); notify(`Daily reward claimed: +${reward.points} points and +${reward.xp} XP.`); await refreshProfile(); refresh(); }
-    catch (err) { notify(err instanceof Error ? err.message : 'Could not claim your reward.', true); } finally { setDailyBusy(false); }
+    catch (err) { notify(err instanceof Error ? err.message : 'Could not claim your reward.', true); await refreshProfile(); refresh(); } finally { setDailyBusy(false); }
   }
   async function favorite(item: Character) {
     if (preview) return;

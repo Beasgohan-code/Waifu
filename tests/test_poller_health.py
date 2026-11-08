@@ -11,9 +11,9 @@ from aiogram.methods import GetMe, GetUpdates
 from fastapi.testclient import TestClient
 from pymongo import ReadPreference
 from pymongo.errors import OperationFailure
+from summon.bot.poller_health import PollerHealthPublisher
 
 from summon.api.app import create_app
-from summon.bot.poller_health import PollerHealthPublisher
 from summon.bot.watchdog import PollingHeartbeat
 from summon.config import Settings
 from summon.database import initialize_database

@@ -1,7 +1,7 @@
 """All extra user-provided packs are addressable without losing 64-bit IDs."""
 
 import pytest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from summon.bot.emoji_extra_palettes import _parse_palette
 from summon.bot.emoji_palette import PALETTES, palette_icon
@@ -120,16 +120,15 @@ def test_real_message_roles_use_each_new_pack_with_unicode_fallback(role, palett
 @pytest.mark.parametrize(
     "palette", ["vector", "emoji_fan", "rijif", "boseh", "news", "summon_bot", "telegram_ios"]
 )
-def test_button_json_serializes_each_palette_id_as_an_exact_string(palette):
-    import json
+async def test_button_serializes_each_palette_id_as_exact_mtproto_int(palette):
 
     _, identifier = palette_icon(palette, 1)
     button = InlineKeyboardButton(
         text="Open", callback_data="safe:action", icon_custom_emoji_id=identifier
     )
-    payload = json.loads(button.model_dump_json(exclude_none=True))
-    assert payload["icon_custom_emoji_id"] == identifier
-    assert isinstance(payload["icon_custom_emoji_id"], str)
+    payload = await button.write(None)
+    assert button.icon_custom_emoji_id == identifier
+    assert payload.style.icon == int(identifier)
 
 
 def test_every_pack_button_icon_has_a_safe_fallback_without_changing_actions():

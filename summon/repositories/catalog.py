@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from typing import Any, cast
 from uuid import uuid4
 
 from pymongo import ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
-from summon.models import CharacterInput, InventorySort, normalize_name
+from summon.models import CharacterChanges, CharacterInput, InventorySort, normalize_name
+from summon.rarities import RARITY_WEIGHTS, spawn_values
 from summon.repositories.base import transaction, utcnow
-
-RARITY_WEIGHTS = {"common": 55, "rare": 25, "epic": 15, "legendary": 5}
+from summon.services.artwork import MAX_ARTWORK_BYTES, Artwork
 
 
 def public_character(doc: dict[str, Any]) -> dict[str, Any]:
@@ -25,6 +27,24 @@ def public_character(doc: dict[str, Any]) -> dict[str, Any]:
         "description": doc.get("description", ""),
         "active": doc.get("active", True),
     }
+
+
+class CatalogConflict(Exception):
+    """A catalog ID exists or a command was already processed."""
+
+
+class CatalogNotFound(Exception):
+    """A requested catalog record does not exist."""
+
+
+def _check_artwork(artwork: Artwork | None, image_url: str | None) -> None:
+    if artwork is not None and (
+        image_url != artwork.path
+        or not 0 < len(artwork.content) <= MAX_ARTWORK_BYTES
+        or not artwork.content.startswith(b"\xff\xd8\xff")
+        or hashlib.sha256(artwork.content).hexdigest() != artwork.digest
+    ):
+        raise ValueError("Invalid processed artwork")
 
 
 class CatalogRepository:
@@ -62,6 +82,121 @@ class CatalogRepository:
 
         return await transaction(self.client, save)
 
+    async def _insert_artwork(self, artwork: Artwork | None, now: Any, session: Any) -> None:
+        if artwork is not None:
+            await self.db.character_artworks.update_one(
+                {"_id": artwork.digest},
+                {
+                    "$setOnInsert": {
+                        "content": artwork.content,
+                        "created_at": now,
+                        "content_type": "image/jpeg",
+                    }
+                },
+                upsert=True,
+                session=session,
+            )
+
+    async def create_character(
+        self,
+        data: CharacterInput,
+        *,
+        actor_id: int,
+        event_id: str,
+        artwork: Artwork | None = None,
+    ) -> dict[str, Any]:
+        """Create only; photo, catalog row and idempotent audit commit together."""
+        if self.client is None:
+            raise RuntimeError("Catalog writes require a transaction client")
+        _check_artwork(artwork, data.image_url)
+        values = data.model_dump(exclude={"id"})
+        values["name_key"] = normalize_name(data.name)
+        now, random_key = utcnow(), self.rng.random()
+
+        async def create(session: Any) -> dict[str, Any]:
+            await self.db.activity.insert_one(
+                {
+                    "_id": event_id,
+                    "user_id": actor_id,
+                    "kind": "character_created",
+                    "character_id": data.id,
+                    "fields": sorted(values),
+                    "created_at": now,
+                },
+                session=session,
+            )
+            await self.db.characters.insert_one(
+                {"_id": data.id, **values, "random_key": random_key, "created_at": now},
+                session=session,
+            )
+            await self._insert_artwork(artwork, now, session)
+            return public_character({"_id": data.id, **values})
+
+        try:
+            return await transaction(self.client, create)
+        except DuplicateKeyError as exc:
+            raise CatalogConflict(
+                "Character ID exists or this command was already processed"
+            ) from exc
+
+    async def update_character(
+        self,
+        character_id: str,
+        changes: CharacterChanges,
+        *,
+        actor_id: int,
+        event_id: str,
+        artwork: Artwork | None = None,
+    ) -> None:
+        """Update only supplied metadata, without changing ID or ownership."""
+        if self.client is None:
+            raise RuntimeError("Catalog writes require a transaction client")
+        values = changes.model_dump(exclude_none=True)
+        if not values:
+            raise ValueError("No character metadata was supplied")
+        _check_artwork(artwork, values.get("image_url"))
+        if "name" in values:
+            values["name_key"] = normalize_name(values["name"])
+        now = utcnow()
+
+        async def update(session: Any) -> None:
+            # A deterministic audit ID makes replay of a Telegram command a
+            # transaction conflict instead of overwriting a newer edit.
+            await self.db.activity.insert_one(
+                {
+                    "_id": event_id,
+                    "user_id": actor_id,
+                    "kind": "character_updated",
+                    "character_id": character_id,
+                    "fields": sorted(values),
+                    "created_at": now,
+                },
+                session=session,
+            )
+            result = await self.db.characters.update_one(
+                {"_id": character_id}, {"$set": values}, session=session
+            )
+            if not result.matched_count:
+                raise CatalogNotFound("Character not found")
+            await self._insert_artwork(artwork, now, session)
+
+        try:
+            await transaction(self.client, update)
+        except DuplicateKeyError as exc:
+            raise CatalogConflict("This command was already processed") from exc
+
+    async def artwork(self, digest: str) -> bytes | None:
+        doc = await self.db.character_artworks.find_one({"_id": digest}, {"content": 1})
+        data = doc.get("content") if doc else None
+        if (
+            not isinstance(data, bytes)
+            or not 0 < len(data) <= MAX_ARTWORK_BYTES
+            or not data.startswith(b"\xff\xd8\xff")
+            or hashlib.sha256(data).hexdigest() != digest
+        ):
+            return None
+        return data
+
     async def choose(self) -> dict[str, Any] | None:
         """Weight nonempty rarities, then uniformly choose one stable-catalog offset.
 
@@ -74,7 +209,11 @@ class CatalogRepository:
             remaining = dict(RARITY_WEIGHTS)
             while remaining:
                 rarity = self.rng.choices(list(remaining), weights=list(remaining.values()), k=1)[0]
-                query = {"active": True, "rarity": rarity}
+                accepted = spawn_values(rarity)
+                query: dict[str, Any] = {
+                    "active": True,
+                    "rarity": accepted[0] if len(accepted) == 1 else {"$in": list(accepted)},
+                }
                 count = await self.db.characters.count_documents(query)
                 if not count:
                     del remaining[rarity]
@@ -189,6 +328,29 @@ class CatalogRepository:
             "limit": limit,
             "total": await self.db.inventory.count_documents(query),
         }
+
+    async def inventory_cursor(
+        self,
+        user_id: int,
+        *,
+        secret: str,
+        cursor: str | None = None,
+        limit: int = 24,
+        favorite: bool = False,
+        duplicates: bool = False,
+        sort: InventorySort = "recent",
+    ) -> dict[str, Any]:
+        from summon.repositories.inventory_paging import SnapshotInventory
+
+        return await SnapshotInventory(self.db, self.client).page(
+            user_id,
+            secret=secret,
+            cursor=cursor,
+            limit=limit,
+            favorite=favorite,
+            duplicates=duplicates,
+            sort=sort,
+        )
 
     async def set_favorite(self, user_id: int, character_id: str, favorite: bool) -> bool:
         result = await self.db.inventory.update_one(

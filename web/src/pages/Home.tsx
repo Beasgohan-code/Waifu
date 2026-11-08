@@ -1,7 +1,7 @@
 import { ArrowRight, BookOpen, Gift, ShieldCheck, Sparkles, Star, Trophy, Zap } from 'lucide-react';
 import { CharacterCard, EmptyState, ProgressBar, SectionTitle, Skeleton } from '../components';
-import { useRemote } from '../hooks';
-import type { Character, Page, Profile, Progression, View } from '../types';
+import { useProgression, useRemote } from '../hooks';
+import type { Character, Page, Profile, View } from '../types';
 
 interface Props {
   profile: Profile; preview: boolean; revision: number; navigate: (view: View) => void;
@@ -11,8 +11,11 @@ interface Props {
 
 export default function Home({ profile, preview, revision, navigate, openCharacter, favorite, daily, dailyBusy }: Props) {
   const { data: catalogue, loading, error } = useRemote<Page<Character>>('/characters?limit=3', revision);
-  const { data: progression } = useRemote<Progression>('/progression', revision);
-  const claimed = profile.last_daily === new Date().toISOString().slice(0, 10);
+  const { data: progression, loading: checkingStatus, refresh: refreshStatus } = useProgression(revision);
+  const status = progression?.daily_status?.state;
+  const canClaim = !preview && !dailyBusy && !checkingStatus && status === 'available';
+  const dailyLabel = preview ? 'Preview only' : dailyBusy ? 'Claiming…' : checkingStatus ? 'Checking daily status…'
+    : status === 'claimed' ? 'Claimed today' : status === 'available' ? 'Claim daily reward' : 'Daily unavailable';
   const nextAchievement = progression?.achievements.find(item => !item.completed);
   return <div className="page-content home-page">
     <div className="page-heading home-heading"><div><span className="eyebrow">YOUR COLLECTOR'S SPACE <span className="eyebrow-star">✦</span></span>
@@ -50,7 +53,8 @@ export default function Home({ profile, preview, revision, navigate, openCharact
       <div className="journey-card"><div className="journey-top"><span className="journey-icon"><Gift size={19} /></span><span className="soft-label">DAILY REWARD</span></div>
         <h3>A little something<br />for you.</h3><p>Check in daily and keep your collector streak going.</p>
         <div className="reward-line"><span><Sparkles size={15} /> 100+ points</span><small>RESETS 00:00 UTC</small></div>
-        <button className="button button-primary full" disabled={preview || claimed || dailyBusy} onClick={daily}>{preview ? 'Preview only' : claimed ? 'Claimed today' : dailyBusy ? 'Claiming…' : 'Claim daily reward'}{!claimed && !preview && <ArrowRight size={15} />}</button>
+        <button className="button button-primary full" disabled={!canClaim} onClick={daily}>{dailyLabel}{canClaim && <ArrowRight size={15} />}</button>
+        {!preview && !checkingStatus && (!status || status === 'unavailable') && <button className="rail-link" onClick={refreshStatus}>Refresh daily status</button>}
       </div>
       <div className="journey-card progress-card"><div className="mini-label"><span>YOUR COLLECTION</span><BookOpen size={16} /></div>
         <div className="progress-number">{profile.unique_characters}<span> / {profile.catalog_size}</span></div><p>characters discovered</p>

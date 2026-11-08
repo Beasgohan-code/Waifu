@@ -9,7 +9,6 @@ description = "SUMMON — Collect. Discover. Summon."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "aiogram==3.31.0",
   "fastapi==0.162.0",
   "itsdangerous==2.2.0",
   "wzgram==3.1.6",
@@ -17,6 +16,7 @@ dependencies = [
   "pydantic-settings==2.16.2",
   "pymongo==4.19.0",
   "uvicorn[standard]==0.54.0",
+  "pillow==13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -70,6 +70,7 @@ select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
 # FastAPI declares dependency injection in parameter defaults.
 "summon/api/app.py" = ["B008"]
 "summon/api/routes.py" = ["B008"]
+"summon/api/routes_*.py" = ["B008"]
 # The API must be reachable through the container/preview proxy.
 "summon/api/run.py" = ["S104"]
 

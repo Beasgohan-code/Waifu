@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 
 from summon.auth import AuthenticationError, BoundSession, SessionCodec, TelegramUser
+from summon.services.moderation import _has_right
 
 
 def get_store(request: Request) -> Any:
@@ -46,3 +47,17 @@ async def limit_action(
         f"user:{user.id}:{action}", limit=limit, seconds=60
     ):
         raise HTTPException(status_code=429, detail="Too many requests; please try again shortly")
+
+
+def get_bot(request: Request) -> Any:
+    bot = request.app.state.telegram_bot
+    if bot is None:
+        raise HTTPException(503, "Group management is not connected to Telegram")
+    return bot
+
+
+def permissions(member: Any) -> dict[str, bool]:
+    return {
+        "can_change_info": _has_right(member, "can_change_info"),
+        "can_restrict_members": _has_right(member, "can_restrict_members"),
+    }

@@ -216,7 +216,9 @@ def test_goodbye_settings_require_live_change_info_right_and_session_actor():
     )
     bot = SimpleNamespace(
         get_chat_member=AsyncMock(
-            return_value=SimpleNamespace(status="administrator", can_change_info=False)
+            return_value=SimpleNamespace(
+                status="administrator", privileges=SimpleNamespace(can_change_info=False)
+            )
         )
     )
     settings = Settings(bot_token=TOKEN, session_secret=SECRET, _env_file=None)
@@ -232,7 +234,7 @@ def test_goodbye_settings_require_live_change_info_right_and_session_actor():
         assert denied.status_code == 403
         groups.update_settings.assert_not_awaited()
         bot.get_chat_member.return_value = SimpleNamespace(
-            status="administrator", can_change_info=True
+            status="administrator", privileges=SimpleNamespace(can_change_info=True)
         )
         result = api_client.patch("/api/groups/-100/settings", json=payload, headers=headers)
         assert result.status_code == 200
@@ -260,6 +262,8 @@ def test_production_session_cookie_is_secure_and_requires_https():
         session_secret=SECRET,
         mongo_uri="mongodb://example.invalid",
         webapp_url="https://miniapp.example",
+        telegram_api_id=12345,
+        telegram_api_hash="test-hash",
         _env_file=None,
     )
     with TestClient(

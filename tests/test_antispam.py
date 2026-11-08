@@ -76,17 +76,18 @@ def test_link_and_mention_entities_cannot_hide_behind_display_text():
 
 
 def test_text_mentions_are_not_double_counted_even_after_utf16_emoji():
-    from aiogram.types import MessageEntity
+    from wzgram.enums import MessageEntityType
+    from wzgram.types import MessageEntity, User
 
     settings = GroupSettings(mention_limit=2)
     text = "🚀 @alice and @bobby"
     # Telegram entity offsets use UTF-16 code units, not Python code points.
     entities = [
         MessageEntity(
-            type="text_mention",
+            type=MessageEntityType.TEXT_MENTION,
             offset=3,
             length=6,
-            user={"id": 1, "is_bot": False, "first_name": "Alice"},
+            user=User(id=1, is_bot=False, first_name="Alice"),
         )
     ]
     assert static_spam_reason(text, settings, entities=entities) is None

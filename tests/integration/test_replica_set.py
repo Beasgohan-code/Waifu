@@ -23,7 +23,7 @@ from summon.repositories.collection import CollectionRepository
 from summon.repositories.gifts import GiftRepository
 from summon.repositories.sessions import SessionRepository
 from summon.repositories.trades import TradeRepository
-from summon.repositories.users import DailyAlreadyClaimed, UserRepository
+from summon.repositories.users import DailyAlreadyClaimed, DailyStatusUnavailable, UserRepository
 from summon.seed import seed_characters
 from summon.services.gifting import GiftConflict
 from summon.services.trading import TradeConflict
@@ -102,6 +102,29 @@ async def test_concurrent_daily_claim_cannot_duplicate_rewards(isolated_database
     player = await db.users.find_one({"_id": user.id})
     assert player["points"] == 100
     assert await db.reward_history.count_documents({"user_id": user.id, "kind": "daily"}) == 1
+
+
+async def test_daily_utc_boundary_race_and_out_of_order_request(isolated_database):
+    client, db = isolated_database
+    repo = UserRepository(client, db)
+    user = TelegramUser(id=124, first_name="Test")
+    before = datetime(2026, 1, 1, 23, 59, 59, tzinfo=UTC)
+    after = before + timedelta(seconds=1)
+    first = await repo.daily(user, before)
+    results = await asyncio.gather(
+        *(repo.daily(user, after) for _ in range(4)), return_exceptions=True
+    )
+    rewards = [result for result in results if isinstance(result, dict)]
+    assert first["points"] == 100 and first["streak"] == 1
+    assert len(rewards) == 1
+    assert rewards[0]["points"] == 110 and rewards[0]["streak"] == 2
+    assert sum(isinstance(result, DailyAlreadyClaimed) for result in results) == 3
+    with pytest.raises(DailyStatusUnavailable):
+        await repo.daily(user, before)
+    player = await db.users.find_one({"_id": user.id})
+    assert player["points"] == 210 and player["xp"] == 40
+    assert player["last_daily"] == "2026-01-02"
+    assert await db.reward_history.count_documents({"user_id": user.id, "kind": "daily"}) == 2
 
 
 async def test_concurrent_trade_acceptance_swaps_once(isolated_database):
@@ -682,3 +705,149 @@ async def test_poller_health_out_of_order_and_future_writes_fail_safely(isolated
         {"_id": poller_health_key(bot, secret)}
     )
     assert unchanged == doc
+
+
+@pytest.mark.parametrize(
+    "sort,favorite,duplicates",
+    [("recent", False, False), ("copies", False, False), ("copies", True, True)],
+)
+async def test_snapshot_inventory_traverses_650_stable_rows_with_mutations(
+    isolated_database, sort, favorite, duplicates
+):
+    from pymongo.write_concern import WriteConcern
+
+    from summon.repositories.catalog import CatalogRepository
+    from summon.repositories.inventory_paging import CursorInvalid
+
+    client, db = isolated_database
+    durable_characters = db.characters.with_options(write_concern=WriteConcern(w="majority"))
+    durable_inventory = db.inventory.with_options(write_concern=WriteConcern(w="majority"))
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    characters = [
+        {
+            "_id": f"snapshot-{i:04d}",
+            "name": f"Snapshot {i}",
+            "name_key": f"snapshot {i}",
+            "category": "Synthetic",
+            "rarity": "rare",
+            "active": True,
+            "random_key": 0.5,
+        }
+        for i in range(650)
+    ]
+    rows = [
+        {
+            "user_id": 11,
+            "character_id": f"snapshot-{i:04d}",
+            "quantity": 1 + i % 4,
+            "favorite": i % 2 == 0,
+            **({"acquired_at": now + timedelta(seconds=i % 5)} if i % 7 else {}),
+        }
+        for i in range(650)
+    ]
+    await durable_characters.insert_many(characters)
+    await durable_inventory.insert_many(rows)
+    await durable_inventory.insert_one(
+        {"user_id": 22, "character_id": "snapshot-0000", "quantity": 99}
+    )
+    repo = CatalogRepository(db, client=client)
+    secret = "synthetic-integration-secret-that-is-long-enough"
+    query = dict(secret=secret, limit=24, sort=sort, favorite=favorite, duplicates=duplicates)
+    first = await repo.inventory_cursor(11, **query)
+    selected = [
+        row
+        for row in rows
+        if (not favorite or row["favorite"]) and (not duplicates or row["quantity"] > 1)
+    ]
+    selected.sort(key=lambda row: row["character_id"])
+    if sort == "recent":
+        selected.sort(
+            key=lambda row: row.get("acquired_at", datetime.min.replace(tzinfo=UTC)), reverse=True
+        )
+    else:
+        selected.sort(key=lambda row: row["quantity"], reverse=True)
+    assert first["total"] == len(selected)
+    assert first["page"] == 1 and first["next_cursor"] and first["page_cursor"]
+    with pytest.raises(CursorInvalid):
+        await repo.inventory_cursor(22, cursor=first["next_cursor"], **query)
+    with pytest.raises(CursorInvalid):
+        await repo.inventory_cursor(
+            11, cursor=first["next_cursor"], **{**query, "favorite": not favorite}
+        )
+
+    # Changes after the first page would move/filter rows in a live keyset query.
+    await durable_characters.insert_one(
+        {
+            "_id": "snapshot-added",
+            "name": "Added later",
+            "name_key": "added later",
+            "category": "Synthetic",
+            "rarity": "rare",
+            "active": True,
+            "random_key": 0.5,
+        }
+    )
+    await durable_inventory.insert_one(
+        {
+            "user_id": 11,
+            "character_id": "snapshot-added",
+            "quantity": 50,
+            "favorite": True,
+            "acquired_at": now + timedelta(days=1),
+        }
+    )
+    await durable_inventory.update_one(
+        {"user_id": 11, "character_id": selected[-1]["character_id"]},
+        {
+            "$set": {
+                "quantity": 99,
+                "favorite": not selected[-1]["favorite"],
+                "acquired_at": now + timedelta(days=1),
+            }
+        },
+    )
+    await durable_characters.update_one(
+        {"_id": selected[0]["character_id"]}, {"$set": {"name": "Changed later"}}
+    )
+    replay = await repo.inventory_cursor(11, cursor=first["page_cursor"], **query)
+    assert replay["items"] == first["items"] and replay["total"] == first["total"]
+
+    items = list(first["items"])
+    page = first
+    while page["next_cursor"]:
+        page = await repo.inventory_cursor(11, cursor=page["next_cursor"], **query)
+        items.extend(page["items"])
+    assert [item["id"] for item in items] == [row["character_id"] for row in selected]
+    assert [(item["quantity"], item["favorite"]) for item in items] == [
+        (row["quantity"], row["favorite"]) for row in selected
+    ]
+    assert len({item["id"] for item in items}) == len(selected)
+    assert all(item["id"] != "snapshot-added" for item in items)
+    fresh = await repo.inventory_cursor(11, **query)
+    assert fresh["total"] != first["total"] or fresh["items"] != first["items"]
+
+
+@pytest.mark.parametrize(
+    "bad,sort",
+    [
+        ({"character_id": "aiko", "quantity": 1, "acquired_at": "bad date"}, "recent"),
+        ({"character_id": "aiko", "quantity": "2"}, "copies"),
+        ({"character_id": "aiko", "quantity": 1.5}, "copies"),
+        ({"character_id": "", "quantity": 1}, "recent"),
+    ],
+)
+async def test_snapshot_inventory_rejects_legacy_corrupt_sort_values(isolated_database, bad, sort):
+    from pymongo.write_concern import WriteConcern
+
+    from summon.repositories.catalog import CatalogRepository
+    from summon.repositories.inventory_paging import CursorDataError
+
+    client, db = isolated_database
+    await db.inventory.with_options(write_concern=WriteConcern(w="majority")).insert_one(
+        {"user_id": 11, **bad}, bypass_document_validation=True
+    )
+    repo = CatalogRepository(db, client=client)
+    with pytest.raises(CursorDataError):
+        await repo.inventory_cursor(
+            11, secret="synthetic-integration-secret-long-enough", sort=sort
+        )

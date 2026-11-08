@@ -13,7 +13,7 @@ it('requests duplicate-only results and copy sorting from the server', async () 
   const fetcher = vi.fn((url: string) => {
     const params = new URL(url, 'https://miniapp.example').searchParams;
     const items = params.get('duplicates') === 'true' ? [duplicate] : [first, duplicate];
-    return Promise.resolve(reply({ items, total: items.length, page: Number(params.get('page')), limit: 24 }));
+    return Promise.resolve(reply({ items, total: items.length, page: 1, limit: 24, page_cursor: 'first', next_cursor: null }));
   });
   vi.stubGlobal('fetch', fetcher);
   const user = userEvent.setup();
@@ -27,16 +27,17 @@ it('requests duplicate-only results and copy sorting from the server', async () 
   await user.selectOptions(screen.getByLabelText('Sort collection'), 'copies');
   await waitFor(() => expect(fetcher.mock.calls.some(([url]) => {
     const params = new URL(url, 'https://miniapp.example').searchParams;
-    return params.get('duplicates') === 'true' && params.get('sort') === 'copies' && params.get('page') === '1';
+    return params.get('duplicates') === 'true' && params.get('sort') === 'copies' && !params.has('cursor');
   })).toBe(true));
-  expect(fetcher.mock.calls.every(([url]) => url.startsWith('/api/inventory?'))).toBe(true);
+  expect(fetcher.mock.calls.every(([url]) => url.startsWith('/api/inventory/pages?'))).toBe(true);
 });
 
 it('resets paging when changing filters and describes an empty duplicates view', async () => {
   const fetcher = vi.fn((url: string) => {
     const params = new URL(url, 'https://miniapp.example').searchParams;
     const filtered = params.get('duplicates') === 'true';
-    return Promise.resolve(reply({ items: filtered ? [] : [first], total: filtered ? 0 : 48, page: Number(params.get('page')), limit: 24 }));
+    const page = params.get('cursor') === 'next' ? 2 : 1;
+    return Promise.resolve(reply({ items: filtered ? [] : [first], total: filtered ? 0 : 48, page, limit: 24, page_cursor: 'first', next_cursor: !filtered && page === 1 ? 'next' : null }));
   });
   vi.stubGlobal('fetch', fetcher);
   const user = userEvent.setup();
@@ -48,14 +49,14 @@ it('resets paging when changing filters and describes an empty duplicates view',
   expect(await screen.findByText('No duplicates yet')).toBeInTheDocument();
   const filteredCalls = fetcher.mock.calls.filter(([url]) => new URL(url, 'https://miniapp.example').searchParams.get('duplicates') === 'true');
   expect(filteredCalls.length).toBeGreaterThan(0);
-  expect(filteredCalls.every(([url]) => new URL(url, 'https://miniapp.example').searchParams.get('page') === '1')).toBe(true);
+  expect(filteredCalls.every(([url]) => !new URL(url, 'https://miniapp.example').searchParams.has('cursor'))).toBe(true);
 });
 
 it('ignores a late response from an earlier collection filter', async () => {
   let resolveInitial: ((value: Response) => void) | undefined;
   const fetcher = vi.fn((url: string) => {
     const params = new URL(url, 'https://miniapp.example').searchParams;
-    if (params.get('duplicates') === 'true') return Promise.resolve(reply({ items: [duplicate], total: 1, page: 1, limit: 24 }));
+    if (params.get('duplicates') === 'true') return Promise.resolve(reply({ items: [duplicate], total: 1, page: 1, limit: 24, page_cursor: 'first', next_cursor: null }));
     return new Promise<Response>(resolve => { resolveInitial = resolve; });
   });
   vi.stubGlobal('fetch', fetcher);
@@ -63,7 +64,7 @@ it('ignores a late response from an earlier collection filter', async () => {
   render(<Catalog {...props} />);
   await user.click(screen.getByRole('button', { name: 'Duplicates' }));
   expect(await screen.findByRole('button', { name: 'View Ren' })).toBeInTheDocument();
-  resolveInitial?.(reply({ items: [first], total: 1, page: 1, limit: 24 }));
+  resolveInitial?.(reply({ items: [first], total: 1, page: 1, limit: 24, page_cursor: 'first', next_cursor: null }));
   await waitFor(() => expect(screen.queryByRole('button', { name: 'View Aiko' })).not.toBeInTheDocument());
   expect(screen.getByRole('button', { name: 'View Ren' })).toBeInTheDocument();
 });
@@ -71,7 +72,8 @@ it('ignores a late response from an earlier collection filter', async () => {
 it('does not jump back to page one when the initial empty search timer finishes', async () => {
   const fetcher = vi.fn((url: string) => {
     const params = new URL(url, 'https://miniapp.example').searchParams;
-    return Promise.resolve(reply({ items: [first], total: 48, page: Number(params.get('page')), limit: 24 }));
+    const page = params.get('cursor') === 'next' ? 2 : 1;
+    return Promise.resolve(reply({ items: [first], total: 48, page, limit: 24, page_cursor: 'first', next_cursor: page === 1 ? 'next' : null }));
   });
   vi.stubGlobal('fetch', fetcher);
   const user = userEvent.setup();

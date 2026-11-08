@@ -4,9 +4,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import SendMessage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from wzgram.enums import ButtonStyle
+from wzgram.errors import BadRequest
+from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from summon.bot.emoji_palette import PALETTES, palette_icon
 from summon.bot.presentation import Card, Emoji, fallback_keyboard, send_card
@@ -264,9 +264,7 @@ def test_field_icon_count_must_match_fields():
 async def test_multiple_new_icons_fall_back_once_without_losing_button_actions():
     bot = AsyncMock()
     bot.send_message.side_effect = [
-        TelegramBadRequest(
-            method=SendMessage(chat_id=123, text="x"), message="CUSTOM_EMOJI_INVALID"
-        ),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         "sent",
     ]
     markup = InlineKeyboardMarkup(
@@ -276,13 +274,13 @@ async def test_multiple_new_icons_fall_back_once_without_losing_button_actions()
                     text="Open",
                     web_app=WebAppInfo(url="https://miniapp.example"),
                     icon_custom_emoji_id=Emoji.OPEN_COLLECTION.value[1],
-                    style="primary",
+                    style=ButtonStyle.PRIMARY,
                 ),
                 InlineKeyboardButton(
                     text="Accept",
                     callback_data="gift:accept:abc",
                     icon_custom_emoji_id=Emoji.GIFT_ACTION.value[1],
-                    style="success",
+                    style=ButtonStyle.SUCCESS,
                 ),
             ]
         ]
@@ -293,7 +291,7 @@ async def test_multiple_new_icons_fall_back_once_without_losing_button_actions()
         fields=(("Points", "40"),),
         field_icons=(Emoji.REWARD_COIN,),
     )
-    assert await send_card(bot, 123, card, reply_markup=markup) == "sent"
+    assert await send_card(bot, 123, card, reply_markup=markup, rich=False) == "sent"
     first, second = bot.send_message.await_args_list
     assert Emoji.SUMMON_BRAND.value[1] in first.kwargs["text"]
     assert Emoji.REWARD_COIN.value[1] in first.kwargs["text"]
@@ -325,14 +323,8 @@ def test_every_new_button_has_a_unicode_fallback_and_keeps_actions(pack):
 
 
 async def test_rich_rejection_strips_every_new_field_icon_and_preserves_actions():
-    from aiogram.methods import SendRichMessage
-    from aiogram.types import InputRichMessage
-
     bot = AsyncMock()
-    bot.send_rich_message.side_effect = TelegramBadRequest(
-        method=SendRichMessage(chat_id=123, rich_message=InputRichMessage(html="<p>x</p>")),
-        message="unsupported rich message",
-    )
+    bot.send_rich_message.side_effect = BadRequest("UNSUPPORTED_RICH_MESSAGE")
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -350,8 +342,8 @@ async def test_rich_rejection_strips_every_new_field_icon_and_preserves_actions(
         fields=(("Series", "A & B"), ("Reward", "40")),
         field_icons=(Emoji.SERIES_TAG, Emoji.REWARD_COIN),
     )
-    await send_card(bot, 123, card, reply_markup=markup, bot_api_rich=True)
-    rich_html = bot.send_rich_message.await_args.kwargs["rich_message"].html
+    await send_card(bot, 123, card, reply_markup=markup, rich=True)
+    rich_html = bot.send_rich_message.await_args.kwargs["rich_text"].html
     assert Emoji.SERIES_TAG.value[1] in rich_html
     assert Emoji.REWARD_COIN.value[1] in rich_html
     plain = bot.send_message.await_args.kwargs
@@ -369,7 +361,7 @@ async def test_disabled_premium_does_not_send_new_custom_emoji_ids():
         fields=(("Points", "40"),),
         field_icons=(Emoji.REWARD_COIN,),
     )
-    await send_card(bot, 123, card, premium=False)
+    await send_card(bot, 123, card, premium=False, rich=False)
     text = bot.send_message.await_args.kwargs["text"]
     assert "tg-emoji" not in text
     assert Emoji.SUMMON_BRAND.value[0] in text and Emoji.REWARD_COIN.value[0] in text
@@ -379,9 +371,8 @@ async def test_ephemeral_field_icons_fall_back_without_exposing_private_data():
     from summon.bot.presentation import send_ephemeral_card
 
     bot = AsyncMock()
-    method = SendMessage(chat_id=-100, text="x")
     bot.send_message.side_effect = [
-        TelegramBadRequest(method=method, message="CUSTOM_EMOJI_INVALID"),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         "private-overlay",
     ]
     card = Card(
@@ -408,9 +399,7 @@ async def test_timeout_after_ephemeral_emoji_rejection_never_falls_back_publicly
 
     bot = AsyncMock()
     bot.send_message.side_effect = [
-        TelegramBadRequest(
-            method=SendMessage(chat_id=-100, text="x"), message="CUSTOM_EMOJI_INVALID"
-        ),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         TimeoutError("delivery unknown"),
     ]
     card = Card("Private", fields=(("Points", "40"),), field_icons=(Emoji.REWARD_COIN,))
@@ -428,12 +417,10 @@ async def test_rejected_ephemeral_and_dm_icons_keep_field_contents_private():
     from summon.bot.presentation import send_ephemeral_card
 
     bot = AsyncMock()
-    group = SendMessage(chat_id=-100, text="x")
-    dm = SendMessage(chat_id=42, text="x")
     bot.send_message.side_effect = [
-        TelegramBadRequest(method=group, message="CUSTOM_EMOJI_INVALID"),
-        TelegramBadRequest(method=group, message="EPHEMERAL_UNSUPPORTED"),
-        TelegramBadRequest(method=dm, message="CUSTOM_EMOJI_INVALID"),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
+        BadRequest("EPHEMERAL_UNSUPPORTED"),
+        BadRequest("CUSTOM_EMOJI_INVALID"),
         "private-dm",
     ]
     card = Card("Profile", fields=(("Points", "40"),), field_icons=(Emoji.REWARD_COIN,))

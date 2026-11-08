@@ -32,6 +32,6 @@ RUN groupadd --system --gid 10001 summon \
     && useradd --system --uid 10001 --gid summon --home-dir /app --shell /usr/sbin/nologin summon
 USER 10001:10001
 EXPOSE 10000
-# Render supplies PORT; other environments default to 8000. For the separate
-# single-instance polling worker, override this command with summon-bot.
+# Render supplies PORT; other environments default to 8000. Run summon-bot as
+# a separate, singleton Wzgram worker; its MongoDB lease coordinates restarts.
 CMD ["summon-api"]

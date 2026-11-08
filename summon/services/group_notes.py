@@ -12,16 +12,15 @@ from summon.group_notes import (
     validate_note_name,
     validate_revision,
 )
-from summon.services.moderation import PermissionDenied, require_group_admin
+from summon.services.moderation import PermissionDenied, _status, require_group_admin
 
 
 async def _require_member(bot: Any, group_id: int, actor_id: int) -> None:
     validate_group_id(group_id)
     validate_actor_id(actor_id)
     member = await bot.get_chat_member(group_id, actor_id)
-    status = getattr(member, "status", "")
-    status = str(getattr(status, "value", status))
-    if status in {"creator", "administrator", "member"}:
+    status = _status(member)
+    if status in {"owner", "creator", "administrator", "member"}:
         return
     if status == "restricted" and getattr(member, "is_member", False) is True:
         return

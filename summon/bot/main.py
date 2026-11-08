@@ -1,21 +1,20 @@
-"""aiogram is the only update ingress; Wzgram is optional and outbound-only."""
+"""Run SUMMON's single, coordinated native Wzgram update client."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 
-from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import BotCommandScopeAllGroupChats
-from wzgram import Client
+from wzgram import Client, idle
+from wzgram.errors import RPCError
+from wzgram.types import BotCommandScopeAllGroupChats
 
-from summon._vendor import richgram_builders as richgram
 from summon.api.context import Store
 from summon.bot.compat import validate_runtime
-from summon.bot.handlers import COMMANDS, build_router, group_commands
-from summon.bot.poller_health import PollerHealthPublisher
-from summon.bot.watchdog import run_supervised_polling
+from summon.bot.handlers import COMMANDS, group_commands, register_handlers
+from summon.bot.ingress import IngressLease
+from summon.bot.session_storage import bot_id_from_token, start_verified_client, worker_storage
+from summon.bot.watchdog import monitor_connection
 from summon.config import Settings
 from summon.database import connect_database
 from summon.repositories.poller_health import PollerHealthRepository
@@ -23,78 +22,140 @@ from summon.repositories.poller_health import PollerHealthRepository
 logger = logging.getLogger(__name__)
 
 
-def create_outbound_client(settings: Settings) -> Client:
-    return Client(
-        "summon-outbound",
-        api_id=settings.telegram_api_id,
-        api_hash=settings.telegram_api_hash.get_secret_value(),
-        bot_token=settings.bot_token.get_secret_value(),
-        in_memory=True,
-        no_updates=True,
-    )
-
-
-async def register_command_menus(bot: Bot) -> None:
-    await bot.set_my_commands(COMMANDS)
-    scope = BotCommandScopeAllGroupChats()
+async def register_command_menus(bot: Client) -> None:
     try:
-        await bot.set_my_commands(group_commands(), scope=scope)
-    except TelegramBadRequest:
-        # Older/self-hosted Bot API servers may reject is_ephemeral; retain a usable menu.
-        logger.warning("Ephemeral commands unavailable; registering a standard group menu")
-        await bot.set_my_commands(COMMANDS, scope=scope)
+        await bot.set_bot_commands(COMMANDS)
+        await bot.set_bot_commands(group_commands(), scope=BotCommandScopeAllGroupChats())
+    except RPCError as exc:
+        # Menu registration is nonessential; command handlers remain available.
+        logger.warning("Telegram command menu registration failed (%s)", type(exc).__name__)
 
 
 async def run() -> None:
     settings = Settings()
     validate_runtime()
     token = settings.bot_token.get_secret_value()
-    if not token:
-        raise RuntimeError("SUMMON_BOT_TOKEN is required to start the bot")
-    client, database = await connect_database(settings)
-    bot = Bot(token)
-    outbound: Client | None = None
-    publisher: PollerHealthPublisher | None = None
-    publisher_task: asyncio.Task[None] | None = None
-    try:
-        if settings.rich_enabled and richgram.RICH_AVAILABLE:
-            candidate = create_outbound_client(settings)
-            try:
-                await candidate.start()
-                outbound = candidate
-            except Exception as exc:
-                logger.warning(
-                    "Outbound rich client unavailable (%s); using standard Bot API",
-                    type(exc).__name__,
-                )
-        elif settings.rich_enabled:
-            logger.warning("Installed Wzgram lacks rich-message support; using standard Bot API")
-        store = Store(client, database)
-        dispatcher = Dispatcher()
-        dispatcher.include_router(build_router(store, settings, outbound))
-        await register_command_menus(bot)
-        # Polling and webhooks are mutually exclusive. Preserve pending updates.
-        await bot.delete_webhook(drop_pending_updates=False)
-        logger.info("SUMMON bot starting with aiogram as the sole update ingress")
-        if settings.poller_heartbeat_enabled:
-            publisher = PollerHealthPublisher(
-                PollerHealthRepository(database, token, settings.session_secret.get_secret_value())
-            )
-            publisher_task = asyncio.create_task(publisher.run())
-        await run_supervised_polling(
-            dispatcher,
-            bot,
-            timeout_seconds=settings.poll_watchdog_seconds,
-            on_success=publisher.observe if publisher is not None else None,
+    bot_id = bot_id_from_token(token)
+    if not settings.telegram_api_id or not settings.telegram_api_hash.get_secret_value():
+        raise RuntimeError("SUMMON_TELEGRAM_API_ID and SUMMON_TELEGRAM_API_HASH are required")
+    if not settings.webhooks_disabled_confirmed:
+        raise RuntimeError(
+            "Stop other update consumers and remove any existing Bot API webhook before "
+            "setting SUMMON_WEBHOOKS_DISABLED_CONFIRMED=true"
         )
+
+    mongo, database = await connect_database(settings)
+    lease = IngressLease(database, bot_id)
+    bot: Client | None = None
+    lease_task: asyncio.Task[None] | None = None
+    monitor_task: asyncio.Task[None] | None = None
+    idle_task: asyncio.Task[None] | None = None
+    startup_task: asyncio.Task[None] | None = None
+    acquired = False
+    try:
+        async with asyncio.timeout(10):
+            await lease.acquire()
+        acquired = True
+        # Renew during Telegram login and gap recovery as well as normal operation.
+        lease_task = asyncio.create_task(lease.maintain(), name="ingress-lease")
+        storage = worker_storage(mongo, settings.telegram_session_database)
+        bot = Client(
+            "summon-bot",
+            api_id=settings.telegram_api_id,
+            api_hash=settings.telegram_api_hash.get_secret_value(),
+            bot_token=token,
+            storage_engine=storage,
+            no_updates=False,
+            skip_updates=False,
+            auto_no_updates=False,
+        )
+        lease.register(bot)
+        register_handlers(bot, Store(mongo, database), settings)
+        # Wzgram schedules registration on the current event loop. Let the
+        # registration tasks finish and verify them BEFORE connecting Telegram.
+        await asyncio.sleep(0)
+        groups = bot.dispatcher.groups
+        if (
+            len(groups.get(-1000, ())) < 3
+            or len(groups.get(-100, ())) < 2
+            or len(groups.get(0, ())) < 40
+        ):
+            raise RuntimeError("Wzgram handlers did not finish registering")
+
+        async def start_bot() -> None:
+            if bot is None:
+                raise RuntimeError("Wzgram client was not created")
+            async with asyncio.timeout(60):
+                await start_verified_client(bot, token, bot_id)
+            if not lease.valid():
+                raise RuntimeError("Update-worker lease expired during startup")
+            try:
+                async with asyncio.timeout(10):
+                    await register_command_menus(bot)
+            except TimeoutError:
+                logger.warning("Telegram command menu registration timed out")
+
+        startup_task = asyncio.create_task(start_bot(), name="telegram-startup")
+        startup_done, _ = await asyncio.wait(
+            {startup_task, lease_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if lease_task in startup_done:
+            await lease_task
+            raise RuntimeError("Update-worker lease stopped during startup")
+        await startup_task
+        logger.info("SUMMON started with one native Wzgram update consumer")
+        health = (
+            PollerHealthRepository(database, token, settings.session_secret.get_secret_value())
+            if settings.poller_heartbeat_enabled
+            else None
+        )
+        monitor_task = asyncio.create_task(
+            monitor_connection(
+                bot,
+                lease,
+                timeout_seconds=settings.poll_watchdog_seconds,
+                health_repository=health,
+            ),
+            name="telegram-connection-monitor",
+        )
+        idle_task = asyncio.create_task(idle(), name="telegram-idle")
+        done, _ = await asyncio.wait(
+            {lease_task, monitor_task, idle_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        # A lost lease or failed connection monitor causes the process manager
+        # to restart this worker; a signal normally resolves idle().
+        for finished in done:
+            await finished
     finally:
-        if publisher_task is not None:
-            publisher_task.cancel()
-            await asyncio.gather(publisher_task, return_exceptions=True)
-        if outbound is not None:
-            await outbound.stop()
-        await bot.session.close()
-        await client.close()
+        lease.invalidate()
+        for pending_task in (startup_task, idle_task, monitor_task, lease_task):
+            if pending_task is not None:
+                pending_task.cancel()
+        await asyncio.gather(
+            *(
+                task
+                for task in (startup_task, idle_task, monitor_task, lease_task)
+                if task is not None
+            ),
+            return_exceptions=True,
+        )
+        stopped = bot is None
+        if bot is not None:
+            try:
+                async with asyncio.timeout(20):
+                    await bot.stop()
+                stopped = not bot.is_connected and not bot.is_initialized
+            except Exception as exc:
+                logger.error("Could not stop Wzgram cleanly (%s)", type(exc).__name__)
+        if acquired and stopped:
+            try:
+                async with asyncio.timeout(5):
+                    await lease.release()
+            except Exception as exc:
+                logger.warning("Could not release ingress lease (%s)", type(exc).__name__)
+        # If disconnect was uncertain, leave the lease to expire rather than
+        # deliberately allowing a second worker to start immediately.
+        await mongo.close()
 
 
 def main() -> None:

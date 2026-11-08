@@ -6,11 +6,12 @@ import math
 import re
 import unicodedata
 from typing import Literal
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-Rarity = Literal["common", "rare", "epic", "legendary"]
+from summon.rarities import Rarity
+from summon.services.artwork import validate_external_url
+
 InventorySort = Literal["recent", "copies"]
 
 
@@ -38,10 +39,26 @@ class CharacterInput(BaseModel):
     def valid_artwork(cls, value: str) -> str:
         if re.fullmatch(r"/art/[a-zA-Z0-9_-]+\.(?:png|jpe?g|webp)", value):
             return value
-        parts = urlsplit(value)
-        if parts.scheme == "https" and parts.hostname and not parts.username and not parts.password:
+        if re.fullmatch(r"/api/artwork/[0-9a-f]{64}", value):
             return value
-        raise ValueError("Artwork must use an HTTPS URL or an /art/ image path")
+        return validate_external_url(value)
+
+
+class CharacterChanges(BaseModel):
+    """Explicit metadata updates; character IDs and ownership are immutable."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    category: str | None = Field(default=None, min_length=1, max_length=120)
+    rarity: Rarity | None = None
+    image_url: str | None = Field(default=None, max_length=2048)
+    description: str | None = Field(default=None, max_length=1200)
+
+    @field_validator("image_url")
+    @classmethod
+    def valid_artwork(cls, value: str | None) -> str | None:
+        return None if value is None else CharacterInput.valid_artwork(value)
 
 
 class GroupSettings(BaseModel):

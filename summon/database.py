@@ -20,6 +20,7 @@ from summon.auto_replies import (
 )
 from summon.config import Settings
 from summon.group_notes import MAX_NOTE_LENGTH, MAX_NOTES, NOTE_NAME_PATTERN, NOTE_REVISION_PATTERN
+from summon.rarities import RARITY_VALUES
 
 _NUMBER = ["int", "long"]
 COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -31,9 +32,20 @@ COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "name": {"bsonType": "string", "minLength": 1, "maxLength": 120},
             "name_key": {"bsonType": "string"},
             "category": {"bsonType": "string", "maxLength": 120},
-            "rarity": {"enum": ["common", "rare", "epic", "legendary"]},
+            "rarity": {"enum": list(RARITY_VALUES)},
             "active": {"bsonType": "bool"},
             "random_key": {"bsonType": "double", "minimum": 0, "maximum": 1},
+        },
+    },
+    "character_artworks": {
+        "bsonType": "object",
+        "required": ["_id", "content", "content_type", "created_at"],
+        "additionalProperties": False,
+        "properties": {
+            "_id": {"bsonType": "string", "pattern": "^[0-9a-f]{64}$"},
+            "content": {"bsonType": "binData"},
+            "content_type": {"enum": ["image/jpeg"]},
+            "created_at": {"bsonType": "date"},
         },
     },
     "inventory": {
@@ -266,7 +278,7 @@ POLLER_HEALTH_SCHEMA: dict[str, Any] = {
     "required": ["_id", "observed_at", "expires_at"],
     "additionalProperties": False,
     "properties": {
-        "_id": {"bsonType": "string", "pattern": "^poller:[0-9a-f]{64}$"},
+        "_id": {"bsonType": "string", "pattern": "^(poller|mtproto):[0-9a-f]{64}$"},
         "observed_at": {"bsonType": "date"},
         "expires_at": {"bsonType": "date"},
     },

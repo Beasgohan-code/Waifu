@@ -25,14 +25,23 @@ def test_production_requires_real_secret_and_database_settings():
         session_secret="x" * 40,
         mongo_uri="mongodb://example.invalid/summon",
         webapp_url="https://summon.example/app",
+        telegram_api_id=12345,
+        telegram_api_hash="test-hash",
         _env_file=None,
     )
     assert settings.environment == "production"
 
 
-def test_rich_client_requires_telegram_application_credentials():
-    with pytest.raises(ValueError):
-        Settings(rich_enabled=True, _env_file=None)
+def test_production_wzgram_requires_telegram_application_credentials():
+    with pytest.raises(ValueError, match="SUMMON_TELEGRAM_API_ID"):
+        Settings(
+            environment="production",
+            bot_token="123:token",
+            session_secret="x" * 40,
+            mongo_uri="mongodb://example.invalid/summon",
+            webapp_url="https://summon.example",
+            _env_file=None,
+        )
 
 
 def test_origins_must_be_exact_hosts_and_https_in_production():
@@ -124,6 +133,8 @@ def test_production_environment_requires_url_before_startup(monkeypatch):
     with pytest.raises(ValueError, match="SUMMON_WEBAPP_URL"):
         Settings(_env_file=None)
     monkeypatch.setenv("SUMMON_WEBAPP_URL", "https://summon.example/app")
+    monkeypatch.setenv("SUMMON_TELEGRAM_API_ID", "12345")
+    monkeypatch.setenv("SUMMON_TELEGRAM_API_HASH", "test-hash")
     assert Settings(_env_file=None).webapp_url == "https://summon.example/app"
 
 
@@ -202,3 +213,33 @@ def test_allowlist_requires_browser_serialized_origins(origin):
 )
 def test_browser_serialized_origins_are_valid(origin):
     assert Settings(allowed_origins=[origin], _env_file=None).allowed_origins == [origin]
+
+
+def test_simple_environment_aliases_and_prefixed_precedence(monkeypatch, tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("SUMMON_MONGO_URI=mongodb://dotenv.invalid/db\nBOT_TOKEN=dotenv-token\n")
+    monkeypatch.setenv("MONGO_URL", "mongodb://environment.invalid/db")
+    monkeypatch.setenv("BOT_TOKEN", "alias-token")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 40)
+    monkeypatch.setenv("API_ID", "1234")
+    monkeypatch.setenv("API_HASH", "fake-hash")
+    monkeypatch.setenv("OWNER_ID", "42")
+    settings = Settings(_env_file=dotenv)
+    assert settings.mongo_uri.get_secret_value() == "mongodb://environment.invalid/db"
+    assert settings.bot_token.get_secret_value() == "alias-token"
+    assert settings.telegram_api_id == 1234
+    assert settings.operator_ids == [42]
+    monkeypatch.setenv("SUMMON_MONGO_URI", "mongodb://prefixed.invalid/db")
+    monkeypatch.setenv("SUMMON_BOT_TOKEN", "")
+    settings = Settings(_env_file=dotenv)
+    assert settings.mongo_uri.get_secret_value() == "mongodb://prefixed.invalid/db"
+    assert settings.bot_token.get_secret_value() == ""
+    explicit = Settings(mongo_uri="mongodb://explicit.invalid/db", _env_file=dotenv)
+    assert explicit.mongo_uri.get_secret_value() == "mongodb://explicit.invalid/db"
+
+
+def test_bad_alias_values_are_not_exposed_in_errors(monkeypatch):
+    monkeypatch.setenv("OWNER_ID", "FAKE_SECRET_OWNER_SENTINEL")
+    with pytest.raises(ValueError) as error:
+        Settings(_env_file=None)
+    assert "FAKE_SECRET_OWNER_SENTINEL" not in str(error.value)

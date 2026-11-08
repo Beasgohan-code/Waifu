@@ -6,8 +6,6 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, cast
 
-from aiogram.types import ChatPermissions
-
 
 class PermissionDenied(PermissionError):
     pass
@@ -20,8 +18,9 @@ def _status(member: Any) -> str:
 
 def _has_right(member: Any, right: str | None) -> bool:
     status = _status(member)
-    return status == "creator" or (
-        status == "administrator" and (right is None or bool(getattr(member, right, False)))
+    return status in {"owner", "creator"} or (
+        status == "administrator"
+        and (right is None or bool(getattr(getattr(member, "privileges", None), right, False)))
     )
 
 
@@ -36,16 +35,20 @@ async def require_group_admin(
     return member
 
 
-async def require_moderation_rights(bot: Any, group_id: int, actor_id: int, target_id: int) -> None:
-    if actor_id == target_id or target_id == bot.id or target_id <= 0:
+async def require_moderation_rights(bot: Any, group_id: int, actor_id: int, target_id: int) -> Any:
+    identity = getattr(getattr(bot, "me", None), "id", None)
+    if not identity:
+        raise PermissionDenied("The bot identity is unavailable")
+    if actor_id == target_id or target_id == identity or target_id <= 0:
         raise PermissionDenied("You cannot moderate yourself or the bot")
     await require_group_admin(bot, group_id, actor_id, "can_restrict_members")
-    bot_member = await bot.get_chat_member(group_id, bot.id)
+    bot_member = await bot.get_chat_member(group_id, identity)
     if not _has_right(bot_member, "can_restrict_members"):
         raise PermissionDenied("The bot needs permission to restrict members")
     target = await bot.get_chat_member(group_id, target_id)
-    if _status(target) in {"creator", "administrator"}:
+    if _status(target) in {"owner", "creator", "administrator"}:
         raise PermissionDenied("Group administrators cannot be moderated here")
+    return target
 
 
 def _warning_target(target_id: int) -> None:
@@ -124,46 +127,20 @@ class ModerationService:
         if duration_seconds is not None and not 60 <= duration_seconds <= 366 * 86400:
             raise ValueError("Duration must be between one minute and one year")
         await require_moderation_rights(self.bot, group_id, actor_id, target_id)
+        # Wzgram's EditBanned-based restriction write clears view_messages.
+        # Even a fresh membership check can race another administrator's ban,
+        # so mute/unmute could accidentally unban the target. Unban and kick
+        # likewise lack an atomic only-if-banned guard. Fail closed for all.
+        if action in {"unban", "kick", "mute", "unmute"}:
+            raise PermissionDenied(
+                "This action is unavailable in Wzgram; use Telegram's group controls instead"
+            )
         until = now + timedelta(seconds=duration_seconds) if duration_seconds else None
         if action == "ban":
-            await self.bot.ban_chat_member(group_id, target_id, until_date=until)
-        elif action == "unban":
-            await self.bot.unban_chat_member(group_id, target_id, only_if_banned=True)
-        elif action == "mute":
-            # Explicitly deny every message type, rather than depending on old defaults.
-            await self.bot.restrict_chat_member(
-                group_id,
-                target_id,
-                permissions=ChatPermissions(
-                    can_send_messages=False,
-                    can_send_audios=False,
-                    can_send_documents=False,
-                    can_send_photos=False,
-                    can_send_videos=False,
-                    can_send_video_notes=False,
-                    can_send_voice_notes=False,
-                    can_send_polls=False,
-                    can_send_other_messages=False,
-                    can_add_web_page_previews=False,
-                ),
-                until_date=until,
-                use_independent_chat_permissions=True,
-            )
-        elif action == "unmute":
-            # Restore the current group defaults, not a hard-coded set of extra privileges.
-            chat = await self.bot.get_chat(group_id)
-            if chat.permissions is None:
-                raise PermissionDenied("Could not determine the group's default permissions")
-            await self.bot.restrict_chat_member(
-                group_id,
-                target_id,
-                permissions=chat.permissions,
-                use_independent_chat_permissions=True,
-            )
-        elif action == "kick":
-            # Telegram's kick is ban + unban. A failure after the ban is not reported as success.
-            await self.bot.ban_chat_member(group_id, target_id)
-            await self.bot.unban_chat_member(group_id, target_id, only_if_banned=True)
+            if until is None:
+                await self.bot.ban_chat_member(group_id, target_id)
+            else:
+                await self.bot.ban_chat_member(group_id, target_id, until_date=until)
         result = await self.groups.record_moderation(
             group_id, actor_id, target_id, action, reason, now
         )

@@ -21,9 +21,17 @@ def static_spam_reason(
 ) -> str | None:
     # Telegram text_link/text_mention entities can conceal a URL or user behind
     # innocent display text, so inspecting plain text alone is insufficient.
-    typed_entities = [
-        (str(getattr(entity.type, "value", entity.type)), entity) for entity in entities
-    ]
+    typed_entities = []
+    for entity in entities:
+        entity_type = getattr(entity, "type", "")
+        # Wzgram enum values are MTProto classes; the enum name is stable.
+        name = getattr(entity_type, "name", None)
+        kind = (
+            name.lower()
+            if isinstance(name, str)
+            else str(getattr(entity_type, "value", entity_type))
+        )
+        typed_entities.append((kind, entity))
     if settings.link_filter and (
         _LINK.search(text) or any(kind in {"url", "text_link"} for kind, _ in typed_entities)
     ):

@@ -5,8 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
-from aiogram.methods import GetChatMember
 from fastapi.testclient import TestClient
 from pymongo import DESCENDING, ReturnDocument
 from pymongo.errors import AutoReconnect
@@ -23,7 +21,10 @@ NEXT_ID = "b" * 32
 
 
 def role(status="administrator", restrict=True):
-    return SimpleNamespace(status=status, can_restrict_members=restrict)
+    return SimpleNamespace(
+        status="owner" if status == "creator" else status,
+        privileges=SimpleNamespace(can_restrict_members=restrict),
+    )
 
 
 class FakeCursor:
@@ -365,9 +366,7 @@ def test_api_telegram_and_database_outages_fail_closed_without_retry():
     path = "/api/groups/-100/members/55/warnings"
     with TestClient(app) as client:
         attach_session(client, secret)
-        bot.get_chat_member.side_effect = TelegramNetworkError(
-            method=GetChatMember(chat_id=-100, user_id=123), message="sensitive failure"
-        )
+        bot.get_chat_member.side_effect = ConnectionError("sensitive failure")
         res = client.get(path)
         assert res.status_code == 503 and "sensitive failure" not in res.text
         store.groups.list_warnings.assert_not_awaited()
@@ -460,7 +459,7 @@ async def test_fake_concurrent_revocations_only_one_wins_and_writes_audit(monkey
 
 async def test_warning_issuance_never_applies_automatic_restriction():
     bot = SimpleNamespace(
-        id=99,
+        me=SimpleNamespace(id=99),
         get_chat_member=AsyncMock(side_effect=[role("creator"), role(), role("member")]),
         ban_chat_member=AsyncMock(),
         restrict_chat_member=AsyncMock(),

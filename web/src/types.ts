@@ -1,4 +1,5 @@
-export type Rarity = 'common' | 'rare' | 'epic' | 'legendary';
+import type { Rarity } from './rarities';
+export type { Rarity } from './rarities';
 
 export interface Character {
   id: string;
@@ -30,7 +31,8 @@ export interface Profile {
 }
 export interface Achievement { id: string; title: string; description: string; current: number; target: number; completed: boolean }
 export interface DailyQuest { id: string; title: string; description: string; completed: boolean; reward: string }
-export interface Progression { achievements: Achievement[]; daily: DailyQuest[] }
+export interface DailyStatus { state: 'available' | 'claimed' | 'unavailable'; server_time: string; next_reset_at: string }
+export interface Progression { achievements: Achievement[]; daily: DailyQuest[]; daily_status?: DailyStatus }
 export interface Leader { name: string; catch_count: number; level: number }
 export interface Trade {
   id: string; sender_id: number; receiver_id: number; offer_id: string; request_id: string;

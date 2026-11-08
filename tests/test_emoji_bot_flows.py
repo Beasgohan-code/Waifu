@@ -1,11 +1,13 @@
 """The supplied IDs are used in real bot responses, not only in a catalogue."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from wzgram import Client
 
-from summon.bot.handlers import build_router
+from summon.bot.handlers import register_handlers
 from summon.bot.presentation import Emoji
 from summon.config import Settings
 from summon.repositories.users import DailyAlreadyClaimed
@@ -51,11 +53,34 @@ def make_message(chat_type="private"):
         message_thread_id=None,
         ephemeral_message_id=None,
         bot=AsyncMock(),
+        text="/test",
+        caption=None,
+        command=["test"],
     )
 
 
-def find_handler(router, name):
-    return next(item.callback for item in router.message.handlers if item.callback.__name__ == name)
+async def native_app(store, settings):
+    app = Client("offline-test", api_id=123, api_hash="test", bot_token="123:fake", in_memory=True)
+    register_handlers(app, store, settings)
+    await asyncio.sleep(0)
+    return app
+
+
+def find_handler(app, name):
+    callback = next(
+        item.callback for item in app.dispatcher.groups[0] if item.callback.__name__ == name
+    )
+
+    async def invoke(message, args=None):
+        command = {"propose_trade": "trade", "propose_gift": "gift", "guess": "summon"}.get(
+            name, name
+        )
+        message.command = [command]
+        argument = getattr(args, "args", None)
+        message.text = "/" + command + (" " + argument if argument else "")
+        return await callback(app, message)
+
+    return invoke
 
 
 @pytest.mark.parametrize(
@@ -70,7 +95,7 @@ def find_handler(router, name):
     ],
 )
 async def test_real_command_cards_choose_meaningful_user_emoji(handler_name, role):
-    router = build_router(make_store(), Settings(_env_file=None))
+    router = await native_app(make_store(), Settings(_env_file=None))
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, handler_name)(make_message())
     card = send.await_args.args[2]
@@ -83,7 +108,7 @@ async def test_start_button_has_user_icon_or_unicode_and_preserves_webapp(premiu
     settings = Settings(
         webapp_url="https://miniapp.example", premium_emoji_enabled=premium, _env_file=None
     )
-    router = build_router(make_store(), settings)
+    router = await native_app(make_store(), settings)
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, "start")(make_message())
     button = send.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
@@ -105,7 +130,7 @@ async def test_exchange_icons_keep_callbacks_and_have_unicode_when_disabled(
     premium, handler_name, arguments, role, accept_role, prefix
 ):
     settings = Settings(premium_emoji_enabled=premium, _env_file=None)
-    router = build_router(make_store(), settings)
+    router = await native_app(make_store(), settings)
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, handler_name)(
             make_message("supergroup"), SimpleNamespace(args=arguments)
@@ -123,11 +148,11 @@ async def test_exchange_icons_keep_callbacks_and_have_unicode_when_disabled(
 
 
 async def test_group_spawn_configuration_guidance_uses_user_settings_emoji():
-    router = build_router(make_store(), Settings(_env_file=None))
     with (
         patch("summon.bot.handlers.require_group_admin", new_callable=AsyncMock),
         patch("summon.bot.handlers.send_ephemeral_card", new_callable=AsyncMock) as send,
     ):
+        router = await native_app(make_store(), Settings(_env_file=None))
         await find_handler(router, "spawns")(
             make_message("supergroup"), SimpleNamespace(args="bad")
         )
@@ -137,21 +162,21 @@ async def test_group_spawn_configuration_guidance_uses_user_settings_emoji():
 async def test_already_claimed_daily_uses_hourglass():
     store = make_store()
     store.users.daily.side_effect = DailyAlreadyClaimed()
-    router = build_router(store, Settings(_env_file=None))
+    router = await native_app(store, Settings(_env_file=None))
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, "daily")(make_message())
     assert send.await_args.args[2].emoji is Emoji.HOURGLASS
 
 
 async def test_guess_guidance_uses_search_icon():
-    router = build_router(make_store(), Settings(_env_file=None))
+    router = await native_app(make_store(), Settings(_env_file=None))
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, "guess")(make_message(), SimpleNamespace(args=None))
     assert send.await_args.args[2].emoji is Emoji.SEARCH
 
 
 async def test_start_uses_new_summon_brand_and_collection_button():
-    router = build_router(
+    router = await native_app(
         make_store(), Settings(webapp_url="https://miniapp.example", _env_file=None)
     )
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
@@ -171,7 +196,7 @@ async def test_start_uses_new_summon_brand_and_collection_button():
     ],
 )
 async def test_profile_and_reward_fields_use_semantic_icons(handler_name, expected):
-    router = build_router(make_store(), Settings(_env_file=None))
+    router = await native_app(make_store(), Settings(_env_file=None))
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, handler_name)(make_message())
     card = send.await_args.args[2]
@@ -182,7 +207,7 @@ async def test_profile_and_reward_fields_use_semantic_icons(handler_name, expect
 async def test_group_rules_use_ios_document_icon():
     store = make_store()
     store.groups.get = AsyncMock(return_value={"settings": {"rules": "Be kind"}})
-    router = build_router(store, Settings(_env_file=None))
+    router = await native_app(store, Settings(_env_file=None))
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, "rules")(make_message("supergroup"))
     assert send.await_args.args[2].emoji is Emoji.RULES

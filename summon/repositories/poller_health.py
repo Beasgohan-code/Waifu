@@ -1,4 +1,4 @@
-"""Last successful polling observations; not a lease or proof of delivery."""
+"""Recent MTProto RPC observations; not a lease or proof of update delivery."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ def poller_health_key(bot_token: str, session_secret: str) -> str:
         raise ValueError("Polling health requires a bot token and a 32-character session secret")
     digest = hmac.new(
         session_secret.encode("utf-8"),
-        b"summon:poller-health:v1\0" + bot_token.encode("utf-8"),
+        b"summon:mtproto-health:v1\0" + bot_token.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    return f"poller:{digest}"
+    return f"mtproto:{digest}"
 
 
 class PollerHealthRepository:
@@ -38,7 +38,7 @@ class PollerHealthRepository:
 
     async def record(self, observed_at: datetime) -> None:
         if observed_at.tzinfo is None or observed_at.utcoffset() is None:
-            raise ValueError("Polling observation must use a timezone-aware timestamp")
+            raise ValueError("Connection observation must use a timezone-aware timestamp")
         observed_at = observed_at.astimezone(UTC)
         # Keep the original observation, never the write-completion time. Use
         # the server clock to discard a far-future event before it can poison
