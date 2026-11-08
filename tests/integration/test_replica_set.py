@@ -1887,3 +1887,48 @@ async def test_telegram_media_and_webapp_reviewed_edits_cannot_overwrite_each_ot
         )
         == 1
     )
+
+
+async def test_catalog_search_pages_use_indexed_literal_prefix_and_actor_ownership(
+    isolated_database,
+):
+    from summon.models import normalize_name
+    from summon.repositories.catalog import CatalogRepository
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    now = datetime.now(UTC)
+    rows = [
+        {
+            "_id": f"search-{index:02d}",
+            "name": f"Aiko {index:02d}",
+            "name_key": normalize_name(f"Aiko {index:02d}"),
+            "category": "Reference inspired",
+            "rarity": "rare",
+            "active": index != 22,
+            "random_key": 0.5,
+            "number": 1000 + index,
+            "created_at": now,
+        }
+        for index in range(23)
+    ]
+    await db.characters.insert_many(rows)
+    await db.inventory.insert_many(
+        [
+            {"user_id": 101, "character_id": "search-00", "quantity": 2, "favorite": True},
+            {"user_id": 102, "character_id": "search-00", "quantity": 99, "favorite": False},
+        ]
+    )
+    pages = await asyncio.gather(
+        *(repo.list(101, search="ＡＩＫＯ", page=page, limit=10) for page in (1, 2, 3))
+    )
+    # Twenty-two new active characters plus the seed Aiko; the inactive one is excluded.
+    assert [len(page["items"]) for page in pages] == [10, 10, 3]
+    assert all(page["total"] == 23 for page in pages)
+    items = [item for page in pages for item in page["items"]]
+    assert len({item["id"] for item in items}) == 23
+    assert "search-22" not in {item["id"] for item in items}
+    owned = next(item for item in items if item["id"] == "search-00")
+    assert owned["quantity"] == 2 and owned["favorite"] is True
+    assert all("user_id" not in item for item in items)
+    assert (await repo.list(101, search=".*", limit=10))["total"] == 0

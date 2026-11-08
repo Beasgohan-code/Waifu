@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from wzgram.types import CallbackQuery, Message, User
@@ -23,6 +24,16 @@ def command_input(message: Message) -> CommandInput:
     parts = text.split(maxsplit=1)
     name = (message.command or [""])[0]
     return CommandInput(command=name, args=parts[1] if len(parts) > 1 else None)
+
+
+def recent_message(message: Message, *, lifetime: timedelta, now: datetime | None = None) -> bool:
+    """Accept a bounded UTC window, with small allowance for clock skew."""
+    date = message.date
+    if not isinstance(date, datetime):
+        return False
+    date = date.replace(tzinfo=UTC) if date.utcoffset() is None else date.astimezone(UTC)
+    now = now or datetime.now(UTC)
+    return now - lifetime <= date <= now + timedelta(minutes=1)
 
 
 def callback_data(callback: CallbackQuery) -> str:

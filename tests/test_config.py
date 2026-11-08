@@ -371,3 +371,41 @@ def test_backup_settings_need_only_mongo_and_exclude_session_database(monkeypatc
     monkeypatch.setenv("TELEGRAM_SESSION_DB", "summon")
     with pytest.raises(ValueError, match="session database"):
         BackupConnectionSettings(_env_file=None)
+
+
+def test_synthetic_production_deployment_uses_the_documented_short_names(monkeypatch):
+    values = {
+        "ENVIRONMENT": "production",
+        "BOT_TOKEN": "123456:synthetic-bot-token",
+        "API_ID": "12345",
+        "API_HASH": "synthetic-app-hash",
+        "MONGO_URL": "mongodb://example.invalid:27017/?replicaSet=synthetic",
+        "MONGO_DB_NAME": "summon",
+        "TELEGRAM_SESSION_DB": "summon_telegram",
+        "SESSION_SECRET": "synthetic-session-secret-" + "x" * 32,
+        "WEBAPP_URL": "https://miniapp.example",
+        "OWNER_ID": "42",
+        "ALLOWED_ORIGINS": "https://miniapp.example",
+        "DB_CHANNEL": "-1001234567890",
+        "WEBHOOKS_DISABLED_CONFIRMED": "true",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    settings = Settings(_env_file=None)
+    assert settings.environment == "production"
+    assert settings.telegram_api_id == 12345 and settings.operator_ids == [42]
+    assert (
+        settings.mongo_database == "summon"
+        and settings.telegram_session_database == "summon_telegram"
+    )
+    assert settings.allowed_origins == [settings.webapp_url]
+    assert settings.webhooks_disabled_confirmed and settings.db_channel == -1001234567890
+    # Host and channel settings stay optional, and no credential is represented in logs.
+    assert (
+        settings.imgbb_key.get_secret_value() == ""
+        and settings.catbox_userhash.get_secret_value() == ""
+    )
+    assert all(
+        values[key] not in repr(settings)
+        for key in ("BOT_TOKEN", "API_HASH", "SESSION_SECRET", "MONGO_URL")
+    )

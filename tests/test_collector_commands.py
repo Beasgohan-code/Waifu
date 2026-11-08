@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -343,3 +343,321 @@ async def test_chancelist_fails_closed_when_the_weight_read_fails():
     card = await invoke(store, "rarity_weights")
     assert card.title == "Collector tools unavailable"
     assert "PRIVATE_DATABASE_DETAIL" not in card.body
+
+
+def search_source(text="/search 星", *, actor_id=42, message_id=50, date=None):
+    from wzgram.enums import ChatType
+    from wzgram.types import Chat, Message, User
+
+    return Message(
+        id=message_id,
+        chat=Chat(id=actor_id, type=ChatType.PRIVATE),
+        from_user=User(id=actor_id, first_name="Test", is_bot=False),
+        text=text,
+        date=date or datetime.now(UTC),
+    )
+
+
+def catalog_search_result(start=0, count=10, total=23):
+    return {
+        "items": [
+            {
+                "id": f"aiko-{index}",
+                "number": index + 1,
+                "name": f"Aiko {index}",
+                "category": "Sky & Stars",
+                "rarity": "epic" if index == 0 else "rare",
+                "quantity": 99,
+                "favorite": True,
+            }
+            for index in range(start, start + count)
+        ],
+        "total": total,
+    }
+
+
+def test_catalog_search_callback_is_private_short_and_bound_to_its_context():
+    from summon.bot.search_paging import (
+        parse_search_callback,
+        search_callback,
+        search_key,
+        source_term,
+        valid_search_callback,
+    )
+
+    key = search_key("synthetic-secret")
+    source = search_source("/sips 星の旅")
+    assert source_term(source, 42, "summon_test") == "星の旅"
+    data = search_callback(key, 123, 42, source, 2)
+    assert len(data.encode()) <= 64 and "星" not in data
+    assert parse_search_callback(data) == (50, 2, data.rsplit(":", 1)[1])
+    assert valid_search_callback(data, data)
+    for other in (
+        search_callback(key, 124, 42, source, 2),
+        search_callback(key, 123, 43, source, 2),
+        search_callback(key, 123, 42, source, 3),
+        search_callback(key, 123, 42, search_source("/sips Other"), 2),
+        search_callback(key, 123, 42, search_source("/sips 星の旅", message_id=51), 2),
+        search_callback(search_key("different-secret"), 123, 42, source, 2),
+    ):
+        assert not valid_search_callback(data, other)
+    for invalid in (
+        "catalog-search:0:2:AAAAAAAAAAAAAAAA",
+        "catalog-search:50:0:AAAAAAAAAAAAAAAA",
+        "catalog-search:50:26:AAAAAAAAAAAAAAAA",
+        "catalog-search:50:2:short",
+        "catalog-search:50:2:AAAAAAAAAAAAAAAA:extra",
+    ):
+        assert parse_search_callback(invalid) is None
+
+
+def test_search_source_rejects_edited_expired_forwarded_and_other_actors():
+    from summon.bot.search_paging import source_term
+
+    current = datetime.now(UTC)
+    source = search_source("/search@summon_test Aiko", date=current)
+    assert source_term(source, 42, "summon_test", now=current) == "Aiko"
+    assert source_term(source, 43, "summon_test", now=current) is None
+    assert source_term(source, 42, "wrong_bot", now=current) is None
+    assert source_term(source, 42, "summon_test", now=current + timedelta(minutes=16)) is None
+    source.forward_origin = SimpleNamespace()
+    assert source_term(source, 42, "summon_test", now=current) is None
+    source.forward_origin = None
+    source.text = "/other Aiko"
+    assert source_term(source, 42, "summon_test", now=current) is None
+    source.text = "/search " + "a" * 81
+    assert source_term(source, 42, "summon_test", now=current) is None
+
+
+def test_search_result_labels_use_safe_reference_metadata_not_other_users():
+    from summon.bot.search_paging import search_card
+
+    card = search_card(catalog_search_result(count=1), 1, can_navigate=True)
+    assert card.fields == (("Aiko 0", "1 (key: aiko-0) · Sky & Stars · Epic (legacy)"),)
+    assert "99" not in str(card.fields) and "favorite" not in str(card.fields).lower()
+    assert "Sky &amp; Stars" in card.telegram_html(premium=False)
+    assert "can change" in card.body
+    assert "private chat" in search_card(catalog_search_result(), 1, can_navigate=False).body
+    assert "first 250" in search_card(catalog_search_result(total=251), 1, can_navigate=True).body
+
+
+async def search_handlers(store, *, premium=True):
+    from wzgram.types import User
+
+    app = Client("search-test", api_id=123, api_hash="test", bot_token="123:fake", in_memory=True)
+    app.me = User(id=123, is_bot=True, username="summon_test", first_name="Bot")
+    register_handlers(
+        app,
+        store,
+        Settings(
+            _env_file=None,
+            session_secret="synthetic-session-secret-for-search",
+            premium_emoji_enabled=premium,
+        ),
+    )
+    await asyncio.sleep(0)
+    callbacks = {
+        handler.callback.__name__: handler.callback
+        for handler in app.dispatcher.groups[0]
+        if handler.callback.__name__ in {"search_characters", "search_page"}
+    }
+    return app, callbacks
+
+
+def search_query(data, *, actor_id=42, chat_id=42, chat_type="private", edit=None):
+    return SimpleNamespace(
+        data=data,
+        from_user=SimpleNamespace(
+            id=actor_id, is_bot=False, first_name="Test", last_name=None, username=None
+        ),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id, type=chat_type), edit_text=edit or AsyncMock()
+        ),
+        answer=AsyncMock(),
+    )
+
+
+async def initial_search(app, callbacks, source):
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+        await callbacks["search_characters"](app, source)
+    return sent.await_args.args[2], sent.await_args.kwargs["reply_markup"]
+
+
+async def test_private_search_pages_use_signed_buttons_and_actor_scoped_queries():
+    store = make_store()
+    store.catalog.list.side_effect = [
+        catalog_search_result(),
+        catalog_search_result(start=10),
+        catalog_search_result(),
+    ]
+    app, callbacks = await search_handlers(store)
+    source = search_source("/sips Aiko")
+    app.get_messages = AsyncMock(return_value=source)
+    card, markup = await initial_search(app, callbacks, source)
+    assert card.title == "Character search" and "Page 1" in card.body
+    assert card.fields[0][1] == "1 (key: aiko-0) · Sky & Stars · Epic (legacy)"
+    next_button = markup.inline_keyboard[0][0]
+    assert next_button.icon_custom_emoji_id is not None
+    assert len(next_button.callback_data.encode()) <= 64 and "Aiko" not in next_button.callback_data
+    query = search_query(next_button.callback_data)
+    await callbacks["search_page"](app, query)
+    app.get_messages.assert_awaited_once_with(42, message_ids=50, replies=0)
+    assert store.catalog.list.await_args.args == (42,)
+    assert store.catalog.list.await_args.kwargs == {"search": "Aiko", "page": 2, "limit": 10}
+    edited = query.message.edit_text.await_args.kwargs
+    assert "Page 2" in edited["text"]
+    buttons = edited["reply_markup"].inline_keyboard[0]
+    assert len(buttons) == 2 and all(button.icon_custom_emoji_id for button in buttons)
+    previous_query = search_query(buttons[0].callback_data)
+    await callbacks["search_page"](app, previous_query)
+    assert store.catalog.list.await_args.kwargs["page"] == 1
+    assert "Page 1" in previous_query.message.edit_text.await_args.kwargs["text"]
+    assert query.answer.await_count == 1 and previous_query.answer.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "scenario", ["different-actor", "group", "tamper", "edited", "expired", "deleted"]
+)
+async def test_search_navigation_rejects_tampering_and_stale_commands_before_query(scenario):
+    store = make_store()
+    store.catalog.list.return_value = catalog_search_result()
+    app, callbacks = await search_handlers(store)
+    source = search_source("/search Aiko")
+    app.get_messages = AsyncMock(return_value=source)
+    _, markup = await initial_search(app, callbacks, source)
+    data = markup.inline_keyboard[0][0].callback_data
+    if scenario == "different-actor":
+        query = search_query(data, actor_id=43, chat_id=43)
+    elif scenario == "group":
+        query = search_query(data, chat_id=-100, chat_type="supergroup")
+    else:
+        if scenario == "tamper":
+            data = data[:-1] + ("A" if data[-1] != "A" else "B")
+        elif scenario == "edited":
+            source.text = "/search Changed"
+        elif scenario == "expired":
+            source.date = datetime.now(UTC) - timedelta(minutes=16)
+        elif scenario == "deleted":
+            app.get_messages.return_value = None
+        query = search_query(data)
+    await callbacks["search_page"](app, query)
+    assert store.catalog.list.await_count == 1
+    assert query.answer.await_args.kwargs["show_alert"] is True
+    query.message.edit_text.assert_not_awaited()
+
+
+async def test_search_navigation_limits_pages_and_never_retries_ambiguous_edits():
+    store = make_store()
+    store.catalog.list.return_value = catalog_search_result(total=1000)
+    app, callbacks = await search_handlers(store)
+    source = search_source("/search Aiko")
+    app.get_messages = AsyncMock(return_value=source)
+    _, markup = await initial_search(app, callbacks, source)
+    edit = AsyncMock(side_effect=TimeoutError("private Telegram detail"))
+    query = search_query(markup.inline_keyboard[0][0].callback_data, edit=edit)
+    await callbacks["search_page"](app, query)
+    assert edit.await_count == 1
+    assert query.answer.await_args.kwargs["show_alert"] is True
+    assert "private Telegram detail" not in query.answer.await_args.args[0]
+    assert store.catalog.list.await_count == 2
+
+
+async def test_search_navigation_falls_back_only_after_definite_emoji_rejection():
+    from wzgram.errors import BadRequest
+
+    store = make_store()
+    store.catalog.list.return_value = catalog_search_result()
+    app, callbacks = await search_handlers(store)
+    source = search_source("/search Aiko")
+    app.get_messages = AsyncMock(return_value=source)
+    _, markup = await initial_search(app, callbacks, source)
+    edit = AsyncMock(side_effect=[BadRequest("CUSTOM_EMOJI_INVALID"), True])
+    query = search_query(markup.inline_keyboard[0][0].callback_data, edit=edit)
+    await callbacks["search_page"](app, query)
+    assert edit.await_count == 2
+    assert "tg-emoji" in edit.await_args_list[0].kwargs["text"]
+    fallback = edit.await_args_list[1].kwargs
+    assert "tg-emoji" not in fallback["text"]
+    assert all(
+        button.icon_custom_emoji_id is None
+        for button in fallback["reply_markup"].inline_keyboard[0]
+    )
+    assert store.catalog.list.await_count == 2
+
+
+async def test_group_search_stays_private_and_offers_no_public_pagination():
+    store = make_store()
+    store.catalog.list.return_value = catalog_search_result()
+    message = group_message()
+    card = await invoke(store, "search_characters", args="Aiko", message=message)
+    assert "private chat" in card.body
+    assert "Page 1" in card.body
+
+
+async def test_search_limits_work_before_retrieving_a_callback_source():
+    store = make_store()
+    store.catalog.list.return_value = catalog_search_result()
+    store.limiter.allow.side_effect = [True, False]
+    app, callbacks = await search_handlers(store)
+    source = search_source("/search Aiko")
+    app.get_messages = AsyncMock(return_value=source)
+    _, markup = await initial_search(app, callbacks, source)
+    query = search_query(markup.inline_keyboard[0][0].callback_data)
+    await callbacks["search_page"](app, query)
+    app.get_messages.assert_not_awaited()
+    assert store.catalog.list.await_count == 1
+    assert query.answer.await_args.kwargs["show_alert"] is True
+
+
+async def test_search_page_25_has_no_next_button_and_explains_the_bound():
+    from summon.bot.search_paging import search_callback, search_key
+
+    store = make_store()
+    store.catalog.list.return_value = catalog_search_result(total=1000)
+    app, callbacks = await search_handlers(store, premium=False)
+    source = search_source("/search Aiko")
+    app.get_messages = AsyncMock(return_value=source)
+    data = search_callback(search_key("synthetic-session-secret-for-search"), 123, 42, source, 25)
+    query = search_query(data)
+    await callbacks["search_page"](app, query)
+    kwargs = query.message.edit_text.await_args.kwargs
+    assert "first 250" in kwargs["text"]
+    buttons = kwargs["reply_markup"].inline_keyboard[0]
+    assert len(buttons) == 1 and "Previous" in buttons[0].text
+    assert buttons[0].icon_custom_emoji_id is None
+    assert store.catalog.list.await_args.kwargs["page"] == 25
+
+
+async def test_search_database_failure_is_private_and_does_not_expose_details():
+    store = make_store()
+    store.catalog.list.return_value = catalog_search_result()
+    app, callbacks = await search_handlers(store)
+    source = search_source("/search Aiko")
+    app.get_messages = AsyncMock(return_value=source)
+    _, markup = await initial_search(app, callbacks, source)
+    store.catalog.list.side_effect = AutoReconnect("PRIVATE_DATABASE_DETAIL")
+    query = search_query(markup.inline_keyboard[0][0].callback_data)
+    await callbacks["search_page"](app, query)
+    assert query.answer.await_args.kwargs["show_alert"] is True
+    assert "PRIVATE_DATABASE_DETAIL" not in query.answer.await_args.args[0]
+    query.message.edit_text.assert_not_awaited()
+
+
+def test_search_result_bounds_legacy_values_and_does_not_make_up_an_unusable_id():
+    from summon.bot.search_paging import search_card
+
+    item = {
+        "id": "X" * 10000,
+        "name": "<" * 10000,
+        "category": "&" * 10000,
+        "rarity": "a" * 10000,
+        "number": None,
+    }
+    card = search_card({"items": [item] * 20, "total": 20}, 1, can_navigate=True)
+    assert len(card.fields) == 10
+    assert "ID needs review" in card.fields[0][1]
+    assert len(card.fields[0][0]) <= 48 and len(card.fields[0][1]) < 120
+    assert len(card.telegram_html(premium=False)) < 10000
+    item.update(id="bad key", number=12, name=None, category=None, rarity=None)
+    card = search_card({"items": [item], "total": 1}, 1, can_navigate=True)
+    assert card.fields == (("Unnamed character", "12 · Unknown series · Uncategorized"),)

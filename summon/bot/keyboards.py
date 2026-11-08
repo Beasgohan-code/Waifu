@@ -29,6 +29,26 @@ def collection_keyboard(url: str, *, premium: bool) -> InlineKeyboardMarkup:
     )
 
 
+def search_page_keyboard(
+    previous: str | None, next_page: str | None, *, premium: bool
+) -> InlineKeyboardMarkup:
+    """Only signed, actor-bound page actions are supplied by the caller."""
+    buttons = []
+    for label, data, icon in (
+        ("Previous", previous, Emoji.PREVIOUS_PAGE),
+        ("Next", next_page, Emoji.NEXT_PAGE),
+    ):
+        if data:
+            buttons.append(
+                InlineKeyboardButton(
+                    text=button_label(label, icon, premium=premium),
+                    callback_data=data,
+                    icon_custom_emoji_id=icon.custom_id if premium else None,
+                )
+            )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons] if buttons else [])
+
+
 def start_keyboard(
     webapp_url: str, bot_username: str | None, actor_id: int, *, premium: bool
 ) -> InlineKeyboardMarkup:

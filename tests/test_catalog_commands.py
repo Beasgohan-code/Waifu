@@ -1994,3 +1994,44 @@ async def test_stale_replacement_can_be_reviewed_again_before_its_command_expire
         host.assert_awaited_once()
     finally:
         await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize("command", ["/search", "/find", "/sips"])
+async def test_native_wzgram_reference_search_aliases_offer_actor_bound_pages(command):
+    app, store = await setup()
+    store.catalog.list = AsyncMock(
+        return_value={
+            "items": [
+                {"id": "aiko", "number": 1, "name": "Aiko", "category": "Sky", "rarity": "rare"}
+            ],
+            "total": 11,
+        }
+    )
+    text = f"{command} Aiko"
+    try:
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+            await dispatch(app, packet(text))
+        assert sent.await_args.args[2].title == "Character search"
+        buttons = sent.await_args.kwargs["reply_markup"].inline_keyboard[0]
+        assert len(buttons) == 1 and buttons[0].callback_data.startswith("catalog-search:")
+        assert "Aiko" not in buttons[0].callback_data
+        original = Message(
+            id=50,
+            chat=Chat(id=42, type=ChatType.PRIVATE),
+            from_user=User(id=42),
+            date=datetime.now(UTC),
+            text=text,
+        )
+        app.message_cache[(42, 51)] = Message(
+            id=51, chat=Chat(id=42, type=ChatType.PRIVATE), from_user=app.me
+        )
+        app.get_messages = AsyncMock(return_value=original)
+        app.answer_callback_query = AsyncMock(return_value=True)
+        with patch("summon.bot.commands_collector.edit_text_card", new_callable=AsyncMock) as edit:
+            await dispatch(app, callback_packet(buttons[0].callback_data))
+        assert store.catalog.list.await_args.kwargs == {"search": "Aiko", "page": 2, "limit": 10}
+        assert edit.await_args.args[1].title == "Character search"
+        assert "Page 2" in edit.await_args.args[1].body
+        assert app.answer_callback_query.await_count == 1
+    finally:
+        await app.dispatcher.stop()

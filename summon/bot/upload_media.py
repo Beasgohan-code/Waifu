@@ -9,12 +9,13 @@ import hmac
 import re
 import shlex
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from wzgram import Client
 from wzgram.types import Message
 
+from summon.bot.telegram_helpers import recent_message
 from summon.models import CharacterBasics
 from summon.rarities import RARITIES, Rarity, parse_rarity
 from summon.repositories.limits import RateLimiter
@@ -131,12 +132,7 @@ def reply_media(message: Message) -> ReplyMedia:
 
 
 def valid_upload_age(message: Message, *, now: datetime | None = None) -> bool:
-    date = message.date
-    if not isinstance(date, datetime):
-        return False
-    date = date.replace(tzinfo=UTC) if date.utcoffset() is None else date.astimezone(UTC)
-    now = now or datetime.now(UTC)
-    return now - UPLOAD_LIFETIME <= date <= now + timedelta(minutes=1)
+    return recent_message(message, lifetime=UPLOAD_LIFETIME, now=now)
 
 
 def menu_token(

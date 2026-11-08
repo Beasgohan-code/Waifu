@@ -66,6 +66,8 @@ class Emoji(Enum):
     NOTE_EDIT = palette_icon("telegram_ios", 30)
     NOTE_DELETE = palette_icon("telegram_ios", 77)
     RULES = palette_icon("telegram_ios", 76)
+    PREVIOUS_PAGE = palette_icon("telegram_ios", 47)
+    NEXT_PAGE = palette_icon("telegram_ios", 48)
     PRIVATE = palette_icon("telegram_ios", 68)
     ADMIN_SHIELD = palette_icon("telegram_ios", 94)
     SNOW = palette_icon("summon_bot", 8)
@@ -277,6 +279,26 @@ async def send_card(
         kwargs["text"] = card.telegram_html(premium=False)
         kwargs["reply_markup"] = fallback_keyboard(reply_markup)
         return await client.send_message(**kwargs)
+
+
+async def edit_text_card(
+    message: Any, card: Card, *, premium: bool, reply_markup: Any | None = None
+) -> Any:
+    """Edit ordinary text, falling back only after a definite emoji rejection."""
+    try:
+        return await message.edit_text(
+            text=card.telegram_html(premium=premium),
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    except BadRequest as exc:
+        if not premium or not _emoji_rejected(exc):
+            raise
+        return await message.edit_text(
+            text=card.telegram_html(premium=False),
+            parse_mode=ParseMode.HTML,
+            reply_markup=fallback_keyboard(reply_markup),
+        )
 
 
 async def edit_keyboard(message: Any, markup: Any, *, premium: bool) -> Any:
