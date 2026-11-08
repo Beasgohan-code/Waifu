@@ -323,7 +323,7 @@ def test_imgbb_and_channel_aliases_are_optional_and_mixed_case(monkeypatch):
     monkeypatch.setenv("Imgbb_key", "FAKE_IMG_HOST_KEY")
     monkeypatch.setenv("DB_CHANNEL", "-1001234567890")
     settings = Settings(_env_file=None)
-    assert settings.artwork_backend == "mongo"  # A key alone never opts into third-party upload.
+    assert settings.artwork_backend == "mongo"  # The legacy backend stays unchanged.
     assert settings.imgbb_key.get_secret_value() == "FAKE_IMG_HOST_KEY"
     assert settings.db_channel == -1001234567890
     assert "FAKE_IMG_HOST_KEY" not in repr(settings)
@@ -346,3 +346,28 @@ def test_channel_and_host_configuration_fail_closed(monkeypatch):
             Settings(_env_file=None)
     monkeypatch.setenv("DB_CHANNEL_ID", "")
     assert Settings(_env_file=None).db_channel is None
+
+
+def test_optional_catbox_userhash_alias_is_secret_and_prefixed_value_wins(monkeypatch):
+    monkeypatch.setenv("CATBOX_USERHASH", "FAKE_USERHASH")
+    settings = Settings(_env_file=None)
+    assert settings.catbox_userhash.get_secret_value() == "FAKE_USERHASH"
+    assert "FAKE_USERHASH" not in repr(settings)
+    monkeypatch.setenv("SUMMON_CATBOX_USERHASH", "")
+    assert Settings(_env_file=None).catbox_userhash.get_secret_value() == ""
+
+
+def test_backup_settings_need_only_mongo_and_exclude_session_database(monkeypatch):
+    from summon.config import BackupConnectionSettings
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("MONGO_URL", "mongodb://example.invalid/summon")
+    monkeypatch.setenv("MONGO_DB_NAME", "summon")
+    monkeypatch.setenv("TELEGRAM_SESSION_DB", "summon_telegram")
+    monkeypatch.setenv("OPERATOR_IDS", "not a list")
+    settings = BackupConnectionSettings(_env_file=None)
+    assert settings.mongo_uri.get_secret_value() == "mongodb://example.invalid/summon"
+    assert settings.mongo_database == "summon"
+    monkeypatch.setenv("TELEGRAM_SESSION_DB", "summon")
+    with pytest.raises(ValueError, match="session database"):
+        BackupConnectionSettings(_env_file=None)

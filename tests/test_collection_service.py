@@ -131,9 +131,12 @@ async def test_free_daily_character_selects_then_uses_authenticated_actor():
     saved = {"id": "mika", "name": "Mika", "category": "Sky", "rarity": "rare"}
     repo = SimpleNamespace(claim_daily_character=AsyncMock(return_value=saved))
     now = datetime.now(UTC)
-    result = await CollectionService(repo, FakeCatalog()).claim_daily_character(user, now)
+    message_id = "daily-character-message:" + "a" * 64
+    result = await CollectionService(repo, FakeCatalog()).claim_daily_character(
+        user, now, message_id=message_id
+    )
     assert result == saved
-    repo.claim_daily_character.assert_awaited_once_with(user, "mika", now)
+    repo.claim_daily_character.assert_awaited_once_with(user, "mika", now, message_id=message_id)
 
 
 async def test_free_daily_character_with_empty_catalog_never_writes():
@@ -147,7 +150,9 @@ async def test_free_daily_character_with_empty_catalog_never_writes():
     catalog = SimpleNamespace(choose=AsyncMock(return_value=None))
     with pytest.raises(DailyCharacterUnavailable):
         await CollectionService(repo, catalog).claim_daily_character(
-            TelegramUser(id=7, first_name="Collector"), datetime.now(UTC)
+            TelegramUser(id=7, first_name="Collector"),
+            datetime.now(UTC),
+            message_id="daily-character-message:" + "a" * 64,
         )
     repo.claim_daily_character.assert_not_awaited()
 
@@ -183,7 +188,9 @@ async def test_free_daily_character_uses_one_transaction_and_a_utc_ledger(monkey
     repo = CollectionRepository(object(), db)
     user = TelegramUser(id=7, first_name="Collector")
     local = datetime(2026, 1, 2, 0, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
-    result = await repo.claim_daily_character(user, "mika", local)
+    result = await repo.claim_daily_character(
+        user, "mika", local, message_id="daily-character-message:" + "a" * 64
+    )
     assert result == {"id": "mika", "name": "Mika", "category": "Sky", "rarity": "rare"}
     ledger = db.reward_history.insert_one.await_args
     assert ledger.args[0]["_id"] == "daily-character:7:2026-01-01"
@@ -209,11 +216,14 @@ async def test_free_daily_character_duplicate_ledger_aborts_before_inventory(mon
     db.reward_history.insert_one.side_effect = DuplicateKeyError("already claimed")
     with pytest.raises(DailyCharacterAlreadyClaimed):
         await CollectionRepository(object(), db).claim_daily_character(
-            TelegramUser(id=7, first_name="Collector"), "mika", datetime.now(UTC)
+            TelegramUser(id=7, first_name="Collector"),
+            "mika",
+            datetime.now(UTC),
+            message_id="daily-character-message:" + "a" * 64,
         )
     db.inventory.update_one.assert_not_awaited()
     db.users.update_one.assert_not_awaited()
-    db.activity.insert_one.assert_not_awaited()
+    assert db.activity.insert_one.await_count == 1
 
 
 async def test_unavailable_or_naive_daily_character_claim_never_touches_ledger(monkeypatch):
@@ -228,9 +238,13 @@ async def test_unavailable_or_naive_daily_character_claim_never_touches_ledger(m
     repo = CollectionRepository(object(), db)
     user = TelegramUser(id=7, first_name="Collector")
     with pytest.raises(ValueError):
-        await repo.claim_daily_character(user, "mika", datetime(2026, 1, 1))
+        await repo.claim_daily_character(
+            user, "mika", datetime(2026, 1, 1), message_id="daily-character-message:" + "a" * 64
+        )
     db.characters.find_one.return_value = None
     with pytest.raises(DailyCharacterUnavailable):
-        await repo.claim_daily_character(user, "mika", datetime.now(UTC))
+        await repo.claim_daily_character(
+            user, "mika", datetime.now(UTC), message_id="daily-character-message:" + "a" * 64
+        )
     db.reward_history.insert_one.assert_not_awaited()
     db.inventory.update_one.assert_not_awaited()

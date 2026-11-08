@@ -385,3 +385,38 @@ async def test_manual_spawn_none_result_is_unconfirmed_and_not_cancelled():
     photo.assert_awaited_once()
     store.collection.mark_delivery_failed.assert_not_awaited()
     assert private.await_args.args[3].title == "Summon unconfirmed"
+
+
+async def test_video_spawn_prefers_telegram_file_id_and_hides_answer():
+    app, store = await setup_spawn("https://files.catbox.moe/example.mp4")
+    character = store.catalog.choose.return_value
+    character.update(media_type="video", telegram_file_id="telegram-video-id", rarity="amv-edition")
+    with patch.object(app, "send_video", new_callable=AsyncMock, return_value=True) as video:
+        await dispatch_message(app)
+    video.assert_awaited_once()
+    assert video.await_args.kwargs["video"] == "telegram-video-id"
+    assert "Aiko" not in video.await_args.kwargs["caption"]
+    store.collection.mark_delivery_failed.assert_not_awaited()
+
+
+async def test_expired_file_id_falls_back_only_after_definite_rejection():
+    url = "https://files.catbox.moe/example.mp4"
+    app, store = await setup_spawn(url)
+    store.catalog.choose.return_value.update(media_type="video", telegram_file_id="old-video-id")
+    with patch.object(
+        app, "send_video", new_callable=AsyncMock, side_effect=[BadRequest("BAD_FILE"), True]
+    ) as video:
+        await dispatch_message(app)
+    assert [call.kwargs["video"] for call in video.await_args_list] == ["old-video-id", url]
+    store.collection.mark_delivery_failed.assert_not_awaited()
+
+
+async def test_animation_timeout_never_retries_host_url_or_cancels():
+    app, store = await setup_spawn("https://files.catbox.moe/example.gif")
+    store.catalog.choose.return_value.update(media_type="animation", telegram_file_id="gif-id")
+    with patch.object(
+        app, "send_animation", new_callable=AsyncMock, side_effect=TimeoutError("uncertain")
+    ) as animation:
+        await dispatch_message(app)
+    animation.assert_awaited_once()
+    store.collection.mark_delivery_failed.assert_not_awaited()

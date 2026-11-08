@@ -33,13 +33,22 @@ export function ProgressBar({ value, max, label }: { value: number; max: number;
   return <div className="progress-track" role="progressbar" aria-label={label || 'Progress'} aria-valuenow={value} aria-valuemin={0} aria-valuemax={max || 1}><span style={{ width: `${percent}%` }} /></div>;
 }
 
+function CharacterArtwork({ character, detail = false }: { character: Character; detail?: boolean }) {
+  const animatedGif = character.media_type === 'animation' && /\.gif$/i.test(character.image_url);
+  if (character.media_type && character.media_type !== 'photo' && !animatedGif) {
+    return <video src={character.image_url} aria-label={`${character.name} video artwork`}
+      muted playsInline preload="metadata" controls={detail} />;
+  }
+  return <img src={character.image_url} alt={character.name} loading={detail ? 'eager' : 'lazy'} />;
+}
+
 export function CharacterCard({ character, onOpen, onFavorite, preview }: {
   character: Character; onOpen: (id: string) => void; onFavorite?: (character: Character) => void; preview: boolean;
 }) {
   return <article className="character-card">
     <div className="character-art">
       <button className="art-button" onClick={() => onOpen(character.id)} aria-label={`View ${character.name}`}>
-        <img src={character.image_url} alt={character.name} loading="lazy" />
+        <CharacterArtwork character={character} />
         <span className="art-shade" />
       </button>
       <span className={`rarity rarity-${character.rarity}`}><span>✦</span> {rarityLabel(character.rarity)}</span>
@@ -108,8 +117,8 @@ export function CharacterDetail({ id, preview, onClose, onChanged, notify }: {
     <section ref={modalRef} className="detail-modal" role="dialog" aria-modal="true" aria-label="Character details">
       <button ref={closeRef} className="modal-close icon-button" onClick={onClose} aria-label="Close character details"><X size={19} /></button>
       {error ? <EmptyState title="Couldn't load character" text={error} /> : !character ? <div className="detail-loading" aria-busy="true">Loading character…</div> : <>
-        <div className="detail-art"><img src={character.image_url} alt={character.name} /><span className={`rarity rarity-${character.rarity}`}>✦ {rarityLabel(character.rarity)}</span></div>
-        <div className="detail-copy"><span className="eyebrow">THE SUMMON ARCHIVE / {character.id}</span><h2>{character.name}</h2><p className="detail-series">{character.category}</p>
+        <div className="detail-art"><CharacterArtwork character={character} detail /><span className={`rarity rarity-${character.rarity}`}>✦ {rarityLabel(character.rarity)}</span></div>
+        <div className="detail-copy"><span className="eyebrow">THE SUMMON ARCHIVE / {character.number ?? character.id}</span><h2>{character.name}</h2><p className="detail-series">{character.category}</p>
           <p className="detail-description">{character.description || 'A character waiting to be discovered.'}</p>
           <div className="detail-facts"><div><span>RARITY</span><strong>{rarityLabel(character.rarity)}</strong></div><div><span>IN YOUR COLLECTION</span><strong>{character.quantity ? `${character.quantity} owned` : 'Not yet collected'}</strong></div></div>
           <div className="detail-actions">

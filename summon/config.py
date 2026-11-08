@@ -70,6 +70,7 @@ _ENV_ALIASES: dict[str, tuple[str, ...]] = {
     "telegram_session_database": ("TELEGRAM_SESSION_DB",),
     "artwork_backend": ("ARTWORK_BACKEND",),
     "imgbb_key": ("IMGBB_KEY", "IMGBB_API_KEY"),
+    "catbox_userhash": ("CATBOX_USERHASH",),
     "db_channel": ("DB_CHANNEL", "DB_CHANNEL_ID"),
     "webhooks_disabled_confirmed": ("WEBHOOKS_DISABLED_CONFIRMED",),
     "rich_enabled": ("RICH_ENABLED",),
@@ -92,6 +93,8 @@ class _AliasedEnvironment(PydanticBaseSettingsSource):
     def __call__(self) -> dict[str, Any]:
         values = self.source()
         for field, aliases in _ENV_ALIASES.items():
+            if field not in self.settings_cls.model_fields:
+                continue
             # An explicitly empty prefixed value is still authoritative and will
             # fail production validation rather than silently falling back.
             if field in values:
@@ -159,6 +162,7 @@ class Settings(BaseSettings):
     )
     artwork_backend: Literal["mongo", "imgbb"] = "mongo"
     imgbb_key: SecretStr = SecretStr("")
+    catbox_userhash: SecretStr = SecretStr("")
     db_channel: int | None = Field(default=None, lt=0, gt=-(2**63))
     webhooks_disabled_confirmed: bool = False
     rich_enabled: bool = True
@@ -279,4 +283,37 @@ class Settings(BaseSettings):
             not self.telegram_api_id or not self.telegram_api_hash.get_secret_value()
         ):
             raise ValueError("Wzgram requires SUMMON_TELEGRAM_API_ID and SUMMON_TELEGRAM_API_HASH")
+        return self
+
+
+class BackupConnectionSettings(BaseSettings):
+    """Only Mongo configuration is needed for the offline operator backup CLI."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SUMMON_", env_file=".env", extra="ignore", hide_input_in_errors=True
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return Settings.settings_customise_sources(
+            settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        )
+
+    mongo_uri: SecretStr = SecretStr("")
+    mongo_database: str = Field(default="summon", pattern=r"^[A-Za-z0-9_-]{1,63}$")
+    telegram_session_database: str = Field(
+        default="summon_telegram", pattern=r"^[A-Za-z0-9_-]{1,63}$"
+    )
+
+    @model_validator(mode="after")
+    def separate_session_database(self) -> BackupConnectionSettings:
+        if self.mongo_database == self.telegram_session_database:
+            raise ValueError("The Wzgram session database is excluded from backups")
         return self

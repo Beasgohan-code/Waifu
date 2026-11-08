@@ -7,6 +7,8 @@ export interface Character {
   category: string;
   rarity: Rarity;
   image_url: string;
+  media_type?: 'photo' | 'video' | 'animation';
+  number?: number;
   description: string;
   quantity: number;
   favorite: boolean;

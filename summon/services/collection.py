@@ -39,14 +39,18 @@ class CollectionService:
             return None
         return {"spawn": spawn, "character": character}
 
-    async def claim_daily_character(self, user: TelegramUser, now: datetime) -> dict[str, Any]:
-        """Choose an active weighted character; the repository enforces the UTC-day claim."""
+    async def claim_daily_character(
+        self, user: TelegramUser, now: datetime, *, message_id: str
+    ) -> dict[str, Any]:
+        """Choose an active weighted character; the repository enforces both claim guards."""
         character = await self.catalog.choose()
         if not character:
             raise DailyCharacterUnavailable
         return cast(
             dict[str, Any],
-            await self.collection.claim_daily_character(user, character["_id"], now),
+            await self.collection.claim_daily_character(
+                user, character["_id"], now, message_id=message_id
+            ),
         )
 
     async def guess(

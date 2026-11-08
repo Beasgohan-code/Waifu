@@ -91,6 +91,10 @@ def fake_db():
             insert_one=AsyncMock(), update_one=AsyncMock(), find_one=AsyncMock(return_value=None)
         ),
         character_artworks=SimpleNamespace(update_one=AsyncMock(), find_one=AsyncMock()),
+        catalog_counters=SimpleNamespace(
+            find_one=AsyncMock(return_value={"_id": "characters"}),
+            find_one_and_update=AsyncMock(return_value={"last_number": 1}),
+        ),
         inventory=SimpleNamespace(update_one=AsyncMock(), delete_one=AsyncMock()),
     )
 

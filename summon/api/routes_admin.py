@@ -13,6 +13,8 @@ from summon.api.schemas import (
 )
 from summon.auth import TelegramUser
 from summon.models import CharacterInput
+from summon.repositories.catalog import CatalogConflict
+from summon.repositories.character_numbers import CharacterNumberingUnavailable
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -31,6 +33,11 @@ async def save_character(
     if character_id != body.id:
         raise HTTPException(400, "Character IDs do not match")
     await limit_action(request, user, "catalog", limit=20)
-    result = await store.catalog.upsert_character(body, actor_id=user.id)
+    try:
+        result = await store.catalog.upsert_character(body, actor_id=user.id)
+    except (CatalogConflict, CharacterNumberingUnavailable):
+        raise HTTPException(
+            409, "Catalog numbering conflicts; operator review is required"
+        ) from None
     logger.info("catalog_changed actor=%s character=%s", user.id, character_id)
     return {"data": result}

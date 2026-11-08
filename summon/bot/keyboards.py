@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from wzgram.enums import ButtonStyle
@@ -23,6 +24,52 @@ def collection_keyboard(url: str, *, premium: bool) -> InlineKeyboardMarkup:
                     style=ButtonStyle.PRIMARY,
                     icon_custom_emoji_id=Emoji.OPEN_COLLECTION.custom_id if premium else None,
                 )
+            ]
+        ]
+    )
+
+
+def start_keyboard(
+    webapp_url: str, bot_username: str | None, actor_id: int, *, premium: bool
+) -> InlineKeyboardMarkup:
+    rows = collection_keyboard(webapp_url, premium=premium).inline_keyboard if webapp_url else []
+    if bot_username and re.fullmatch(r"[A-Za-z0-9_]{5,32}", bot_username):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=button_label("Add to a group", Emoji.SPARK, premium=premium),
+                    url=f"https://t.me/{bot_username}?startgroup=true",
+                    icon_custom_emoji_id=Emoji.SPARK.custom_id if premium else None,
+                    style=ButtonStyle.PRIMARY,
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=button_label("How to play", Emoji.QUESTION, premium=premium),
+                callback_data=f"start-guide:{actor_id}",
+                icon_custom_emoji_id=Emoji.QUESTION.custom_id if premium else None,
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def upload_provider_keyboard(
+    choices: list[tuple[str, str]], *, premium: bool
+) -> InlineKeyboardMarkup:
+    """Provider callbacks are signed and actor-bound by the upload handler."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=button_label(label, Emoji.OPEN_COLLECTION, premium=premium),
+                    callback_data=data,
+                    icon_custom_emoji_id=Emoji.OPEN_COLLECTION.custom_id if premium else None,
+                    style=ButtonStyle.PRIMARY,
+                )
+                for label, data in choices
             ]
         ]
     )

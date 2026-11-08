@@ -15,6 +15,7 @@ from summon.api.schemas import (
 )
 from summon.auth import TelegramUser
 from summon.models import InventorySort, Rarity
+from summon.repositories.character_numbers import CharacterNumberingUnavailable
 from summon.repositories.inventory_paging import (
     CursorDataError,
     CursorExpired,
@@ -74,7 +75,10 @@ async def character_detail(
     user: TelegramUser = Depends(get_current_user),
     store: Any = Depends(get_store),
 ) -> dict[str, Any]:
-    character = await store.catalog.details(user.id, character_id)
+    try:
+        character = await store.catalog.details(user.id, character_id)
+    except CharacterNumberingUnavailable:
+        raise HTTPException(503, "Character numbering requires operator review") from None
     if not character:
         raise HTTPException(404, "Character not found")
     return {"data": character}

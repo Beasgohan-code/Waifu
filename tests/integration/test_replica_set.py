@@ -1112,7 +1112,12 @@ async def test_free_daily_character_is_once_per_actor_utc_day_and_preserves_dail
     )
     repo = CollectionRepository(client, db)
     results = await asyncio.gather(
-        *(repo.claim_daily_character(actor, "aiko", now) for _ in range(5)),
+        *(
+            repo.claim_daily_character(
+                actor, "aiko", now, message_id="daily-character-message:" + f"{i:064x}"
+            )
+            for i in range(5)
+        ),
         return_exceptions=True,
     )
     assert sum(isinstance(result, dict) for result in results) == 1
@@ -1127,10 +1132,16 @@ async def test_free_daily_character_is_once_per_actor_utc_day_and_preserves_dail
 
     # A different actor and the next UTC day have separate guarded claims.
     other = TelegramUser(id=701, first_name="Other")
-    assert (await repo.claim_daily_character(other, "aiko", now))["id"] == "aiko"
-    assert (await repo.claim_daily_character(actor, "aiko", now + timedelta(days=1)))[
-        "id"
-    ] == "aiko"
+    assert (
+        await repo.claim_daily_character(
+            other, "aiko", now, message_id="daily-character-message:" + "a" * 64
+        )
+    )["id"] == "aiko"
+    assert (
+        await repo.claim_daily_character(
+            actor, "aiko", now + timedelta(days=1), message_id="daily-character-message:" + "b" * 64
+        )
+    )["id"] == "aiko"
     assert (await db.inventory.find_one({"user_id": 700, "character_id": "aiko"}))["quantity"] == 4
 
 
@@ -1157,7 +1168,9 @@ async def test_free_daily_character_ledger_and_ownership_rollback_together(isola
         ),
     )
     with pytest.raises(RuntimeError, match="injected inventory failure"):
-        await repo.claim_daily_character(actor, "aiko", now)
+        await repo.claim_daily_character(
+            actor, "aiko", now, message_id="daily-character-message:" + "c" * 64
+        )
     assert await db.users.find_one({"_id": actor.id}) is None
     assert await db.inventory.find_one({"user_id": actor.id}) is None
     assert await db.reward_history.find_one({"_id": "daily-character:700:2026-04-05"}) is None
@@ -1175,6 +1188,145 @@ async def test_free_daily_character_rejects_deactivated_character_without_consum
     await db.characters.update_one({"_id": "aiko"}, {"$set": {"active": False}})
     repo = CollectionRepository(client, db)
     with pytest.raises(DailyCharacterUnavailable):
-        await repo.claim_daily_character(actor, "aiko", now)
+        await repo.claim_daily_character(
+            actor, "aiko", now, message_id="daily-character-message:" + "c" * 64
+        )
     assert await db.reward_history.find_one({"_id": "daily-character:700:2026-04-05"}) is None
-    assert (await repo.claim_daily_character(actor, "mira", now))["id"] == "mira"
+    assert (
+        await repo.claim_daily_character(
+            actor, "mira", now, message_id="daily-character-message:" + "d" * 64
+        )
+    )["id"] == "mira"
+
+
+async def test_daily_character_same_message_cannot_be_replayed_across_midnight(isolated_database):
+    from summon.repositories.collection import DailyCharacterAlreadyClaimed
+
+    client, db = isolated_database
+    actor = TelegramUser(id=700, first_name="Collector")
+    repo = CollectionRepository(client, db)
+    before_midnight = datetime(2026, 4, 5, 23, 59, tzinfo=UTC)
+    message_id = "daily-character-message:" + "e" * 64
+    await repo.claim_daily_character(actor, "aiko", before_midnight, message_id=message_id)
+    with pytest.raises(DailyCharacterAlreadyClaimed):
+        await repo.claim_daily_character(
+            actor, "aiko", before_midnight + timedelta(minutes=2), message_id=message_id
+        )
+    assert await db.reward_history.find_one({"_id": "daily-character:700:2026-04-06"}) is None
+    assert (await db.inventory.find_one({"user_id": 700, "character_id": "aiko"}))["quantity"] == 1
+    await repo.claim_daily_character(
+        actor,
+        "aiko",
+        before_midnight + timedelta(minutes=3),
+        message_id="daily-character-message:" + "f" * 64,
+    )
+    assert (await db.inventory.find_one({"user_id": 700, "character_id": "aiko"}))["quantity"] == 2
+
+
+async def test_numeric_check_backfills_aliases_without_changing_ownership(isolated_database):
+    from summon.repositories.catalog import CatalogRepository
+
+    client, db = isolated_database
+    # Simulate a pre-numbering catalog in this explicitly isolated test DB.
+    await db.catalog_counters.delete_one({"_id": "characters"})
+    await db.characters.update_many({}, {"$unset": {"number": ""}})
+    await db.inventory.insert_one(
+        {"user_id": 700, "character_id": "aiko", "quantity": 2, "favorite": True}
+    )
+    repo = CatalogRepository(db, client=client)
+    first, padded = await asyncio.gather(repo.details(700, "1"), repo.details(700, "01"))
+    assert first["id"] == padded["id"] == "aiko"
+    assert first["number"] == padded["number"] == 1
+    assert first["quantity"] == padded["quantity"] == 2
+    assert (await repo.details(700, "aiko"))["id"] == "aiko"
+    assert (await db.inventory.find_one({"user_id": 700}))["character_id"] == "aiko"
+    numbers = [item["number"] async for item in db.characters.find({})]
+    assert sorted(numbers) == [1, 2, 3]
+
+
+async def test_conflicting_numeric_legacy_slugs_fail_closed_without_renumbering(isolated_database):
+    from summon.repositories.catalog import CatalogRepository
+    from summon.repositories.character_numbers import CharacterNumberingUnavailable
+
+    client, db = isolated_database
+    await db.catalog_counters.delete_one({"_id": "characters"})
+    await db.characters.update_many({}, {"$unset": {"number": ""}})
+    template = await db.characters.find_one({"_id": "aiko"})
+    for character_id in ("1", "01"):
+        await db.characters.insert_one({**template, "_id": character_id})
+    with pytest.raises(CharacterNumberingUnavailable):
+        await CatalogRepository(db, client=client).details(700, "1")
+    assert await db.catalog_counters.find_one({"_id": "characters"}) is None
+    assert await db.characters.count_documents({"number": {"$exists": True}}) == 0
+
+
+async def test_concurrent_new_characters_receive_distinct_stable_numbers(isolated_database):
+    from summon.models import CharacterInput
+    from summon.repositories.catalog import CatalogRepository
+
+    client, db = isolated_database
+    repo = CatalogRepository(db, client=client)
+    await repo.details(700, "1")
+
+    async def create(index):
+        data = CharacterInput(
+            id=f"new-{index}",
+            name=f"New {index}",
+            category="Sky",
+            rarity="rare",
+            image_url="https://example.com/image.jpg",
+        )
+        return await repo.create_character(data, actor_id=700, event_id=f"numeric-test-{index}")
+
+    saved = await asyncio.gather(*(create(index) for index in range(5)))
+    assert sorted(item["number"] for item in saved) == [4, 5, 6, 7, 8]
+    for item in saved:
+        assert (await repo.details(700, str(item["number"])))["id"] == item["id"]
+
+
+async def test_encrypted_snapshot_and_insert_only_restore_into_isolated_database(
+    isolated_database, tmp_path
+):
+    from summon.backup import (
+        BackupError,
+        _read_encrypted,
+        export_snapshot,
+        inspect_backup,
+        restore_empty,
+    )
+
+    client, source = isolated_database
+    await source.inventory.insert_one(
+        {"user_id": 700, "character_id": "aiko", "quantity": 2, "favorite": True}
+    )
+    await source.users.insert_one(
+        {"_id": 700, "first_name": "Private test player", "bot_token": "fake-secret"}
+    )
+    await source.web_sessions.insert_one(
+        {
+            "_id": "a" * 64,
+            "user_id": 700,
+            "expires_at": datetime.now(UTC) + timedelta(hours=1),
+        }
+    )
+    path = tmp_path / "isolated.sbak"
+    password = "a long isolated test passphrase"
+    exported = await export_snapshot(client, source, path, password)
+    encrypted = _read_encrypted(path)
+    assert b"Private test player" not in encrypted and b"fake-secret" not in encrypted
+    assert inspect_backup(encrypted, password)[1] == exported
+    target_name = f"summon_restore_{uuid4().hex}"
+    try:
+        restored = await restore_empty(client, encrypted, password, target_name)
+        target = client[target_name]
+        assert restored == exported
+        assert (await target.inventory.find_one({"user_id": 700}))["character_id"] == "aiko"
+        assert (await target.characters.find_one({"_id": "aiko"}))["number"] == 1
+        assert "bot_token" not in await target.users.find_one({"_id": 700})
+        assert await target.web_sessions.count_documents({}) == 0
+        with pytest.raises(BackupError, match="empty"):
+            await restore_empty(client, encrypted, password, target_name)
+        assert await target.inventory.count_documents({"user_id": 700}) == 1
+    finally:
+        if os.environ.get("SUMMON_TEST_MONGO_DROP_CONFIRM") == "DROP_ISOLATED_TEST_DB":
+            await client.drop_database(target_name)

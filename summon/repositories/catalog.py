@@ -14,12 +14,13 @@ from pymongo.errors import DuplicateKeyError
 from summon.models import CharacterChanges, CharacterInput, InventorySort, normalize_name
 from summon.rarities import spawn_values
 from summon.repositories.base import transaction, utcnow
+from summon.repositories.character_numbers import CharacterNumbers, numeric_slug
 from summon.repositories.rarity_weights import SpawnWeightsRepository
 from summon.services.artwork import MAX_ARTWORK_BYTES, Artwork
 
 
 def public_character(doc: dict[str, Any]) -> dict[str, Any]:
-    return {
+    character = {
         "id": doc["_id"],
         "name": doc["name"],
         "category": doc["category"],
@@ -28,6 +29,11 @@ def public_character(doc: dict[str, Any]) -> dict[str, Any]:
         "description": doc.get("description", ""),
         "active": doc.get("active", True),
     }
+    if isinstance(doc.get("number"), int) and not isinstance(doc["number"], bool):
+        character["number"] = doc["number"]
+    if doc.get("media_type") in {"video", "animation"}:
+        character["media_type"] = doc["media_type"]
+    return character
 
 
 class CatalogConflict(Exception):
@@ -61,11 +67,35 @@ class CatalogRepository:
         values = data.model_dump(exclude={"id"})
         values["name_key"] = normalize_name(data.name)
         now, random_key, event_id = utcnow(), self.rng.random(), uuid4().hex
+        numbers = CharacterNumbers(self.client, self.db)
+        await numbers.ensure_initialized()
 
         async def save(session: Any) -> dict[str, Any]:
+            existing = await self.db.characters.find_one({"_id": data.id}, session=session)
+            number = (
+                existing.get("number") if existing else await numbers.allocate(data.id, session)
+            )
+            if not isinstance(number, int) or isinstance(number, bool):
+                raise RuntimeError("Existing character has no stable number")
+            write_values = dict(values)
+            if existing and data.image_url == existing.get("image_url"):
+                # Editing unrelated metadata must not discard a Telegram backup
+                # or silently change video artwork into a photo.
+                for field in ("media_type", "telegram_file_id"):
+                    if field not in data.model_fields_set:
+                        write_values.pop(field, None)
+                if (
+                    "media_type" in data.model_fields_set
+                    and data.media_type != existing.get("media_type", "photo")
+                    and "telegram_file_id" not in data.model_fields_set
+                ):
+                    write_values["telegram_file_id"] = None
             await self.db.characters.update_one(
                 {"_id": data.id},
-                {"$set": values, "$setOnInsert": {"random_key": random_key, "created_at": now}},
+                {
+                    "$set": write_values,
+                    "$setOnInsert": {"random_key": random_key, "created_at": now, "number": number},
+                },
                 upsert=True,
                 session=session,
             )
@@ -80,7 +110,9 @@ class CatalogRepository:
                 },
                 session=session,
             )
-            return public_character({"_id": data.id, **values})
+            return public_character(
+                {**(existing or {}), "_id": data.id, "number": number, **write_values}
+            )
 
         return await transaction(self.client, save)
 
@@ -98,6 +130,12 @@ class CatalogRepository:
                 upsert=True,
                 session=session,
             )
+
+    async def prepare_numbering(self) -> None:
+        """Initialize stable aliases before beginning an external media upload."""
+        if self.client is None:
+            raise RuntimeError("Catalog writes require a transaction client")
+        await CharacterNumbers(self.client, self.db).ensure_initialized()
 
     async def catalog_event_exists(self, event_id: str) -> bool:
         """Avoid repeating optional external uploads for an already-audited command."""
@@ -122,8 +160,11 @@ class CatalogRepository:
         values = data.model_dump(exclude={"id"})
         values["name_key"] = normalize_name(data.name)
         now, random_key = utcnow(), self.rng.random()
+        numbers = CharacterNumbers(self.client, self.db)
+        await numbers.ensure_initialized()
 
         async def create(session: Any) -> dict[str, Any]:
+            number = await numbers.allocate(data.id, session)
             await self.db.activity.insert_one(
                 {
                     "_id": event_id,
@@ -136,11 +177,17 @@ class CatalogRepository:
                 session=session,
             )
             await self.db.characters.insert_one(
-                {"_id": data.id, **values, "random_key": random_key, "created_at": now},
+                {
+                    "_id": data.id,
+                    **values,
+                    "number": number,
+                    "random_key": random_key,
+                    "created_at": now,
+                },
                 session=session,
             )
             await self._insert_artwork(artwork, now, session)
-            return public_character({"_id": data.id, **values})
+            return public_character({"_id": data.id, "number": number, **values})
 
         try:
             return await transaction(self.client, create)
@@ -157,6 +204,7 @@ class CatalogRepository:
         actor_id: int,
         event_id: str,
         artwork: Artwork | None = None,
+        telegram_file_id: str | None = None,
     ) -> None:
         """Update only supplied metadata, without changing ID or ownership."""
         if self.client is None:
@@ -165,6 +213,17 @@ class CatalogRepository:
         if not values:
             raise ValueError("No character metadata was supplied")
         _check_artwork(artwork, values.get("image_url"))
+        if telegram_file_id is not None and (
+            "image_url" not in values
+            or not isinstance(telegram_file_id, str)
+            or not 1 <= len(telegram_file_id) <= 2048
+            or not telegram_file_id.isascii()
+            or not telegram_file_id.isprintable()
+        ):
+            raise ValueError("A valid Telegram file ID requires a new artwork URL")
+        if "image_url" in values:
+            # A new URL must never retain a file ID for unrelated old media.
+            values.update(media_type="photo", telegram_file_id=telegram_file_id)
         if "name" in values:
             values["name_key"] = normalize_name(values["name"])
         now = utcnow()
@@ -250,19 +309,28 @@ class CatalogRepository:
         return None
 
     async def get(self, character_id: str) -> dict[str, Any] | None:
-        doc = await self.db.characters.find_one({"_id": character_id, "active": True})
+        number = numeric_slug(character_id)
+        if number is not None:
+            if self.client is None:
+                raise RuntimeError("Numeric lookup requires a transaction client")
+            await CharacterNumbers(self.client, self.db).ensure_initialized()
+            doc = await self.db.characters.find_one({"number": number, "active": True})
+        else:
+            doc = await self.db.characters.find_one({"_id": character_id, "active": True})
         return public_character(doc) if doc else None
 
     async def details(self, user_id: int, character_id: str) -> dict[str, Any] | None:
         character = await self.get(character_id)
         if not character:
             return None
+        # Inventory and wishlists always reference the immutable internal slug.
+        canonical_id = character["id"]
         owned = (
-            await self.db.inventory.find_one({"user_id": user_id, "character_id": character_id})
+            await self.db.inventory.find_one({"user_id": user_id, "character_id": canonical_id})
             or {}
         )
         wished = await self.db.wishlists.find_one(
-            {"user_id": user_id, "character_id": character_id}
+            {"user_id": user_id, "character_id": canonical_id}
         )
         character.update(
             quantity=owned.get("quantity", 0),

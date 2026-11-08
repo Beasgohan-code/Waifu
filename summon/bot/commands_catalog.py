@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import secrets
 import unicodedata
 from dataclasses import dataclass
 from io import BytesIO
@@ -20,16 +21,26 @@ from pymongo.errors import PyMongoError
 from wzgram import Client, filters
 from wzgram.enums import ChatType
 from wzgram.errors import RPCError
-from wzgram.types import Message
+from wzgram.types import CallbackQuery, Message
 
 from summon.auth import TelegramUser
-from summon.bot.keyboards import operator_panel_keyboard
-from summon.bot.presentation import Card, Emoji, send_photo_card
-from summon.bot.telegram_helpers import _user, command_input
+from summon.bot.keyboards import operator_panel_keyboard, upload_provider_keyboard
+from summon.bot.presentation import Card, Emoji, callback_text, send_media_card, send_photo_card
+from summon.bot.telegram_helpers import _user, callback_data, command_input, telegram_user
+from summon.bot.upload_media import (
+    Provider,
+    menu_token,
+    parse_upload,
+    read_motion,
+    reply_media,
+    valid_token,
+    valid_upload_age,
+)
 from summon.config import Settings
 from summon.models import CharacterBasics, CharacterChanges, CharacterInput
 from summon.rarities import MAX_SPAWN_WEIGHT, RARITY_WEIGHTS, Rarity, parse_rarity, rarity_label
 from summon.repositories.catalog import CatalogConflict, CatalogNotFound
+from summon.repositories.character_numbers import CharacterNumberingUnavailable
 from summon.repositories.rarity_weights import InvalidSpawnWeights, SpawnWeightConflict
 from summon.services.artwork import (
     MAX_ARTWORK_BYTES,
@@ -40,6 +51,7 @@ from summon.services.artwork import (
     normalize_photo,
     validate_external_url,
 )
+from summon.services.catbox import upload_catbox
 from summon.services.imgbb import ImageHostError, upload_imgbb
 
 logger = logging.getLogger(__name__)
@@ -62,6 +74,7 @@ class PreparedArtwork:
     stored_photo: Artwork | None = None
     channel_photo: Artwork | None = None
     external_hosted: bool = False
+    telegram_file_id: str | None = None
 
 
 class ImageHostAlreadyAttempted(Exception):
@@ -165,6 +178,12 @@ def _valid_private_message(message: Message, user: TelegramUser) -> bool:
 def register_catalog_commands(app: Client, store: Any, settings: Settings, respond: Any) -> None:
     photo_slots = asyncio.Semaphore(2)
     host_slots = asyncio.Semaphore(2)
+    secret = settings.session_secret.get_secret_value()
+    menu_key = (
+        hashlib.sha256(("summon-upload-v1:" + secret).encode()).digest()
+        if secret
+        else secrets.token_bytes(32)
+    )
 
     async def authorize(message: Message) -> TelegramUser | None:
         user = _user(message)
@@ -335,9 +354,17 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             raise InvalidArtwork("Choose either one Telegram photo or one HTTPS URL")
         if not photo_message:
             return PreparedArtwork(validate_external_url(url or ""))
+        if settings.artwork_backend != "imgbb":
+            raise InvalidArtwork("Use /upload to choose a public media host")
+        file_id = getattr(photo_message.photo, "file_id", None)
+        if (
+            not isinstance(file_id, str)
+            or not 1 <= len(file_id) <= 2048
+            or not file_id.isascii()
+            or not file_id.isprintable()
+        ):
+            raise InvalidArtwork("Telegram photo ID is unavailable")
         artwork = await _read_photo(app, photo_message, photo_slots)
-        if settings.artwork_backend == "mongo":
-            return PreparedArtwork(artwork.path, stored_photo=artwork, channel_photo=artwork)
         # An external provider has no transactional or idempotency API. A durable,
         # majority-acknowledged claim prevents replay for seven days; the catalog
         # audit also blocks successfully completed commands beyond that window.
@@ -351,7 +378,9 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                     hosted_url = await upload_imgbb(artwork, settings.imgbb_key)
         except TimeoutError:
             raise ImageHostError("Image host result is unconfirmed") from None
-        return PreparedArtwork(hosted_url, channel_photo=artwork, external_hosted=True)
+        return PreparedArtwork(
+            hosted_url, channel_photo=artwork, external_hosted=True, telegram_file_id=file_id
+        )
 
     async def archive_photo(artwork: Artwork | None, character_id: str) -> bool:
         if settings.db_channel is None or artwork is None:
@@ -382,6 +411,82 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             logger.warning("Catalog archive delivery unconfirmed (%s)", type(exc).__name__)
             return False
 
+    async def upload_source(message: Message) -> Message:
+        if message.reply_to_message is not None:
+            return message.reply_to_message
+        if message.reply_to_message_id is not None:
+            source = await app.get_messages(
+                message.chat.id, message_ids=message.reply_to_message_id, replies=0
+            )
+            if isinstance(source, Message) and not source.empty:
+                return source
+        # Keep supporting an ordinary captioned photo from the earlier flow.
+        if message.photo or message.video or message.animation:
+            return message
+        raise InvalidArtwork("Reply to a photo, video or GIF")
+
+    async def start_media_upload(
+        message: Message, user: TelegramUser, bot_id: int, event_id: str
+    ) -> None:
+        try:
+            parsed = parse_upload(command_input(message).args or "", _generated_id("", event_id))
+            source = await upload_source(message)
+            media = reply_media(source)
+            if not valid_upload_age(message):
+                raise InvalidArtwork("Upload menu expired")
+            if settings.db_channel is None:
+                await respond(
+                    message,
+                    Card(
+                        "Archive channel needed",
+                        "Set DB_CHANNEL to a private channel where the bot can post, "
+                        "then try again.",
+                        emoji=Emoji.WARNING,
+                    ),
+                )
+                return
+            providers: list[tuple[str, Provider]] = [("Catbox", "catbox")]
+            if media.kind == "photo" and settings.imgbb_key.get_secret_value().strip():
+                providers.append(("ImgBB", "imgbb"))
+            choices = [
+                (
+                    label,
+                    f"catalog-upload:{message.id}:{'c' if provider == 'catbox' else 'i'}:"
+                    f"{menu_token(menu_key, bot_id, user.id, message, media, provider)}",
+                )
+                for label, provider in providers
+            ]
+        except (ValueError, ValidationError, RPCError, OSError, TimeoutError):
+            await respond(
+                message,
+                Card(
+                    "Check the character details",
+                    'Reply to a photo, video or GIF with /upload "Character name" '
+                    '"Anime name" 1, or use /upload Character | Anime | 1. '
+                    "Rarity numbers are 1–18; video and GIF use AMV Edition.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+        await respond(
+            message,
+            Card(
+                "Choose a media host",
+                "The selected file becomes public. Catbox accepts photos and moving media; "
+                "ImgBB is available for photos when its key is configured. "
+                "Videos and GIFs may retain embedded metadata. "
+                "The channel copy and provider upload cannot be undone automatically.",
+                emoji=Emoji.OPEN_COLLECTION,
+                fields=(
+                    ("Character", parsed.name),
+                    ("Series", parsed.category),
+                    ("Rarity", rarity_label(rarity)),
+                ),
+            ),
+            markup=upload_provider_keyboard(choices, premium=settings.premium_emoji_enabled),
+        )
+
     @app.on_message(filters.incoming & filters.command(["upload", "addchar"]))
     async def create_character(_client: Client, message: Message) -> None:
         user = await authorize(message)
@@ -396,6 +501,15 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             return
         command = command_input(message)
         event_id = _event_id(identity.id, message.chat.id, message.id)
+        if command.command == "upload" and (
+            message.reply_to_message_id is not None
+            or message.reply_to_message is not None
+            or message.photo is not None
+            or message.video is not None
+            or message.animation is not None
+        ):
+            await start_media_upload(message, user, identity.id, event_id)
+            return
         prepared: PreparedArtwork | None = None
         try:
             parsed = _new_character(command.command, command.args or "", event_id)
@@ -407,6 +521,7 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 category=parsed.category,
                 rarity=parsed.rarity,
             )
+            await store.catalog.prepare_numbering()
             if (
                 settings.artwork_backend == "imgbb"
                 and _photo_message(message) is not None
@@ -415,7 +530,11 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             ):
                 raise CatalogConflict
             prepared = await artwork_for(message, parsed.url, event_id)
-            data = CharacterInput(**basics.model_dump(), image_url=prepared.url)
+            data = CharacterInput(
+                **basics.model_dump(),
+                image_url=prepared.url,
+                telegram_file_id=prepared.telegram_file_id,
+            )
             await store.catalog.create_character(
                 data, actor_id=user.id, event_id=event_id, artwork=prepared.stored_photo
             )
@@ -445,10 +564,20 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 message,
                 Card(
                     "Check the character details",
-                    "Use /upload id | name | series | rarity | HTTPS-URL, or reply to a photo "
-                    "with /upload id | name | series | rarity. "
-                    "For /addchar, omit the ID. Use a rarity ID from 1 to 18 or a rarity name. "
-                    "Photos must be ordinary JPEG photos up to 3 MiB.",
+                    'Reply to a photo, video or GIF with /upload "Character name" '
+                    '"Anime name" 1, or use /upload Character | Anime | 1. '
+                    "To add an HTTPS URL directly, use /addchar name | anime | rarity | URL. "
+                    "Photos are limited to 3 MiB; videos and GIFs to 16 MiB.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        except CharacterNumberingUnavailable:
+            await respond(
+                message,
+                Card(
+                    "Numbering needs review",
+                    "An operator must review the existing catalog; no ownership was changed.",
                     emoji=Emoji.WARNING,
                 ),
             )
@@ -502,6 +631,221 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
             ),
         )
 
+    async def archive_media(
+        payload: bytes, extension: str, media_type: str, original_file_id: str, character_id: str
+    ) -> tuple[str, bool]:
+        if settings.db_channel is None:
+            return original_file_id, False
+        try:
+            async with asyncio.timeout(120):
+                channel = await app.get_chat(settings.db_channel)
+                if channel.type != ChatType.CHANNEL:
+                    return original_file_id, False
+                file = BytesIO(payload)
+                file.name = f"summon.{extension}"
+                sent = await send_media_card(
+                    app,
+                    settings.db_channel,
+                    file,
+                    Card(
+                        "Catalog media archived",
+                        "A character's public media was added by an operator.",
+                        emoji=Emoji.OPEN_COLLECTION,
+                        fields=(("ID", character_id),),
+                    ),
+                    media_type=media_type,
+                    premium=settings.premium_emoji_enabled,
+                )
+                if sent is None:
+                    return original_file_id, False
+                item = getattr(sent, media_type, None)
+                channel_file_id = getattr(item, "file_id", None)
+                if (
+                    isinstance(channel_file_id, str)
+                    and 1 <= len(channel_file_id) <= 2048
+                    and channel_file_id.isascii()
+                    and channel_file_id.isprintable()
+                ):
+                    return channel_file_id, True
+                return original_file_id, True
+        except (RPCError, OSError, TimeoutError) as exc:
+            # A timeout may have posted the copy. Never repeat an uncertain send.
+            logger.warning("Catalog archive delivery unconfirmed (%s)", type(exc).__name__)
+            return original_file_id, False
+
+    @app.on_callback_query(filters.regex("^catalog-upload:") | filters.regex(b"^catalog-upload:"))
+    async def upload_choice(_client: Client, callback: CallbackQuery) -> None:
+        actor = telegram_user(callback.from_user)
+        parts = callback_data(callback).split(":")
+        identity = getattr(app, "me", None)
+        chat = getattr(callback.message, "chat", None)
+        kind: Any = getattr(chat, "type", None)
+        if (
+            actor is None
+            or actor.id not in settings.operator_ids
+            or not identity
+            or not isinstance(identity.id, int)
+            or chat is None
+            or chat.id != actor.id
+            or getattr(kind, "value", kind) != "private"
+            or len(parts) != 4
+            or not re.fullmatch(r"[1-9][0-9]{0,9}", parts[1])
+            or parts[2] not in {"c", "i"}
+            or not re.fullmatch(r"[a-zA-Z0-9_-]{16}", parts[3])
+        ):
+            await callback.answer(
+                callback_text("This menu is unavailable.", emoji=Emoji.WARNING), show_alert=True
+            )
+            return
+        provider: Provider = "catbox" if parts[2] == "c" else "imgbb"
+        try:
+            command_message = await app.get_messages(actor.id, message_ids=int(parts[1]), replies=1)
+            if not isinstance(command_message, Message) or command_message.empty:
+                raise ValueError("Original command is unavailable")
+            if (
+                not _valid_private_message(command_message, actor)
+                or not command_message.from_user
+                or command_message.from_user.id != actor.id
+                or command_message.forward_origin is not None
+                or command_message.via_bot is not None
+                or command_message.business_connection_id is not None
+                or command_message.sender_business_bot is not None
+                or not valid_upload_age(command_message)
+            ):
+                raise ValueError("Original command is unavailable")
+            command_text = str(command_message.text or command_message.caption or "").split(
+                maxsplit=1
+            )
+            command_name, _, mention = (command_text[0] if command_text else "").partition("@")
+            if command_name.casefold() != "/upload" or (
+                mention and mention.casefold() != (identity.username or "").casefold()
+            ):
+                raise ValueError("Original command changed")
+            event_id = _event_id(identity.id, actor.id, command_message.id)
+            parsed = parse_upload(
+                command_input(command_message).args or "", _generated_id("", event_id)
+            )
+            source = await upload_source(command_message)
+            media = reply_media(source)
+            expected = menu_token(menu_key, identity.id, actor.id, command_message, media, provider)
+            if not valid_token(expected, parts[3]):
+                raise ValueError("Original command or media changed")
+            if provider == "imgbb" and (
+                media.kind != "photo" or not settings.imgbb_key.get_secret_value().strip()
+            ):
+                raise ValueError("Provider is unavailable")
+            if settings.db_channel is None:
+                raise ValueError("Archive channel is unavailable")
+            if not await store.limiter.allow(
+                f"catalog:{actor.id}:upload-choice", limit=10, seconds=60
+            ):
+                await callback.answer(
+                    callback_text("Try again shortly.", emoji=Emoji.HOURGLASS), show_alert=True
+                )
+                return
+            await store.catalog.prepare_numbering()
+            if await store.catalog.character_exists(parsed.character_id):
+                raise CatalogConflict
+            if await store.catalog.catalog_event_exists(event_id):
+                raise ImageHostAlreadyAttempted
+            if not await store.limiter.claim_once(f"catalog-media:{event_id}", seconds=7 * 86400):
+                raise ImageHostAlreadyAttempted
+        except (ValueError, ValidationError, RPCError, OSError, TimeoutError):
+            await callback.answer(
+                callback_text(
+                    "This menu expired or its original message changed. Send /upload again.",
+                    emoji=Emoji.WARNING,
+                ),
+                show_alert=True,
+            )
+            return
+        except (CharacterNumberingUnavailable, CatalogConflict, ImageHostAlreadyAttempted):
+            await callback.answer(
+                callback_text(
+                    "Already attempted or catalog numbering needs review. Check the catalog.",
+                    emoji=Emoji.WARNING,
+                ),
+                show_alert=True,
+            )
+            return
+        except PyMongoError as exc:
+            logger.warning("Catalog upload preflight unavailable (%s)", type(exc).__name__)
+            await callback.answer(
+                callback_text("Catalog unavailable; try later.", emoji=Emoji.WARNING),
+                show_alert=True,
+            )
+            return
+
+        await callback.answer(
+            callback_text("Uploading publicly; please wait.", emoji=Emoji.HOURGLASS)
+        )
+        try:
+            artwork = None
+            if media.kind == "photo":
+                artwork = await _read_photo(app, source, photo_slots)
+                payload, extension = artwork.content, "jpg"
+            else:
+                payload, extension = await read_motion(app, source, media, photo_slots)
+            async with host_slots:
+                if provider == "imgbb":
+                    if artwork is None:
+                        raise ImageHostError("Photo required")
+                    url = await upload_imgbb(artwork, settings.imgbb_key)
+                else:
+                    url = await upload_catbox(payload, extension, settings.catbox_userhash)
+            backup_id, archived = await archive_media(
+                payload, extension, media.kind, media.file_id, parsed.character_id
+            )
+            rarity = "amv-edition" if media.kind != "photo" else parsed.rarity
+            data = CharacterInput(
+                id=parsed.character_id,
+                name=parsed.name,
+                category=parsed.category,
+                rarity=rarity,
+                image_url=url,
+                media_type=media.kind,
+                telegram_file_id=backup_id,
+            )
+            saved = await store.catalog.create_character(data, actor_id=actor.id, event_id=event_id)
+        except (
+            ImageHostError,
+            ValueError,
+            ValidationError,
+            RPCError,
+            OSError,
+            TimeoutError,
+            PyMongoError,
+            CatalogConflict,
+            CharacterNumberingUnavailable,
+        ) as exc:
+            logger.warning("Public catalog upload unconfirmed (%s)", type(exc).__name__)
+            await respond(
+                callback.message,
+                Card(
+                    "Upload result unconfirmed",
+                    "Check the catalog, selected host and DB_CHANNEL before trying again. "
+                    "A public upload or channel copy may already exist; "
+                    "this button will not retry it.",
+                    emoji=Emoji.WARNING,
+                ),
+            )
+            return
+        number = saved.get("number") if isinstance(saved, dict) else None
+        await respond(
+            callback.message,
+            Card(
+                "Character added",
+                "The hosted media URL and Telegram file ID were saved; ownership was not changed."
+                + (
+                    " Channel copy unconfirmed; check DB_CHANNEL before reposting."
+                    if not archived
+                    else ""
+                ),
+                emoji=Emoji.DONE,
+                fields=(("ID", str(number or data.id)), ("Rarity", rarity_label(data.rarity))),
+            ),
+        )
+
     @app.on_message(filters.incoming & filters.command(["updatechar", "update"]))
     async def edit_character(_client: Client, message: Message) -> None:
         user = await authorize(message)
@@ -550,12 +894,14 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                     raise ValueError("Invalid rarity")
                 value = parsed
             changes = CharacterChanges.model_validate({field: value})
+            media_id = prepared.telegram_file_id if prepared else None
             await store.catalog.update_character(
                 character_id,
                 changes,
                 actor_id=user.id,
                 event_id=event_id,
                 artwork=prepared.stored_photo if prepared else None,
+                **({"telegram_file_id": media_id} if media_id else {}),
             )
         except ImageHostAlreadyAttempted:
             await respond(
@@ -584,7 +930,8 @@ def register_catalog_commands(app: Client, store: Any, settings: Settings, respo
                 Card(
                     "Check the update",
                     "Use /updatechar id name|series|rarity|image|description value. "
-                    "For an image, provide a public HTTPS URL or reply to a photo without a URL.",
+                    "Images accept a public HTTPS URL; replied photos require an "
+                    "operator-configured ImgBB backend and key.",
                     emoji=Emoji.WARNING,
                 ),
             )

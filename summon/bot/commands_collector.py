@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -11,12 +12,13 @@ from wzgram import Client, filters
 from wzgram.errors import BadRequest, RPCError
 from wzgram.types import CallbackQuery, Message
 
-from summon.bot.keyboards import collection_keyboard, collection_mode_keyboard
+from summon.bot.keyboards import collection_mode_keyboard, start_keyboard
 from summon.bot.presentation import Card, Emoji, callback_text, edit_keyboard
 from summon.bot.telegram_helpers import _group, _user, callback_data, command_input, telegram_user
 from summon.config import Settings
 from summon.models import CollectionMode
 from summon.rarities import rarity_label
+from summon.repositories.character_numbers import CharacterNumberingUnavailable
 from summon.repositories.collection import DailyCharacterAlreadyClaimed, DailyCharacterUnavailable
 from summon.repositories.rarity_weights import InvalidSpawnWeights
 from summon.repositories.users import DailyAlreadyClaimed, DailyStatusUnavailable, daily_status
@@ -33,9 +35,13 @@ def register_collector_commands(
             return
         await store.users.touch(user, datetime.now(UTC))
         keyboard = None
-        if not _group(message) and settings.webapp_url:
-            keyboard = collection_keyboard(
-                settings.webapp_url, premium=settings.premium_emoji_enabled
+        if not _group(message):
+            bot_user = getattr(app, "me", None)
+            keyboard = start_keyboard(
+                settings.webapp_url,
+                getattr(bot_user, "username", None),
+                user.id,
+                premium=settings.premium_emoji_enabled,
             )
         await respond(
             message,
@@ -50,6 +56,51 @@ def register_collector_commands(
                 field_icons=(Emoji.QUESTION, Emoji.ADMIN_SHIELD),
             ),
             markup=keyboard,
+        )
+
+    @app.on_callback_query(filters.regex("^start-guide:") | filters.regex(b"^start-guide:"))
+    async def start_guide(_client: Client, callback: CallbackQuery) -> None:
+        actor = telegram_user(callback.from_user)
+        parts = callback_data(callback).split(":")
+        chat = getattr(callback.message, "chat", None)
+        kind: Any = getattr(chat, "type", None)
+        if (
+            actor is None
+            or len(parts) != 2
+            or parts[1] != str(actor.id)
+            or chat is None
+            or chat.id != actor.id
+            or getattr(kind, "value", kind) != "private"
+        ):
+            await callback.answer(
+                callback_text("This menu belongs to another collector.", emoji=Emoji.WARNING),
+                show_alert=True,
+            )
+            return
+        try:
+            allowed = await store.limiter.allow(
+                f"user:{actor.id}:start-guide", limit=20, seconds=60
+            )
+        except (PyMongoError, OSError, TimeoutError):
+            allowed = False
+        if not allowed:
+            await callback.answer(
+                callback_text("Try again shortly.", emoji=Emoji.HOURGLASS), show_alert=True
+            )
+            return
+        await callback.answer(callback_text("Here is your guide.", emoji=Emoji.QUESTION))
+        await respond(
+            callback.message,
+            Card(
+                "Your first summon",
+                "Add SUMMON to a group and ask an administrator to enable group spawns. "
+                "When a character appears, guess their name with /summon. "
+                "Collect a free character with /hclaim and explore your collection "
+                "with /collection.",
+                emoji=Emoji.SUMMON_BRAND,
+                fields=(("Full guide", "/help"), ("Group setup", "/manage")),
+                field_icons=(Emoji.QUESTION, Emoji.ADMIN_SHIELD),
+            ),
         )
 
     @app.on_message(filters.incoming & filters.command(["help", "commands", "menu"]))
@@ -348,6 +399,18 @@ def register_collector_commands(
             return
         try:
             character = await store.catalog.details(user.id, character_id)
+        except CharacterNumberingUnavailable:
+            await respond(
+                message,
+                Card(
+                    "Numbering needs review",
+                    "An operator must review conflicting or unusually large legacy catalogs. "
+                    "Existing character IDs and ownership have not been changed.",
+                    emoji=Emoji.WARNING,
+                ),
+                private=True,
+            )
+            return
         except PyMongoError:
             await collector_read_error(message)
             return
@@ -356,6 +419,9 @@ def register_collector_commands(
                 message, Card("Not found", "That character is not in the catalog."), private=True
             )
             return
+        display_id = str(character.get("number", character["id"]))
+        if character.get("number") is not None and display_id != character["id"]:
+            display_id += f" (catalog key: {character['id']})"
         await respond(
             message,
             Card(
@@ -363,7 +429,7 @@ def register_collector_commands(
                 character.get("description", ""),
                 emoji=Emoji.SEARCH,
                 fields=(
-                    ("ID", character["id"]),
+                    ("ID", display_id),
                     ("Series", character["category"]),
                     ("Rarity", rarity_label(character["rarity"])),
                     ("Your copies", str(character.get("quantity", 0))),
@@ -668,8 +734,15 @@ def register_collector_commands(
         if not allowed:
             await respond(message, Card("Please slow down", "Try again shortly."), private=True)
             return
+        if app.me is None or not isinstance(message.id, int) or message.id <= 0:
+            await collector_read_error(message)
+            return
+        material = f"{app.me.id}:{message.chat.id}:{message.id}".encode("ascii")
+        message_id = "daily-character-message:" + hashlib.sha256(material).hexdigest()
         try:
-            character = await collection.claim_daily_character(user, datetime.now(UTC))
+            character = await collection.claim_daily_character(
+                user, datetime.now(UTC), message_id=message_id
+            )
         except DailyCharacterAlreadyClaimed:
             await respond(
                 message,

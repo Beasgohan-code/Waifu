@@ -40,6 +40,7 @@ async def setup(*, operators=(42,), **settings_overrides):
             spawn_weights=AsyncMock(return_value=dict(RARITY_WEIGHTS)),
             create_character=AsyncMock(),
             update_character=AsyncMock(),
+            prepare_numbering=AsyncMock(),
             catalog_event_exists=AsyncMock(return_value=False),
             character_exists=AsyncMock(return_value=False),
             set_spawn_weight=AsyncMock(return_value=(10, 500)),
@@ -190,31 +191,28 @@ async def test_addchar_reference_style_uses_deterministic_generated_id():
         await app.dispatcher.stop()
 
 
-async def test_captioned_telegram_photo_is_sanitized_and_sent_to_transaction():
-    app, store = await setup()
+async def test_captioned_telegram_photo_offers_host_choice_before_uploading():
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
     original = jpeg()
-    streamed = []
-
-    async def stream(message, *, limit):
-        streamed.append((message, limit))
-        yield original
-
-    app.stream_media = stream
+    app.stream_media = AsyncMock()
     try:
-        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock):
+        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
             await dispatch(
                 app, packet("/upload aiko | Aiko | Sky | 2", photo=(original, len(original)))
             )
-        args = store.catalog.create_character.await_args
-        assert args.args[0].image_url == args.kwargs["artwork"].path
-        assert args.kwargs["artwork"].content.startswith(b"\xff\xd8\xff")
-        assert streamed[0][1] == 4
+        assert sent.await_args.args[2].title == "Choose a media host"
+        buttons = sent.await_args.kwargs["reply_markup"].inline_keyboard[0]
+        assert len(buttons) == 2
+        assert "Catbox" in buttons[0].text and "ImgBB" in buttons[1].text
+        app.stream_media.assert_not_called()
+        store.catalog.create_character.assert_not_awaited()
     finally:
         await app.dispatcher.stop()
 
 
 async def test_reply_to_photo_updates_image_without_touching_other_metadata():
-    app, store = await setup()
+    app, store = await setup(artwork_backend="imgbb", imgbb_key="FAKE_HOST_KEY")
+    store.catalog.character_exists.return_value = True
     original = jpeg()
     photo = Photo(
         file_id="test",
@@ -234,13 +232,22 @@ async def test_reply_to_photo_updates_image_without_touching_other_metadata():
 
     app.stream_media = stream
     try:
-        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock):
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
+            patch(
+                "summon.bot.commands_catalog.upload_imgbb",
+                new_callable=AsyncMock,
+                return_value="https://i.ibb.co/test/photo.jpg",
+            ),
+        ):
             await dispatch(app, packet("/updatechar aiko image", reply_id=49))
         args = store.catalog.update_character.await_args
         assert args.args[0] == "aiko"
         assert args.args[1].model_dump(exclude_none=True) == {
-            "image_url": args.kwargs["artwork"].path
+            "image_url": "https://i.ibb.co/test/photo.jpg"
         }
+        assert args.kwargs["artwork"] is None
+        assert args.kwargs["telegram_file_id"] == "test"
         assert args.kwargs["actor_id"] == 42
     finally:
         await app.dispatcher.stop()
@@ -384,8 +391,8 @@ async def test_imgbb_photo_upload_is_opt_in_claimed_once_and_used_as_catalog_url
                 return_value="https://i.ibb.co/abc/image.jpg",
             ) as hosted,
         ):
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
-        store.catalog.character_exists.assert_awaited_once_with("a")
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
+        store.catalog.character_exists.assert_awaited_once_with("a-" + _event_id(123, 42, 50)[-12:])
         store.catalog.catalog_event_exists.assert_awaited_once_with(_event_id(123, 42, 50))
         store.limiter.claim_once.assert_awaited_once_with(
             f"imgbb:{_event_id(123, 42, 50)}", seconds=7 * 86400
@@ -393,6 +400,7 @@ async def test_imgbb_photo_upload_is_opt_in_claimed_once_and_used_as_catalog_url
         hosted.assert_awaited_once()
         character = store.catalog.create_character.await_args.args[0]
         assert character.image_url == "https://i.ibb.co/abc/image.jpg"
+        assert character.telegram_file_id
         assert store.catalog.create_character.await_args.kwargs["artwork"] is None
         assert sent.await_args.args[2].title == "Character added"
     finally:
@@ -419,7 +427,7 @@ async def test_imgbb_duplicate_or_replayed_upload_never_contacts_host(blocked_by
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
             patch("summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock) as hosted,
         ):
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         hosted.assert_not_awaited()
         store.catalog.create_character.assert_not_awaited()
         assert sent.await_args.args[2].title in {"Already exists", "Upload already attempted"}
@@ -449,7 +457,7 @@ async def test_imgbb_timeout_is_unconfirmed_and_does_not_modify_catalog(caplog):
                 side_effect=ImageHostError("PRIVATE_HOST_DETAIL"),
             ) as hosted,
         ):
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         hosted.assert_awaited_once()
         store.catalog.create_character.assert_not_awaited()
         card = sent.await_args.args[2]
@@ -477,7 +485,7 @@ async def test_imgbb_success_then_database_failure_warns_about_possible_orphan()
                 return_value="https://i.ibb.co/abc/image.jpg",
             ) as hosted,
         ):
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         hosted.assert_awaited_once()
         store.catalog.create_character.assert_awaited_once()
         card = sent.await_args.args[2]
@@ -487,7 +495,9 @@ async def test_imgbb_success_then_database_failure_warns_about_possible_orphan()
 
 
 async def test_configured_channel_receives_sanitized_photo_only_after_catalog_save():
-    app, store = await setup(db_channel=-1001234567890)
+    app, store = await setup(
+        db_channel=-1001234567890, artwork_backend="imgbb", imgbb_key="FAKE_HOST_KEY"
+    )
     original = jpeg()
     events = []
 
@@ -509,8 +519,15 @@ async def test_configured_channel_receives_sanitized_photo_only_after_catalog_sa
     app.send_photo = AsyncMock(side_effect=post)
     store.catalog.create_character.side_effect = save
     try:
-        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_imgbb",
+                new_callable=AsyncMock,
+                return_value="https://i.ibb.co/test/photo.jpg",
+            ),
+        ):
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         assert events == ["catalog saved", "channel posted"]
         assert sent.await_args.args[2].title == "Character added"
         assert "unconfirmed" not in sent.await_args.args[2].body
@@ -519,7 +536,9 @@ async def test_configured_channel_receives_sanitized_photo_only_after_catalog_sa
 
 
 async def test_db_channel_never_posts_to_a_group_and_warns_after_catalog_save():
-    app, store = await setup(db_channel=-1001234567890)
+    app, store = await setup(
+        db_channel=-1001234567890, artwork_backend="imgbb", imgbb_key="FAKE_HOST_KEY"
+    )
     original = jpeg()
 
     async def stream(_message, *, limit):
@@ -529,8 +548,15 @@ async def test_db_channel_never_posts_to_a_group_and_warns_after_catalog_save():
     app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.SUPERGROUP))
     app.send_photo = AsyncMock()
     try:
-        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_imgbb",
+                new_callable=AsyncMock,
+                return_value="https://i.ibb.co/test/photo.jpg",
+            ),
+        ):
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         store.catalog.create_character.assert_awaited_once()
         app.send_photo.assert_not_awaited()
         assert "Channel copy unconfirmed" in sent.await_args.args[2].body
@@ -539,7 +565,9 @@ async def test_db_channel_never_posts_to_a_group_and_warns_after_catalog_save():
 
 
 async def test_db_channel_timeout_does_not_retry_or_undo_confirmed_catalog():
-    app, store = await setup(db_channel=-1001234567890)
+    app, store = await setup(
+        db_channel=-1001234567890, artwork_backend="imgbb", imgbb_key="FAKE_HOST_KEY"
+    )
     original = jpeg()
 
     async def stream(_message, *, limit):
@@ -549,8 +577,15 @@ async def test_db_channel_timeout_does_not_retry_or_undo_confirmed_catalog():
     app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
     app.send_photo = AsyncMock(side_effect=TimeoutError("PRIVATE_SEND_DETAIL"))
     try:
-        with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_imgbb",
+                new_callable=AsyncMock,
+                return_value="https://i.ibb.co/test/photo.jpg",
+            ),
+        ):
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         store.catalog.create_character.assert_awaited_once()
         app.send_photo.assert_awaited_once()
         assert "Channel copy unconfirmed" in sent.await_args.args[2].body
@@ -560,12 +595,14 @@ async def test_db_channel_timeout_does_not_retry_or_undo_confirmed_catalog():
 
 
 async def test_db_channel_does_not_fetch_or_archive_operator_https_urls():
-    app, store = await setup(db_channel=-1001234567890)
+    app, store = await setup(
+        db_channel=-1001234567890, artwork_backend="imgbb", imgbb_key="FAKE_HOST_KEY"
+    )
     app.get_chat = AsyncMock()
     app.send_photo = AsyncMock()
     try:
         with patch("summon.bot.handlers.send_card", new_callable=AsyncMock):
-            await dispatch(app, packet("/upload a | A | S | 2 | https://cdn.example/a.jpg"))
+            await dispatch(app, packet("/addchar A | S | 2 | https://cdn.example/a.jpg"))
         store.catalog.create_character.assert_awaited_once()
         app.get_chat.assert_not_awaited()
         app.send_photo.assert_not_awaited()
@@ -602,24 +639,19 @@ async def test_imgbb_photo_update_requires_existing_id_and_never_changes_ownersh
         await app.dispatcher.stop()
 
 
-async def test_imgbb_key_alone_does_not_upload_outside_mongo():
+async def test_imgbb_key_alone_does_not_write_new_photo_blobs_to_mongo():
     app, store = await setup(imgbb_key="FAKE_HOST_KEY")
     original = jpeg()
-
-    async def stream(_message, *, limit):
-        yield original
-
-    app.stream_media = stream
+    app.stream_media = AsyncMock()
     try:
         with (
             patch("summon.bot.handlers.send_card", new_callable=AsyncMock),
             patch("summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock) as hosted,
         ):
-            await dispatch(app, packet("/upload a | A | S | 2", photo=(original, len(original))))
+            await dispatch(app, packet("/addchar A | S | 2", photo=(original, len(original))))
         hosted.assert_not_awaited()
-        store.limiter.claim_once.assert_not_awaited()
-        data = store.catalog.create_character.await_args
-        assert data.args[0].image_url == data.kwargs["artwork"].path
+        store.catalog.create_character.assert_not_awaited()
+        app.stream_media.assert_not_called()
     finally:
         await app.dispatcher.stop()
 
@@ -909,5 +941,293 @@ async def test_claimlist_uses_the_same_current_weights_as_daily_characters():
         assert card.title == "Summon rarity weights"
         assert "free /hclaim" in card.body
         assert ("Rare", "0") in card.fields
+    finally:
+        await app.dispatcher.stop()
+
+
+def callback_packet(data, *, user_id=42):
+    actor = raw.types.User(
+        id=user_id, first_name="Operator", access_hash=user_id, usernames=[], restriction_reason=[]
+    )
+    update = raw.types.UpdateBotCallbackQuery(
+        query_id=1234,
+        user_id=user_id,
+        peer=raw.types.PeerUser(user_id=user_id),
+        msg_id=51,
+        chat_instance=99,
+        data=data.encode(),
+    )
+    return update, {user_id: actor}, {}
+
+
+async def prepare_upload_callback(app, text, source):
+    """Drive native Wzgram message dispatch and retain its actual signed buttons."""
+    app.message_cache[(42, 49)] = source
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+        await dispatch(app, packet(text, reply_id=49))
+    assert sent.await_args.args[2].title == "Choose a media host"
+    buttons = sent.await_args.kwargs["reply_markup"].inline_keyboard[0]
+    command = Message(
+        id=50,
+        chat=Chat(id=42, type=ChatType.PRIVATE),
+        from_user=User(id=42),
+        date=datetime.now(UTC),
+        text=text,
+        reply_to_message_id=49,
+        reply_to_message=source,
+    )
+    app.message_cache[(42, 51)] = Message(
+        id=51, chat=Chat(id=42, type=ChatType.PRIVATE), from_user=app.me
+    )
+    app.get_messages = AsyncMock(return_value=command)
+    app.answer_callback_query = AsyncMock(return_value=True)
+    return buttons, command
+
+
+def source_photo(content):
+    return Message(
+        id=49,
+        chat=Chat(id=42, type=ChatType.PRIVATE),
+        from_user=User(id=42),
+        photo=Photo(
+            file_id="original-photo-id",
+            file_unique_id="photo-unique",
+            width=16,
+            height=16,
+            file_size=len(content),
+            date=datetime.now(UTC),
+        ),
+    )
+
+
+async def test_native_photo_provider_choice_saves_host_url_and_archived_file_id():
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+    content = jpeg()
+    source = source_photo(content)
+    events = []
+
+    async def stream(message, *, limit):
+        assert message.id == 49 and limit == 4
+        yield content
+
+    async def host(*_args, **_kwargs):
+        events.append("host")
+        return "https://i.ibb.co/test/photo.jpg"
+
+    async def channel_post(**kwargs):
+        assert kwargs["chat_id"] == -1001234567890
+        assert kwargs["photo"].getvalue().startswith(b"\xff\xd8\xff")
+        events.append("channel")
+        return SimpleNamespace(photo=SimpleNamespace(file_id="channel-photo-id"))
+
+    async def save(data, **kwargs):
+        events.append("catalog")
+        assert kwargs["event_id"] == _event_id(123, 42, 50)
+        return {"id": data.id, "number": 1}
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_photo = AsyncMock(side_effect=channel_post)
+    store.catalog.create_character.side_effect = save
+    store.limiter.claim_once.side_effect = [True, False]
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, '/upload "Toji Fushiguro" "Jujutsu Kaisen" 2', source
+        )
+        assert len(buttons) == 2 and "ImgBB" in buttons[1].text
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_imgbb", new_callable=AsyncMock, side_effect=host
+            ) as hosted,
+        ):
+            await dispatch(app, callback_packet(buttons[1].callback_data))
+            await dispatch(app, callback_packet(buttons[1].callback_data))
+        data = store.catalog.create_character.await_args.args[0]
+        assert (data.name, data.category, data.rarity) == (
+            "Toji Fushiguro",
+            "Jujutsu Kaisen",
+            "rare",
+        )
+        assert data.image_url == "https://i.ibb.co/test/photo.jpg"
+        assert data.telegram_file_id == "channel-photo-id" and data.media_type == "photo"
+        assert "artwork" not in store.catalog.create_character.await_args.kwargs
+        assert events == ["host", "channel", "catalog"]
+        hosted.assert_awaited_once()
+        store.catalog.create_character.assert_awaited_once()
+        assert sent.await_args.args[2].title == "Character added"
+        assert store.limiter.claim_once.await_count == 2
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_native_video_upload_uses_catbox_and_forces_amv():
+    from wzgram.types import Video
+
+    content = b"\x00\x00\x00\x18ftypisom" + b"video"
+    source = Message(
+        id=49,
+        chat=Chat(id=42, type=ChatType.PRIVATE),
+        from_user=User(id=42),
+        video=Video(
+            file_id="original-video-id",
+            file_unique_id="video-unique",
+            width=16,
+            height=16,
+            codec="h264",
+            duration=1,
+            mime_type="video/mp4",
+            file_size=len(content),
+        ),
+    )
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+
+    async def stream(_message, *, limit):
+        assert limit == 17
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_video = AsyncMock(
+        return_value=SimpleNamespace(video=SimpleNamespace(file_id="channel-video-id"))
+    )
+    store.catalog.create_character.return_value = {"id": "generated", "number": 1}
+    try:
+        buttons, _ = await prepare_upload_callback(
+            app, "/upload Toji-Fushiguro Jujutsu-Kaisen 2", source
+        )
+        assert len(buttons) == 1 and "Catbox" in buttons[0].text
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/example.mp4",
+            ) as hosted,
+        ):
+            await dispatch(app, callback_packet(buttons[0].callback_data))
+        hosted.assert_awaited_once()
+        data = store.catalog.create_character.await_args.args[0]
+        assert (data.name, data.category, data.rarity, data.media_type) == (
+            "Toji Fushiguro",
+            "Jujutsu Kaisen",
+            "amv-edition",
+            "video",
+        )
+        assert data.image_url == "https://files.catbox.moe/example.mp4"
+        assert data.telegram_file_id == "channel-video-id"
+        assert sent.await_args.args[2].title == "Character added"
+    finally:
+        await app.dispatcher.stop()
+
+
+@pytest.mark.parametrize("change", ["actor", "provider", "text", "media"])
+async def test_native_upload_menu_rejects_other_actor_or_changed_signed_inputs(change):
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+    content = jpeg()
+    source = source_photo(content)
+    app.stream_media = AsyncMock()
+    try:
+        buttons, command = await prepare_upload_callback(app, "/upload A | S | 2", source)
+        callback = buttons[0].callback_data
+        user_id = 42
+        if change == "actor":
+            user_id = 99
+            app.message_cache[(99, 51)] = Message(id=51, chat=Chat(id=99, type=ChatType.PRIVATE))
+        elif change == "provider":
+            callback = callback.replace(":c:", ":i:")
+        elif change == "text":
+            command.text = "/upload Changed | S | 2"
+        else:
+            source.photo.file_unique_id = "different-photo"
+        with patch("summon.bot.commands_catalog.upload_catbox", new_callable=AsyncMock) as hosted:
+            await dispatch(app, callback_packet(callback, user_id=user_id))
+        hosted.assert_not_awaited()
+        app.stream_media.assert_not_called()
+        store.catalog.create_character.assert_not_awaited()
+        assert app.answer_callback_query.await_args.kwargs["show_alert"] is True
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_native_channel_timeout_keeps_original_file_id_and_warns_without_retry():
+    app, store = await setup(db_channel=-1001234567890)
+    content = jpeg()
+    source = source_photo(content)
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_photo = AsyncMock(side_effect=TimeoutError("PRIVATE_ARCHIVE_DETAIL"))
+    store.catalog.create_character.return_value = {"id": "generated", "number": 1}
+    try:
+        buttons, _ = await prepare_upload_callback(app, "/upload A | S | 1", source)
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/example.jpg",
+            ),
+        ):
+            await dispatch(app, callback_packet(buttons[0].callback_data))
+        assert (
+            store.catalog.create_character.await_args.args[0].telegram_file_id
+            == "original-photo-id"
+        )
+        assert "Channel copy unconfirmed" in sent.await_args.args[2].body
+        app.send_photo.assert_awaited_once()
+    finally:
+        await app.dispatcher.stop()
+
+
+async def test_native_gif_upload_uses_animation_file_id_and_amv_rarity():
+    from wzgram.types import Animation
+
+    content = b"GIF89a" + b"frames"
+    source = Message(
+        id=49,
+        chat=Chat(id=42, type=ChatType.PRIVATE),
+        from_user=User(id=42),
+        animation=Animation(
+            file_id="original-gif-id",
+            file_unique_id="gif-unique",
+            width=16,
+            height=16,
+            duration=1,
+            mime_type="image/gif",
+            file_size=len(content),
+        ),
+    )
+    app, store = await setup(db_channel=-1001234567890, imgbb_key="FAKE_HOST_KEY")
+
+    async def stream(_message, *, limit):
+        yield content
+
+    app.stream_media = stream
+    app.get_chat = AsyncMock(return_value=SimpleNamespace(type=ChatType.CHANNEL))
+    app.send_animation = AsyncMock(
+        return_value=SimpleNamespace(animation=SimpleNamespace(file_id="channel-gif-id"))
+    )
+    store.catalog.create_character.return_value = {"id": "generated", "number": 1}
+    try:
+        buttons, _ = await prepare_upload_callback(app, '/upload "A Name" "A Series" 8', source)
+        assert len(buttons) == 1 and "Catbox" in buttons[0].text
+        with (
+            patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent,
+            patch(
+                "summon.bot.commands_catalog.upload_catbox",
+                new_callable=AsyncMock,
+                return_value="https://files.catbox.moe/example.gif",
+            ),
+        ):
+            await dispatch(app, callback_packet(buttons[0].callback_data))
+        data = store.catalog.create_character.await_args.args[0]
+        assert data.rarity == "amv-edition" and data.media_type == "animation"
+        assert data.telegram_file_id == "channel-gif-id"
+        assert data.image_url.endswith(".gif")
+        assert sent.await_args.args[2].title == "Character added"
     finally:
         await app.dispatcher.stop()

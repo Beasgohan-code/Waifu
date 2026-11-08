@@ -33,8 +33,20 @@ COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "name_key": {"bsonType": "string"},
             "category": {"bsonType": "string", "maxLength": 120},
             "rarity": {"enum": list(RARITY_VALUES)},
+            "number": {"bsonType": _NUMBER, "minimum": 1, "maximum": 2**53 - 1},
+            "media_type": {"enum": ["photo", "video", "animation"]},
+            "telegram_file_id": {"bsonType": ["string", "null"], "maxLength": 2048},
             "active": {"bsonType": "bool"},
             "random_key": {"bsonType": "double", "minimum": 0, "maximum": 1},
+        },
+    },
+    "catalog_counters": {
+        "bsonType": "object",
+        "required": ["_id", "last_number"],
+        "additionalProperties": False,
+        "properties": {
+            "_id": {"enum": ["characters"]},
+            "last_number": {"bsonType": _NUMBER, "minimum": 0, "maximum": 2**53 - 1},
         },
     },
     "spawn_weights": {
@@ -198,6 +210,10 @@ COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
 # Every list/read path is bounded and uses one of these indexes or the _id index.
 INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
     "characters": [
+        (
+            [("number", ASCENDING)],
+            {"unique": True, "partialFilterExpression": {"number": {"$exists": True}}},
+        ),
         ([("active", ASCENDING), ("name_key", ASCENDING), ("_id", ASCENDING)], {}),
         (
             [

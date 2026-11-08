@@ -14,6 +14,7 @@ from summon.services.artwork import validate_external_url
 
 InventorySort = Literal["recent", "copies"]
 CollectionMode = Literal["recent", "copies", "favorites"]
+MediaType = Literal["photo", "video", "animation"]
 
 
 def normalize_name(value: str) -> str:
@@ -37,8 +38,17 @@ class CharacterBasics(BaseModel):
 
 class CharacterInput(CharacterBasics):
     image_url: str = Field(max_length=2048)
+    media_type: MediaType = "photo"
+    telegram_file_id: str | None = Field(default=None, min_length=1, max_length=2048)
     description: str = Field(default="", max_length=1200)
     active: bool = True
+
+    @field_validator("telegram_file_id")
+    @classmethod
+    def valid_file_id(cls, value: str | None) -> str | None:
+        if value is not None and (not value.isascii() or not value.isprintable()):
+            raise ValueError("Invalid Telegram file ID")
+        return value
 
     @field_validator("image_url")
     @classmethod

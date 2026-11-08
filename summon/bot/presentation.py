@@ -313,7 +313,46 @@ async def send_photo_card(
             raise
         logger.info("Custom emoji in photo caption rejected; retrying with Unicode")
         kwargs["caption"] = card.telegram_html(premium=False)
+        if hasattr(photo, "seek"):
+            photo.seek(0)
         return await client.send_photo(**kwargs)
+
+
+async def send_media_card(
+    client: Any,
+    chat_id: int,
+    media: str | BinaryIO,
+    card: Card,
+    *,
+    media_type: str,
+    premium: bool = True,
+    message_thread_id: int | None = None,
+) -> Any:
+    """Send photo, video, or animation; never retry an ambiguous delivery."""
+    if media_type == "photo":
+        return await send_photo_card(
+            client, chat_id, media, card, premium=premium, message_thread_id=message_thread_id
+        )
+    if media_type not in {"video", "animation"}:
+        raise ValueError("Unsupported media type")
+    sender = client.send_video if media_type == "video" else client.send_animation
+    kwargs: dict[str, Any] = {
+        "chat_id": chat_id,
+        media_type: media,
+        "caption": card.telegram_html(premium=premium),
+        "parse_mode": ParseMode.HTML,
+        "message_thread_id": message_thread_id,
+    }
+    try:
+        return await sender(**kwargs)
+    except BadRequest as exc:
+        if not premium or not _emoji_rejected(exc):
+            raise
+        logger.info("Custom emoji in media caption rejected; retrying with Unicode")
+        kwargs["caption"] = card.telegram_html(premium=False)
+        if hasattr(media, "seek"):
+            media.seek(0)
+        return await sender(**kwargs)
 
 
 async def send_ephemeral_card(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
@@ -131,14 +132,16 @@ class CollectionRepository:
         await transaction(self.client, mark)
 
     async def claim_daily_character(
-        self, user: TelegramUser, character_id: str, now: datetime
+        self, user: TelegramUser, character_id: str, now: datetime, *, message_id: str
     ) -> dict[str, Any]:
-        """Award one free character per actor and UTC day in a single transaction."""
+        """Award once per UTC day and once per Telegram message, atomically."""
         if now.utcoffset() is None:
             raise ValueError("A timezone-aware server timestamp is required")
         now = now.astimezone(UTC)
         if not isinstance(character_id, str) or not 1 <= len(character_id) <= 64:
             raise ValueError("Invalid character ID")
+        if not re.fullmatch(r"daily-character-message:[0-9a-f]{64}", message_id):
+            raise ValueError("A stable message identity is required")
         event_id = f"daily-character:{user.id}:{now.date().isoformat()}"
 
         async def claim(session: Any) -> dict[str, Any]:
@@ -148,6 +151,17 @@ class CollectionRepository:
             if not character:
                 raise DailyCharacterUnavailable
             try:
+                # The daily ledger alone is insufficient: an old Telegram
+                # update could otherwise be replayed on a different UTC day.
+                await self.db.activity.insert_one(
+                    {
+                        "_id": message_id,
+                        "user_id": user.id,
+                        "kind": "daily_character_message",
+                        "created_at": now,
+                    },
+                    session=session,
+                )
                 await self.db.reward_history.insert_one(
                     {
                         "_id": event_id,
@@ -159,8 +173,8 @@ class CollectionRepository:
                     session=session,
                 )
             except DuplicateKeyError:
-                # This specific unique ledger insert is the daily guard; a
-                # separate inventory conflict is not misreported as a claim.
+                # Either the message or UTC-day guard already exists. Other
+                # transaction conflicts are not misreported as daily claims.
                 raise DailyCharacterAlreadyClaimed from None
             await self.db.users.update_one(
                 {"_id": user.id},

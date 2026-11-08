@@ -1,4 +1,4 @@
-"""Opt-in, insert-only sample catalogue seed; never migrates or edits ownership."""
+"""Opt-in, insert-only sample catalogue seed; never edits ownership."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from typing import Any
 from summon.config import Settings
 from summon.database import connect_database
 from summon.models import CharacterInput, normalize_name
+from summon.repositories.base import transaction
+from summon.repositories.character_numbers import CharacterNumbers
 
 CONFIRMATION = "INSERT-SAMPLE"
 SAMPLE_CHARACTERS = (
@@ -45,18 +47,35 @@ async def seed_characters(database: Any) -> dict[str, int]:
     inserted = 0
     rng = secrets.SystemRandom()
     now = datetime.now(UTC)
+    client = database.client
+    numbers = CharacterNumbers(client, database)
+    # Numbering adds aliases only; existing character IDs and ownership stay intact.
+    await numbers.ensure_initialized()
     for character in SAMPLE_CHARACTERS:
         document = character.model_dump(exclude={"id"})
         document.update(
             name_key=normalize_name(character.name), random_key=rng.random(), created_at=now
         )
-        # Only inserts are allowed; existing catalog and every ownership record remain untouched.
-        result = await database.characters.update_one(
-            {"_id": character.id},
-            {"$setOnInsert": document},
-            upsert=True,
-        )
-        inserted += int(result.upserted_id is not None)
+
+        async def insert(
+            session: Any,
+            character: CharacterInput = character,
+            document: dict[str, Any] = document,
+        ) -> bool:
+            if await database.characters.find_one(
+                {"_id": character.id}, {"_id": 1}, session=session
+            ):
+                return False
+            number = await numbers.allocate(character.id, session)
+            result = await database.characters.update_one(
+                {"_id": character.id},
+                {"$setOnInsert": {**document, "number": number}},
+                upsert=True,
+                session=session,
+            )
+            return result.upserted_id is not None
+
+        inserted += int(await transaction(client, insert))
     return {"inserted": inserted, "already_present": len(SAMPLE_CHARACTERS) - inserted}
 
 

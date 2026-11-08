@@ -212,3 +212,40 @@ async def test_group_rules_use_ios_document_icon():
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
         await find_handler(router, "rules")(make_message("supergroup"))
     assert send.await_args.args[2].emoji is Emoji.RULES
+
+
+async def test_start_includes_group_invitation_and_actor_bound_guide():
+    from wzgram.types import User
+
+    app = await native_app(
+        make_store(), Settings(webapp_url="https://miniapp.example", _env_file=None)
+    )
+    app.me = User(id=123, is_bot=True, username="summon_test", first_name="Bot")
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await find_handler(app, "start")(make_message())
+    rows = send.await_args.kwargs["reply_markup"].inline_keyboard
+    assert rows[0][0].web_app.url == "https://miniapp.example"
+    assert rows[1][0].url == "https://t.me/summon_test?startgroup=true"
+    assert rows[2][0].callback_data == "start-guide:42"
+    assert rows[1][0].icon_custom_emoji_id == Emoji.SPARK.custom_id
+
+
+async def test_start_guide_rejects_another_actor_before_sending():
+    app = await native_app(make_store(), Settings(_env_file=None))
+    callback = SimpleNamespace(
+        from_user=SimpleNamespace(
+            id=43, is_bot=False, first_name="Other", last_name=None, username=None
+        ),
+        data="start-guide:42",
+        message=SimpleNamespace(chat=SimpleNamespace(id=43, type="private")),
+        answer=AsyncMock(),
+    )
+    handler = next(
+        item.callback
+        for item in app.dispatcher.groups[0]
+        if item.callback.__name__ == "start_guide"
+    )
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as sent:
+        await handler(app, callback)
+    sent.assert_not_awaited()
+    assert callback.answer.await_args.kwargs["show_alert"] is True

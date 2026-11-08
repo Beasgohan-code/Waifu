@@ -13,7 +13,7 @@ from wzgram.errors import BadRequest, Forbidden, RPCError
 from wzgram.types import Message
 
 from summon.auto_replies import AutoReplyStorageError, find_auto_reply
-from summon.bot.presentation import Card, Emoji
+from summon.bot.presentation import Card, Emoji, send_media_card
 from summon.bot.protection import is_group_user_content
 from summon.bot.telegram_helpers import _group, _user
 from summon.config import Settings
@@ -45,22 +45,38 @@ def register_group_events(
             ),
             field_icons=(Emoji.SERIES_TAG, Emoji.RARITY_STAR),
         )
-        image = character.get("image_url", "")
-        if image.startswith(("/art/", "/api/artwork/")):
-            image = urljoin(settings.webapp_url, image) if settings.webapp_url else ""
-        if not image:
+        url = character.get("image_url", "")
+        if url.startswith(("/art/", "/api/artwork/")):
+            url = urljoin(settings.webapp_url, url) if settings.webapp_url else ""
+        file_id = character.get("telegram_file_id")
+        if not isinstance(file_id, str) or not file_id:
+            file_id = ""
+        media_type = character.get("media_type", "photo")
+        if media_type not in {"photo", "video", "animation"} or not (file_id or url):
             await store.collection.mark_delivery_failed(message.chat.id, event["spawn"]["id"])
-            logger.warning("Spawn has no public artwork URL; spawn marked failed")
+            logger.warning("Spawn has no usable artwork; spawn marked failed")
             return False
-        try:
-            sent = await send_photo_card(
-                app,
-                message.chat.id,
-                image,
-                card,
-                premium=settings.premium_emoji_enabled,
-                message_thread_id=message.message_thread_id,
+
+        async def deliver(media: str) -> Any:
+            kwargs = {
+                "premium": settings.premium_emoji_enabled,
+                "message_thread_id": message.message_thread_id,
+            }
+            if media_type == "photo":
+                return await send_photo_card(app, message.chat.id, media, card, **kwargs)
+            return await send_media_card(
+                app, message.chat.id, media, card, media_type=media_type, **kwargs
             )
+
+        try:
+            try:
+                sent = await deliver(file_id or url)
+            except BadRequest:
+                # A definite rejection of the bot-scoped file ID can safely fall
+                # back to the hosted URL; uncertain sends are never retried.
+                if not file_id or not url or file_id == url:
+                    raise
+                sent = await deliver(url)
         except (BadRequest, Forbidden):
             # A text-only challenge is not guessable. Only a definite rejection
             # cancels the reservation; an ambiguous failure may have delivered.

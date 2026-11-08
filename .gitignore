@@ -9,6 +9,9 @@
 *.log
 # Keep migration exports/reports out of the checkout whenever possible.
 migration-data/
+# Encrypted backups contain private user data and must never be committed.
+backups/
+*.sbak
 
 # Python
 .venv/
