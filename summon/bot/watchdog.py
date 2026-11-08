@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,28 +26,31 @@ async def monitor_connection(
     timeout_seconds: float,
     health_repository: Any | None = None,
     interval_seconds: float = 30,
+    rpc_timeout_seconds: float = 15,
+    clock: Callable[[], float] | None = None,
 ) -> None:
-    if timeout_seconds <= 0 or interval_seconds <= 0:
+    if timeout_seconds <= 0 or interval_seconds <= 0 or rpc_timeout_seconds <= 0:
         raise ValueError("Connection monitoring intervals must be positive")
-    last_success = asyncio.get_running_loop().time()
+    clock = clock or asyncio.get_running_loop().time
+    last_success = clock()
     while True:
         if not lease.valid():
             raise TelegramConnectionStalled("Update-worker coordination is no longer valid")
         try:
             if not client.is_connected or not client.is_initialized:
                 raise ConnectionError("Wzgram client is not connected")
-            async with asyncio.timeout(15):
+            async with asyncio.timeout(rpc_timeout_seconds):
                 # A successful GetState proves an RPC response, not that updates
                 # were delivered, dispatched, or processed successfully.
                 await client.invoke(raw.functions.updates.GetState())
         except Exception as exc:
             logger.warning("Telegram connection check failed (%s)", type(exc).__name__)
-            if asyncio.get_running_loop().time() - last_success >= timeout_seconds:
+            if clock() - last_success >= timeout_seconds:
                 raise TelegramConnectionStalled(
                     "Telegram stopped answering connection checks"
                 ) from exc
         else:
-            last_success = asyncio.get_running_loop().time()
+            last_success = clock()
             if health_repository is not None and lease.valid():
                 try:
                     async with asyncio.timeout(3):

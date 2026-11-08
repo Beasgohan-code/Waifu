@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import html
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -67,12 +68,73 @@ class Emoji(Enum):
     RULES = palette_icon("telegram_ios", 76)
     PRIVATE = palette_icon("telegram_ios", 68)
     ADMIN_SHIELD = palette_icon("telegram_ios", 94)
+    SNOW = palette_icon("summon_bot", 8)
+    RAIN = palette_icon("summon_bot", 58)
+    HALLOWEEN = palette_icon("summon_bot", 45)
+    CHRISTMAS = palette_icon("summon_bot", 17)
+    CELEBRATE = palette_icon("summon_bot", 55)
+    MUSIC = vector_icon(2)
+
+    @property
+    def custom_id(self) -> str | None:
+        value = self.value[1]
+        if re.fullmatch(r"[1-9][0-9]{0,18}", value) and int(value) <= 2**63 - 1:
+            return value
+        return None
 
     def render(self, *, premium: bool = True) -> str:
-        glyph, emoji_id = self.value
-        if not premium:
+        glyph = html.escape(self.value[0], quote=False)
+        emoji_id = self.custom_id
+        if not premium or emoji_id is None:
             return glyph
         return f'<tg-emoji emoji-id="{emoji_id}">{glyph}</tg-emoji>'
+
+
+_RARITY_ICONS = {
+    "common": Emoji.RARITY_STAR,
+    "rare": Emoji.STAR,
+    "special edition": Emoji.SUMMON_BRAND,
+    "legendary": Emoji.CROWN,
+    "mythic edition": Emoji.DIAMOND,
+    "valentine edition": Emoji.HEART,
+    "summer edition": Emoji.SPARK,
+    "rainy edition": Emoji.RAIN,
+    "halloween edition": Emoji.HALLOWEEN,
+    "christmas edition": Emoji.CHRISTMAS,
+    "winter edition": Emoji.SNOW,
+    "new year edition": Emoji.CELEBRATE,
+    "festival edition": Emoji.CELEBRATE,
+    "amv edition": Emoji.MUSIC,
+    "event edition": Emoji.GIFT_ACTION,
+    "celestial edition": Emoji.STAR,
+    "luxury edition": Emoji.DIAMOND,
+    "limited edition": Emoji.HOURGLASS,
+    "epic (legacy)": Emoji.RARITY_STAR,
+}
+
+
+def _field_icon(key: str, value: str) -> Emoji:
+    """Decorate authored labels, not arbitrary user-supplied message bodies."""
+    label = key.casefold().strip()
+    if label == "rarity":
+        return _RARITY_ICONS.get(value.casefold().strip(), Emoji.RARITY_STAR)
+    if label in _RARITY_ICONS:
+        return _RARITY_ICONS[label]
+    if any(word in label for word in ("series", "category")):
+        return Emoji.SERIES_TAG
+    if any(word in label for word in ("point", "balance", "reward", "coin")):
+        return Emoji.REWARD_COIN
+    if any(word in label for word in ("trade", "gift")):
+        return Emoji.GIFT_ACTION
+    if any(word in label for word in ("group", "admin", "moderation", "security")):
+        return Emoji.ADMIN_SHIELD
+    if any(word in label for word in ("time", "daily", "streak", "expires")):
+        return Emoji.HOURGLASS
+    if any(word in label for word in ("owned", "collection", "copies", "favorite")):
+        return Emoji.OPEN_COLLECTION
+    if any(word in label for word in ("progress", "level", "xp", "experience")):
+        return Emoji.STAR
+    return Emoji.SPARK
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,9 +153,11 @@ class Card:
     def _render_fields(self, *, premium: bool) -> list[tuple[str, str]]:
         rendered = []
         for index, (key, value) in enumerate(self.fields):
-            icon = self.field_icons[index] if self.field_icons else None
-            prefix = f"{icon.render(premium=premium)} " if icon else ""
-            rendered.append((prefix + html.escape(key), html.escape(value)))
+            explicit = self.field_icons[index] if self.field_icons else None
+            icon = explicit or _field_icon(key, value)
+            rendered.append(
+                (f"{icon.render(premium=premium)} {html.escape(key)}", html.escape(value))
+            )
         return rendered
 
     def telegram_html(self, *, premium: bool = True) -> str:
@@ -108,7 +172,8 @@ class Card:
                 )
             )
         if self.details:
-            parts.append(f"<b>{html.escape(self.details[0])}</b>\n{html.escape(self.details[1])}")
+            label = f"{Emoji.NOTE.render(premium=premium)} {html.escape(self.details[0])}"
+            parts.append(f"<b>{label}</b>\n{html.escape(self.details[1])}")
         return "\n\n".join(parts)
 
     def rich_html(self, *, premium: bool = True) -> str:
@@ -122,7 +187,10 @@ class Card:
             )
         if self.details:
             pieces.append(
-                richgram.rich_details(html.escape(self.details[0]), html.escape(self.details[1]))
+                richgram.rich_details(
+                    f"{Emoji.NOTE.render(premium=premium)} {html.escape(self.details[0])}",
+                    html.escape(self.details[1]),
+                )
             )
         return "".join(pieces)
 
@@ -136,7 +204,12 @@ def _emoji_rejected(exc: BadRequest) -> bool:
 
 def button_label(text: str, emoji: Emoji, *, premium: bool) -> str:
     """Show the corresponding Unicode glyph when premium button icons are off."""
-    return text if premium else f"{emoji.value[0]} {text}"
+    return text if premium and emoji.custom_id else f"{emoji.value[0]} {text}"
+
+
+def callback_text(text: str, *, emoji: Emoji) -> str:
+    """Callback toasts have plain text only; use Unicode, never Telegram HTML."""
+    return f"{emoji.value[0]} {text}"[:200]
 
 
 def fallback_keyboard(markup: Any) -> Any:
@@ -179,10 +252,15 @@ async def send_card(
                 reply_markup=reply_markup,
                 message_thread_id=message_thread_id,
             )
-        except BadRequest:
+        except BadRequest as exc:
             logger.info("Rich message rejected; using readable standard text")
-            premium = False
-            reply_markup = fallback_keyboard(reply_markup)
+            # An unsupported rich layout does not imply custom emoji are
+            # unavailable in ordinary Telegram messages or native buttons.
+            if _emoji_rejected(exc):
+                premium = False
+                reply_markup = fallback_keyboard(reply_markup)
+            elif not premium:
+                reply_markup = fallback_keyboard(reply_markup)
     kwargs: dict[str, Any] = {
         "chat_id": chat_id,
         "text": card.telegram_html(premium=premium),

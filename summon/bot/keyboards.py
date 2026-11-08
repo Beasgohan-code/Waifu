@@ -20,7 +20,7 @@ def collection_keyboard(url: str, *, premium: bool) -> InlineKeyboardMarkup:
                     ),
                     web_app=WebAppInfo(url=url),
                     style=ButtonStyle.PRIMARY,
-                    icon_custom_emoji_id=Emoji.OPEN_COLLECTION.value[1] if premium else None,
+                    icon_custom_emoji_id=Emoji.OPEN_COLLECTION.custom_id if premium else None,
                 )
             ]
         ]
@@ -39,13 +39,13 @@ def exchange_keyboard(
                     text=button_label(text, icon, premium=premium),
                     callback_data=f"{kind}:accept:{offer_id}",
                     style=ButtonStyle.SUCCESS,
-                    icon_custom_emoji_id=icon.value[1] if premium else None,
+                    icon_custom_emoji_id=icon.custom_id if premium else None,
                 ),
                 InlineKeyboardButton(
                     text=button_label("Cancel", Emoji.CANCEL, premium=premium),
                     callback_data=f"{kind}:cancel:{offer_id}",
                     style=ButtonStyle.DANGER,
-                    icon_custom_emoji_id=Emoji.CANCEL.value[1] if premium else None,
+                    icon_custom_emoji_id=Emoji.CANCEL.custom_id if premium else None,
                 ),
             ]
         ]

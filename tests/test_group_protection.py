@@ -1,429 +1,364 @@
-"""Protection must run before group commands and on delivered edits."""
+"""Native dispatcher protection precedes commands, spawns and edited messages."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message, Update
+import pytest
+import pytest_asyncio
+from wzgram import Client, raw
+from wzgram.handlers import RawUpdateHandler
+from wzgram.types import Message, User
 
-from summon.bot.handlers import build_router
+from summon.bot.handlers import register_handlers
 from summon.config import Settings
 from summon.models import GroupSettings
 
 
-def group_store(**settings):
-    groups = SimpleNamespace(
-        db=object(),
-        get=AsyncMock(return_value={"settings": GroupSettings(**settings).model_dump()}),
-        record_spam=AsyncMock(),
-        ensure=AsyncMock(),
-    )
-    return SimpleNamespace(
-        groups=groups,
-        collection=SimpleNamespace(record_message=AsyncMock()),
-        catalog=object(),
-        trades=object(),
-        gifts=object(),
-    )
+@pytest_asyncio.fixture
+async def make_bot():
+    clients = []
 
-
-def update(bot, *, text, edited=False, chat_type="supergroup", ephemeral_id=None):
-    body = {
-        "message_id": 123,
-        "date": int(datetime.now(UTC).timestamp()),
-        "chat": {
-            "id": -100 if chat_type != "private" else 42,
-            "type": chat_type,
-            **({"title": "Test"} if chat_type != "private" else {"first_name": "Member"}),
-        },
-        "from": {"id": 42, "is_bot": False, "first_name": "Member"},
-        "text": text,
-    }
-    if text.startswith("/help"):
-        body["entities"] = [{"type": "bot_command", "offset": 0, "length": 5}]
-    if ephemeral_id is not None:
-        body["ephemeral_message_id"] = ephemeral_id
-    return Update.model_validate(
-        {"update_id": 1, "edited_message" if edited else "message": body}, context={"bot": bot}
-    )
-
-
-def dispatcher(store):
-    dp = Dispatcher()
-    dp.include_router(
-        build_router(
-            store, Settings(bot_api_rich_enabled=False, premium_emoji_enabled=False, _env_file=None)
+    async def create(*, database=None, **settings):
+        groups = SimpleNamespace(
+            db=database if database is not None else object(),
+            get=AsyncMock(return_value={"settings": GroupSettings(**settings).model_dump()}),
+            record_spam=AsyncMock(),
+            ensure=AsyncMock(),
         )
+        store = SimpleNamespace(
+            groups=groups,
+            collection=SimpleNamespace(
+                record_message=AsyncMock(return_value={"settings": {"spawn_enabled": False}})
+            ),
+            catalog=object(),
+            trades=object(),
+            gifts=object(),
+            limiter=SimpleNamespace(allow=AsyncMock(return_value=True)),
+        )
+        app = Client(
+            "offline-protection",
+            api_id=123,
+            api_hash="test",
+            bot_token="123:fake",
+            in_memory=True,
+            workers=1,
+            skip_updates=True,
+            fetch_replies=False,
+        )
+        app.me = User(id=123, is_bot=True, username="summon_test", first_name="Bot")
+        register_handlers(
+            app, store, Settings(rich_enabled=False, premium_emoji_enabled=False, _env_file=None)
+        )
+        app._test_complete = asyncio.Queue()
+
+        async def finished(_client, update, _users, _chats):
+            if isinstance(update, raw.types.UpdateUserStatus):
+                app._test_complete.put_nowait(None)
+
+        app.add_handler(RawUpdateHandler(finished), group=100)
+        await asyncio.sleep(0)
+        await app.dispatcher.start()
+        clients.append(app)
+        return app, store
+
+    yield create
+    for client in clients:
+        await client.dispatcher.stop()
+
+
+def packet(
+    text="",
+    *,
+    edited=False,
+    private=False,
+    ephemeral=False,
+    photo=False,
+    hidden_link=False,
+    service=None,
+    sender_chat=False,
+):
+    now = int(datetime.now(UTC).timestamp())
+    actor = raw.types.User(
+        id=42, first_name="Member", access_hash=42, usernames=[], restriction_reason=[]
     )
-    return dp
+    new = raw.types.User(
+        id=43, first_name="New", access_hash=43, usernames=[], restriction_reason=[]
+    )
+    group = raw.types.Chat(
+        id=100,
+        title="Test",
+        photo=raw.types.ChatPhotoEmpty(),
+        participants_count=2,
+        date=now,
+        version=1,
+    )
+    peer = raw.types.PeerUser(user_id=42) if private else raw.types.PeerChat(chat_id=100)
+    sender = raw.types.PeerUser(user_id=42)
+    chats = {100: group}
+    if sender_chat:
+        sender = raw.types.PeerChannel(channel_id=200)
+        chats[200] = raw.types.Channel(
+            id=200,
+            title="Channel",
+            photo=raw.types.ChatPhotoEmpty(),
+            date=now,
+            broadcast=True,
+            access_hash=200,
+            usernames=[],
+            restriction_reason=[],
+        )
+    users = {42: actor, 43: new}
+    if ephemeral:
+        message = raw.types.EphemeralMessage(
+            id=999,
+            from_id=sender,
+            receiver_id=123,
+            date=now,
+            message=text,
+            peer_id=peer,
+            entities=[],
+        )
+        return raw.types.UpdateNewEphemeralMessage(message=message), users, chats
+    if service:
+        action = (
+            raw.types.MessageActionChatAddUser(users=[43])
+            if service == "join"
+            else raw.types.MessageActionPinMessage()
+        )
+        message = raw.types.MessageService(
+            id=123, peer_id=peer, from_id=sender, date=now, action=action
+        )
+    else:
+        media = None
+        if photo:
+            media = raw.types.MessageMediaPhoto(
+                photo=raw.types.Photo(
+                    id=1,
+                    access_hash=2,
+                    file_reference=b"ref",
+                    date=now,
+                    dc_id=1,
+                    sizes=[raw.types.PhotoSize(type="x", w=1, h=1, size=1)],
+                )
+            )
+        entities = [raw.types.MessageEntityTextUrl(offset=0, length=5, url="https://example.com")]
+        message = raw.types.Message(
+            id=123,
+            peer_id=peer,
+            from_id=sender,
+            date=now,
+            message=text,
+            entities=entities if hidden_link else [],
+            restriction_reason=[],
+            media=media,
+        )
+    kind = raw.types.UpdateEditMessage if edited else raw.types.UpdateNewMessage
+    return kind(message=message, pts=1, pts_count=1), users, chats
 
 
-async def test_protection_blocks_command_before_handler_and_audits_confirmed_deletion():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
+async def dispatch(app, update):
+    await app.dispatcher.updates_queue.put(update)
+    marker = raw.types.UpdateUserStatus(user_id=42, status=raw.types.UserStatusRecently())
+    await app.dispatcher.updates_queue.put((marker, {}, {}))
+    await asyncio.wait_for(app._test_complete.get(), 2)
+
+
+def bot_admin(*, can_delete=True):
+    return SimpleNamespace(
+        status="administrator", privileges=SimpleNamespace(can_delete_messages=can_delete)
+    )
+
+
+async def test_protection_blocks_command_before_handler_and_audits_confirmed_deletion(make_bot):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(side_effect=[SimpleNamespace(status="member"), bot_admin()])
     with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
-        patch.object(Message, "delete", new_callable=AsyncMock) as delete,
+        patch.object(Message, "delete", new_callable=AsyncMock, return_value=True) as delete,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
     ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=True),
-        ]
-        await dp.feed_update(bot, update(bot, text="/help https://example.com"))
+        await dispatch(app, packet("/help https://example.com"))
     delete.assert_awaited_once()
-    store.groups.record_spam.assert_awaited_once()
     assert store.groups.record_spam.await_args.args[:3] == (-100, 42, "link")
     send.assert_not_awaited()
     store.collection.record_message.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_administrators_are_exempt_and_the_command_still_runs():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
+async def test_administrators_are_exempt_and_command_still_runs(make_bot):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(return_value=bot_admin())
     with (
-        patch.object(
-            Bot,
-            "get_chat_member",
-            new_callable=AsyncMock,
-            return_value=SimpleNamespace(status="administrator"),
-        ),
         patch.object(Message, "delete", new_callable=AsyncMock) as delete,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
     ):
-        await dp.feed_update(bot, update(bot, text="/help https://example.com"))
+        await dispatch(app, packet("/help https://example.com"))
     delete.assert_not_awaited()
     store.groups.record_spam.assert_not_awaited()
     send.assert_awaited_once()
-    await bot.session.close()
 
 
-async def test_suspected_command_is_not_executed_if_bot_cannot_delete():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
+async def test_suspected_command_is_not_executed_if_bot_cannot_delete(make_bot):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(
+        side_effect=[SimpleNamespace(status="member"), bot_admin(can_delete=False)]
+    )
     with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
         patch.object(Message, "delete", new_callable=AsyncMock) as delete,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
     ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=False),
-        ]
-        await dp.feed_update(bot, update(bot, text="/help https://example.com"))
+        await dispatch(app, packet("/help https://example.com"))
     delete.assert_not_awaited()
     store.groups.record_spam.assert_not_awaited()
     send.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_edited_messages_are_inspected_but_never_count_as_activity():
-    store = group_store(link_filter=True, flood_enabled=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
-        patch.object(Message, "delete", new_callable=AsyncMock) as delete,
-    ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=True),
-        ]
-        await dp.feed_update(bot, update(bot, text="https://example.com", edited=True))
-    assert "edited_message" in dp.resolve_used_update_types()
+async def test_edited_messages_are_inspected_but_never_count_as_activity(make_bot):
+    app, store = await make_bot(link_filter=True, flood_enabled=True)
+    app.get_chat_member = AsyncMock(side_effect=[SimpleNamespace(status="member"), bot_admin()])
+    with patch.object(Message, "delete", new_callable=AsyncMock, return_value=True) as delete:
+        await dispatch(app, packet("https://example.com", edited=True))
     delete.assert_awaited_once()
     store.groups.record_spam.assert_awaited_once()
     store.collection.record_message.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_private_messages_do_not_use_group_protection():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
+async def test_private_messages_do_not_use_group_protection(make_bot):
+    app, store = await make_bot(link_filter=True)
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
-        await dp.feed_update(
-            bot, update(bot, text="/help https://example.com", chat_type="private")
-        )
+        await dispatch(app, packet("/help https://example.com", private=True))
     store.groups.get.assert_not_awaited()
     send.assert_awaited_once()
-    await bot.session.close()
 
 
-async def test_suspected_ephemeral_command_is_not_deleted_as_an_ordinary_message():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
+async def test_suspected_ephemeral_command_is_not_deleted_as_ordinary_message(make_bot):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(return_value=SimpleNamespace(status="member"))
     with (
-        patch.object(
-            Bot,
-            "get_chat_member",
-            new_callable=AsyncMock,
-            return_value=SimpleNamespace(status="member"),
-        ) as member,
         patch.object(Message, "delete", new_callable=AsyncMock) as delete,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
     ):
-        await dp.feed_update(bot, update(bot, text="/help https://example.com", ephemeral_id=999))
-    member.assert_awaited_once_with(-100, 42)
+        await dispatch(app, packet("/help https://example.com", ephemeral=True))
+    app.get_chat_member.assert_awaited_once_with(-100, 42)
     delete.assert_not_awaited()
     store.groups.record_spam.assert_not_awaited()
     send.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_new_chat_activity_is_checked_and_counted_only_once():
-    store = group_store(flood_enabled=True)
+async def test_new_chat_activity_is_checked_and_counted_once(make_bot):
     counter = AsyncMock(return_value={"count": 1})
-    store.groups.db = SimpleNamespace(rate_limits=SimpleNamespace(find_one_and_update=counter))
-    store.collection.record_message.return_value = {"settings": {"spawn_enabled": False}}
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    with patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member:
-        await dp.feed_update(bot, update(bot, text="A normal conversation"))
+    database = SimpleNamespace(rate_limits=SimpleNamespace(find_one_and_update=counter))
+    app, store = await make_bot(database=database, flood_enabled=True)
+    app.get_chat_member = AsyncMock()
+    await dispatch(app, packet("A normal conversation"))
     counter.assert_awaited_once()
     store.groups.ensure.assert_awaited_once()
     store.collection.record_message.assert_awaited_once()
-    member.assert_not_awaited()
-    await bot.session.close()
+    app.get_chat_member.assert_not_awaited()
 
 
-async def test_safe_edit_does_not_count_flood_or_spawn_and_does_not_run_command():
-    store = group_store(flood_enabled=True, duplicate_enabled=True)
+async def test_safe_edit_does_not_count_flood_spawn_or_run_command(make_bot):
     counter = AsyncMock(return_value={"count": 1})
-    store.groups.db = SimpleNamespace(rate_limits=SimpleNamespace(find_one_and_update=counter))
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
+    database = SimpleNamespace(rate_limits=SimpleNamespace(find_one_and_update=counter))
+    app, store = await make_bot(database=database, flood_enabled=True, duplicate_enabled=True)
     with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
-        await dp.feed_update(bot, update(bot, text="/help", edited=True))
+        await dispatch(app, packet("/help", edited=True))
     counter.assert_not_awaited()
     store.collection.record_message.assert_not_awaited()
     store.groups.ensure.assert_not_awaited()
     send.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_join_service_event_bypasses_spam_and_still_welcomes():
-    store = group_store(welcome_enabled=True, link_filter=True, flood_enabled=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    raw = {
-        "update_id": 99,
-        "message": {
-            "message_id": 2,
-            "date": int(datetime.now(UTC).timestamp()),
-            "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-            "from": {"id": 42, "is_bot": False, "first_name": "Admin"},
-            "new_chat_members": [{"id": 43, "is_bot": False, "first_name": "New"}],
-        },
-    }
-    with (
-        patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
-    ):
-        await dp.feed_update(bot, Update.model_validate(raw, context={"bot": bot}))
-    # The welcome handler reads settings once; the middleware must not read them.
+async def test_join_service_event_bypasses_spam_and_still_welcomes(make_bot):
+    app, store = await make_bot(welcome_enabled=True, link_filter=True, flood_enabled=True)
+    app.get_chat_member = AsyncMock()
+    with patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send:
+        await dispatch(app, packet(service="join"))
     store.groups.get.assert_awaited_once_with(-100)
-    member.assert_not_awaited()
+    app.get_chat_member.assert_not_awaited()
     send.assert_awaited_once()
     store.collection.record_message.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_edited_caption_hidden_link_is_checked():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    raw = {
-        "update_id": 2,
-        "edited_message": {
-            "message_id": 3,
-            "date": int(datetime.now(UTC).timestamp()),
-            "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-            "from": {"id": 42, "is_bot": False, "first_name": "Member"},
-            "photo": [{"file_id": "photo", "file_unique_id": "unique", "width": 1, "height": 1}],
-            "caption": "click here",
-            "caption_entities": [
-                {"type": "text_link", "offset": 0, "length": 5, "url": "https://example.com"}
-            ],
-        },
-    }
-    with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
-        patch.object(Message, "delete", new_callable=AsyncMock, return_value=True) as delete,
-    ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=True),
-        ]
-        await dp.feed_update(bot, Update.model_validate(raw, context={"bot": bot}))
+async def test_edited_caption_hidden_link_is_checked(make_bot):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(side_effect=[SimpleNamespace(status="member"), bot_admin()])
+    with patch.object(Message, "delete", new_callable=AsyncMock, return_value=True) as delete:
+        await dispatch(app, packet("click here", edited=True, photo=True, hidden_link=True))
     delete.assert_awaited_once()
     assert store.groups.record_spam.await_args.args[:3] == (-100, 42, "link")
     store.collection.record_message.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_unverified_admin_status_suppresses_flagged_command_without_deletion():
-    from aiogram.exceptions import TelegramNetworkError
-    from aiogram.methods import GetChatMember
-
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    error = TelegramNetworkError(
-        method=GetChatMember(chat_id=-100, user_id=42), message="unavailable"
-    )
+async def test_unverified_admin_status_suppresses_flagged_command_without_deletion(make_bot):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(side_effect=ConnectionError("synthetic secret"))
     with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock, side_effect=error),
         patch.object(Message, "delete", new_callable=AsyncMock) as delete,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
     ):
-        await dp.feed_update(bot, update(bot, text="/help https://example.com"))
+        await dispatch(app, packet("/help https://example.com"))
     delete.assert_not_awaited()
     store.groups.record_spam.assert_not_awaited()
     send.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_uncertain_delete_does_not_create_false_audit_or_run_command():
-    from aiogram.exceptions import TelegramNetworkError
-    from aiogram.methods import DeleteMessage
-
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    error = TelegramNetworkError(
-        method=DeleteMessage(chat_id=-100, message_id=123), message="unavailable"
-    )
+@pytest.mark.parametrize("result", [False, ConnectionError("unconfirmed")])
+async def test_unconfirmed_delete_does_not_create_false_audit_or_run_command(make_bot, result):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(side_effect=[SimpleNamespace(status="member"), bot_admin()])
+    kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
     with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
-        patch.object(Message, "delete", new_callable=AsyncMock, side_effect=error) as delete,
+        patch.object(Message, "delete", new_callable=AsyncMock, **kwargs) as delete,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
     ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=True),
-        ]
-        await dp.feed_update(bot, update(bot, text="/help https://example.com"))
-    delete.assert_awaited_once()  # Never retry an ambiguous Telegram result.
-    store.groups.record_spam.assert_not_awaited()
-    send.assert_not_awaited()
-    await bot.session.close()
-
-
-async def test_false_delete_result_does_not_create_false_audit():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
-        patch.object(Message, "delete", new_callable=AsyncMock, return_value=False) as delete,
-    ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=True),
-        ]
-        await dp.feed_update(bot, update(bot, text="/help https://example.com"))
+        await dispatch(app, packet("/help https://example.com"))
     delete.assert_awaited_once()
     store.groups.record_spam.assert_not_awaited()
-    await bot.session.close()
+    send.assert_not_awaited()
 
 
-async def test_flooding_a_command_is_checked_once_before_the_command_handler():
-    store = group_store(flood_enabled=True, flood_limit=3)
+async def test_flooding_a_command_is_checked_once_before_handler(make_bot):
     counter = AsyncMock(return_value={"count": 4})
-    store.groups.db = SimpleNamespace(rate_limits=SimpleNamespace(find_one_and_update=counter))
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
+    database = SimpleNamespace(rate_limits=SimpleNamespace(find_one_and_update=counter))
+    app, store = await make_bot(database=database, flood_enabled=True, flood_limit=3)
+    app.get_chat_member = AsyncMock(side_effect=[SimpleNamespace(status="member"), bot_admin()])
     with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
         patch.object(Message, "delete", new_callable=AsyncMock, return_value=True) as delete,
         patch("summon.bot.handlers.send_card", new_callable=AsyncMock) as send,
     ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=True),
-        ]
-        await dp.feed_update(bot, update(bot, text="/help"))
+        await dispatch(app, packet("/help"))
     counter.assert_awaited_once()
     delete.assert_awaited_once()
     assert store.groups.record_spam.await_args.args[:3] == (-100, 42, "flood")
     send.assert_not_awaited()
     store.collection.record_message.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_other_group_service_events_do_not_count_as_flood_or_spawns():
-    store = group_store(flood_enabled=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    date = int(datetime.now(UTC).timestamp())
-    raw = {
-        "update_id": 3,
-        "message": {
-            "message_id": 9,
-            "date": date,
-            "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-            "from": {"id": 42, "is_bot": False, "first_name": "Member"},
-            "pinned_message": {
-                "message_id": 5,
-                "date": date,
-                "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-                "text": "Pinned message",
-            },
-        },
-    }
-    await dp.feed_update(bot, Update.model_validate(raw, context={"bot": bot}))
+async def test_other_group_service_events_do_not_count_as_flood_or_spawns(make_bot):
+    app, store = await make_bot(flood_enabled=True)
+    await dispatch(app, packet(service="pin"))
     store.groups.get.assert_not_awaited()
     store.groups.ensure.assert_not_awaited()
     store.collection.record_message.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_sender_chat_message_is_not_deleted_without_a_checkable_human_role():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    raw = {
-        "update_id": 4,
-        "message": {
-            "message_id": 10,
-            "date": int(datetime.now(UTC).timestamp()),
-            "chat": {"id": -100, "type": "supergroup", "title": "Test"},
-            "from": {"id": 42, "is_bot": False, "first_name": "Sender"},
-            "sender_chat": {"id": -200, "type": "channel", "title": "Channel"},
-            "text": "https://example.com",
-        },
-    }
+async def test_sender_chat_is_not_deleted_without_checkable_human_role(make_bot):
+    app, store = await make_bot(link_filter=True)
     with patch.object(Message, "delete", new_callable=AsyncMock) as delete:
-        await dp.feed_update(bot, Update.model_validate(raw, context={"bot": bot}))
+        await dispatch(app, packet("https://example.com", sender_chat=True))
     store.groups.get.assert_not_awaited()
     store.groups.ensure.assert_not_awaited()
     store.collection.record_message.assert_not_awaited()
     delete.assert_not_awaited()
-    await bot.session.close()
 
 
-async def test_flagged_ordinary_message_never_advances_spawn_activity():
-    store = group_store(link_filter=True)
-    bot = Bot("123456:TEST_TOKEN_NOT_REAL")
-    dp = dispatcher(store)
-    with (
-        patch.object(Bot, "get_chat_member", new_callable=AsyncMock) as member,
-        patch.object(Message, "delete", new_callable=AsyncMock, return_value=True) as delete,
-    ):
-        member.side_effect = [
-            SimpleNamespace(status="member"),
-            SimpleNamespace(status="administrator", can_delete_messages=True),
-        ]
-        await dp.feed_update(bot, update(bot, text="https://example.com"))
+async def test_flagged_ordinary_message_never_advances_spawn_activity(make_bot):
+    app, store = await make_bot(link_filter=True)
+    app.get_chat_member = AsyncMock(side_effect=[SimpleNamespace(status="member"), bot_admin()])
+    with patch.object(Message, "delete", new_callable=AsyncMock, return_value=True) as delete:
+        await dispatch(app, packet("https://example.com"))
     delete.assert_awaited_once()
     store.groups.record_spam.assert_awaited_once()
     store.groups.ensure.assert_not_awaited()
     store.collection.record_message.assert_not_awaited()
-    await bot.session.close()

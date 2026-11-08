@@ -8,6 +8,7 @@ from wzgram import Client
 from wzgram.errors import BadRequest, Forbidden
 from wzgram.types import Message
 
+from summon.bot.commands_catalog import register_catalog_commands
 from summon.bot.commands_collector import register_collector_commands
 from summon.bot.commands_exchange import register_exchange_commands
 from summon.bot.commands_groups import register_group_commands
@@ -77,6 +78,7 @@ def register_handlers(app: Client, store: Any, settings: Settings) -> None:
             message_thread_id=message.message_thread_id,
         )
 
+    register_catalog_commands(app, store, settings, respond)
     register_collector_commands(app, store, settings, collection, respond)
     register_exchange_commands(app, store, settings, trading, gifting, respond)
     register_group_commands(app, store, respond, require_group_admin)

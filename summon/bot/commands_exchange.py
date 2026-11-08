@@ -12,7 +12,7 @@ from wzgram.errors import BadRequest
 from wzgram.types import CallbackQuery, Message
 
 from summon.bot.keyboards import exchange_keyboard
-from summon.bot.presentation import Card, Emoji
+from summon.bot.presentation import Card, Emoji, callback_text
 from summon.bot.telegram_helpers import _group, _user, callback_data, command_input
 from summon.config import Settings
 from summon.services.gifting import GiftConflict, GiftForbidden, GiftNotFound, GiftService
@@ -81,12 +81,17 @@ def register_exchange_commands(
             or parts[1] not in {"accept", "cancel"}
             or not re.fullmatch(r"[a-f0-9]{32}", parts[2])
         ):
-            await callback.answer("Invalid trade", show_alert=True)
+            await callback.answer(
+                callback_text("Invalid trade", emoji=Emoji.WARNING), show_alert=True
+            )
             return
         if not await store.limiter.allow(
             f"user:{callback.from_user.id}:trade", limit=10, seconds=60
         ):
-            await callback.answer("Too many trade actions; try again shortly.", show_alert=True)
+            await callback.answer(
+                callback_text("Too many trade actions; try again shortly.", emoji=Emoji.HOURGLASS),
+                show_alert=True,
+            )
             return
         try:
             if parts[1] == "accept":
@@ -96,9 +101,10 @@ def register_exchange_commands(
                 await store.trades.cancel(parts[2], callback.from_user.id, datetime.now(UTC))
                 result = "Trade cancelled."
         except (TradeConflict, TradeForbidden, TradeNotFound) as exc:
-            await callback.answer(str(exc), show_alert=True)
+            await callback.answer(callback_text(str(exc), emoji=Emoji.WARNING), show_alert=True)
             return
-        await callback.answer(result, show_alert=True)
+        icon = Emoji.DONE if parts[1] == "accept" else Emoji.CANCEL
+        await callback.answer(callback_text(result, emoji=icon), show_alert=True)
         if callback.message and hasattr(callback.message, "edit_reply_markup"):
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
@@ -152,12 +158,17 @@ def register_exchange_commands(
             or parts[1] not in {"accept", "cancel"}
             or not re.fullmatch(r"[a-f0-9]{32}", parts[2])
         ):
-            await callback.answer("Invalid gift", show_alert=True)
+            await callback.answer(
+                callback_text("Invalid gift", emoji=Emoji.WARNING), show_alert=True
+            )
             return
         if not await store.limiter.allow(
             f"user:{callback.from_user.id}:gift", limit=10, seconds=60
         ):
-            await callback.answer("Too many gift actions; try again shortly.", show_alert=True)
+            await callback.answer(
+                callback_text("Too many gift actions; try again shortly.", emoji=Emoji.HOURGLASS),
+                show_alert=True,
+            )
             return
         try:
             if parts[1] == "accept":
@@ -167,9 +178,10 @@ def register_exchange_commands(
                 await store.gifts.cancel(parts[2], callback.from_user.id, datetime.now(UTC))
                 result = "Gift cancelled."
         except (GiftConflict, GiftForbidden, GiftNotFound) as exc:
-            await callback.answer(str(exc), show_alert=True)
+            await callback.answer(callback_text(str(exc), emoji=Emoji.WARNING), show_alert=True)
             return
-        await callback.answer(result, show_alert=True)
+        icon = Emoji.DONE if parts[1] == "accept" else Emoji.CANCEL
+        await callback.answer(callback_text(result, emoji=icon), show_alert=True)
         if callback.message and hasattr(callback.message, "edit_reply_markup"):
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)

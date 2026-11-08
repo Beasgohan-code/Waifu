@@ -198,7 +198,7 @@ async def test_bot_api_rich_card_preserves_keyboard_callbacks():
     bot.send_message.assert_not_awaited()
 
 
-async def test_bot_api_rich_rejection_falls_back_to_plain_keyboard_once():
+async def test_rich_layout_rejection_preserves_premium_in_standard_message():
     from wzgram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     bot = AsyncMock()
@@ -218,8 +218,8 @@ async def test_bot_api_rich_rejection_falls_back_to_plain_keyboard_once():
     await send_card(bot, -100, Card("Gift"), reply_markup=markup, rich=True)
     button = bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.callback_data == "gift:accept:abc"
-    assert button.icon_custom_emoji_id is None
-    assert "tg-emoji" not in bot.send_message.await_args.kwargs["text"]
+    assert button.icon_custom_emoji_id == Emoji.CHECK.custom_id
+    assert "tg-emoji" in bot.send_message.await_args.kwargs["text"]
 
 
 async def test_bot_api_rich_timeout_does_not_retry():
@@ -345,3 +345,37 @@ async def test_rejected_new_pack_icons_fall_back_without_losing_webapp_or_callba
     assert opened.text == f"{Emoji.CROWN.value[0]} Open"
     assert accept.icon_custom_emoji_id is opened.icon_custom_emoji_id is None
     assert markup.inline_keyboard[0][0].icon_custom_emoji_id == Emoji.GIFT.value[1]
+
+
+def test_every_authored_field_and_details_receive_context_appropriate_icons():
+    card = Card(
+        "Summary",
+        fields=(("Rarity", "Rainy Edition"), ("Series", "Sky"), ("Other", "Value")),
+        details=("More", "User <content>"),
+    )
+    rich = card.rich_html(premium=True)
+    plain = card.telegram_html(premium=True)
+    assert Emoji.RAIN.custom_id in rich and Emoji.RAIN.custom_id in plain
+    assert Emoji.SERIES_TAG.custom_id in rich and Emoji.SPARK.custom_id in rich
+    assert Emoji.NOTE.custom_id in rich and "User &lt;content&gt;" in rich
+    assert "tg-emoji" not in card.telegram_html(premium=False)
+
+
+async def test_custom_emoji_rejection_in_rich_falls_back_to_unicode_once():
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = BadRequest("CUSTOM_EMOJI_INVALID")
+    await send_card(bot, 1, Card("Stats", fields=(("Series", "Sky"),)), rich=True)
+    assert "tg-emoji" not in bot.send_message.await_args.kwargs["text"]
+    bot.send_message.assert_awaited_once()
+
+
+def test_callback_and_menu_surfaces_use_plain_unicode_not_telegram_html():
+    from summon.bot.menu import COMMANDS
+    from summon.bot.presentation import callback_text
+
+    answer = callback_text("Done", emoji=Emoji.DONE)
+    assert answer == f"{Emoji.DONE.value[0]} Done"
+    assert "<tg-emoji" not in answer
+    assert len(callback_text("x" * 1000, emoji=Emoji.DONE)) <= 200
+    assert all("<tg-emoji" not in item.description for item in COMMANDS)
+    assert all(item.description[0] != "<" for item in COMMANDS)

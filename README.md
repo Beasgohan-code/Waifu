@@ -4,7 +4,7 @@
 
 SUMMON is an async Telegram character-collection bot, MongoDB-backed group-management service, and mobile-first Mini App. Collection, daily rewards, progression, favorites, search, consent-based trades and gifts, group settings, public notes, and opt-in auto replies are implemented without gambling, deposits, or cash-out.
 
-> **Prototype, not deployment-ready.** This Wzgram migration has not been tested against live Telegram or a real MongoDB deployment. The old aiogram-specific test suites have not yet been migrated and the full Python suite currently fails collection. See [todo.md](todo.md) for current release gates.
+> **Prototype, not deployment-ready.** This Wzgram migration has not been tested against live Telegram or a production MongoDB deployment. Offline native regression tests and a prior isolated, single-member MongoDB CI run do not verify a real cutover, production permissions, or failover. See [todo.md](todo.md) for current release gates.
 
 ## Telegram behavior
 
@@ -41,7 +41,11 @@ No deployment or cutover has been performed. For an authorized isolated rehearsa
 
 Common aliases `BOT_TOKEN`, `SESSION_SECRET`, `MONGO_URL`, `MONGO_DB_NAME`, `WEBAPP_URL`, `API_ID`, `API_HASH`, and `OWNER_ID` (a single Telegram ID) are accepted alongside existing `SUMMON_*` names. An explicit process environment value takes precedence over `.env`; within a single source, the `SUMMON_*` spelling wins, including an explicitly empty value. Do not set conflicting names or expose secret values.
 
-Catalog models now recognize the 18 reference rarity tiers while retaining stored `epic` values; legacy Epic and Special Edition share one spawn bucket. Weights use the reference's initialization defaults, including AMV 10; another reference fallback specifies 100, and a running reference instance can have customized values. Photo-upload storage is work in progress: no Telegram upload command is registered yet.
+Catalog models recognize the 18 reference rarity tiers while retaining stored `epic` values; legacy Epic and Special Edition share one spawn bucket. Weights use the reference's initialization defaults, including AMV 10; another reference fallback specifies 100, and a running reference instance can have customized values.
+
+Configured operators can create characters in a private bot chat with `/upload id | name | series | rarity | HTTPS-URL`, or omit the URL and caption or reply to an ordinary Telegram photo. `/addchar` accepts the same details without an ID and generates one; `/updatechar id name|series|rarity|image|description value` (also `/update`) changes metadata, with a URL or replied-to photo for `image`. These commands do not transfer ownership. Photos must be ordinary JPEGs up to 3 MiB; protected, spoiler and self-destructing photos are rejected, and accepted photos are transcoded with metadata removed.
+
+**Artwork is public.** Upload only images you have permission to publish; uploaded bytes are stored in MongoDB and public responses can be cached for an hour. For HTTPS URLs, SUMMON does not fetch or verify the destination: Telegram and app clients fetch the URL, whose DNS or redirects can change. Operators must choose a trusted public host. The public image route rate-limits requests by the observed network host, so shared proxy egress can combine clients. Live Telegram, hosted proxy behavior, and production MongoDB transactions still need an authorized rehearsal.
 
 Run one `summon-bot` worker per bot token and one or more `summon-api` workers. Configure the same bot token, application MongoDB database, separate `SUMMON_TELEGRAM_SESSION_DATABASE`, and session secret consistently. The bot must have read/write/index permissions for its dedicated session database; API workers need read access to its `peers` collection, not the session auth-key collection. That database and its backups contain credential-bearing MTProto session data and sensitive peer metadata. Restrict and encrypt access; never share one MTProto auth session concurrently across workers.
 

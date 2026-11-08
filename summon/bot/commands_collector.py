@@ -50,6 +50,12 @@ def register_collector_commands(
 
     @app.on_message(filters.incoming & filters.command(["help", "commands", "menu"]))
     async def help_command(_client: Client, message: Message) -> None:
+        user = _user(message)
+        operator_fields = (
+            (("Catalog operator", "/upload · /addchar · /updatechar (private chat)"),)
+            if user and user.id in settings.operator_ids and not _group(message)
+            else ()
+        )
         await respond(
             message,
             Card(
@@ -64,7 +70,8 @@ def register_collector_commands(
                     ("Group", "/manage · /spawns · /checkspawn · /rules · /notes"),
                     ("Moderation", "/warn · /warnings · /unwarn · /ban"),
                     ("Other actions", "Use Telegram to mute, unmute, unban or kick."),
-                ),
+                )
+                + operator_fields,
             ),
         )
 

@@ -23,13 +23,18 @@ def player_level(xp: int) -> int:
     return 1 + math.isqrt(max(0, xp) // 100)
 
 
-class CharacterInput(BaseModel):
+class CharacterBasics(BaseModel):
+    """Validate catalog metadata before downloading an operator-provided photo."""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
     name: str = Field(min_length=1, max_length=120)
     category: str = Field(min_length=1, max_length=120)
     rarity: Rarity
+
+
+class CharacterInput(CharacterBasics):
     image_url: str = Field(max_length=2048)
     description: str = Field(default="", max_length=1200)
     active: bool = True

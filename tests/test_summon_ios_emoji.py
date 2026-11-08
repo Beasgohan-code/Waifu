@@ -322,7 +322,7 @@ def test_every_new_button_has_a_unicode_fallback_and_keeps_actions(pack):
         assert restored.callback_data == "action:ok"
 
 
-async def test_rich_rejection_strips_every_new_field_icon_and_preserves_actions():
+async def test_rich_layout_rejection_retains_field_icons_and_preserves_actions():
     bot = AsyncMock()
     bot.send_rich_message.side_effect = BadRequest("UNSUPPORTED_RICH_MESSAGE")
     markup = InlineKeyboardMarkup(
@@ -347,10 +347,13 @@ async def test_rich_rejection_strips_every_new_field_icon_and_preserves_actions(
     assert Emoji.SERIES_TAG.value[1] in rich_html
     assert Emoji.REWARD_COIN.value[1] in rich_html
     plain = bot.send_message.await_args.kwargs
-    assert "tg-emoji" not in plain["text"] and "A &amp; B" in plain["text"]
-    assert "🏷" in plain["text"] and "🪙" in plain["text"]
+    assert "tg-emoji" in plain["text"] and "A &amp; B" in plain["text"]
+    assert (
+        Emoji.SERIES_TAG.custom_id in plain["text"] and Emoji.REWARD_COIN.custom_id in plain["text"]
+    )
     button = plain["reply_markup"].inline_keyboard[0][0]
-    assert button.text == "💎 Open" and button.web_app.url == "https://miniapp.example"
+    assert button.icon_custom_emoji_id == Emoji.OPEN_COLLECTION.custom_id
+    assert button.text == "Open" and button.web_app.url == "https://miniapp.example"
 
 
 async def test_disabled_premium_does_not_send_new_custom_emoji_ids():

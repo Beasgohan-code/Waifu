@@ -108,7 +108,10 @@ async def test_gift_callback_uses_telegram_actor_and_rejects_non_recipient():
     )
     await handler(app, "gift_callback")(app, callback)
     assert gifts.confirm.await_args.args[:2] == ("a" * 32, 42)
-    callback.answer.assert_awaited_once_with("Only the recipient can accept", show_alert=True)
+    callback.answer.assert_awaited_once()
+    assert callback.answer.await_args.args[0].endswith("Only the recipient can accept")
+    assert callback.answer.await_args.kwargs["show_alert"] is True
+    assert "<tg-emoji" not in callback.answer.await_args.args[0]
 
 
 def test_runtime_rejects_shared_pyrogram_distribution_conflict(monkeypatch):

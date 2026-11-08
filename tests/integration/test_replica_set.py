@@ -851,3 +851,98 @@ async def test_snapshot_inventory_rejects_legacy_corrupt_sort_values(isolated_da
         await repo.inventory_cursor(
             11, secret="synthetic-integration-secret-long-enough", sort=sort
         )
+
+
+async def test_catalog_artwork_transactions_preserve_inventory_and_reject_replays(
+    isolated_database,
+):
+    from io import BytesIO
+
+    from PIL import Image
+
+    from summon.models import CharacterChanges, CharacterInput
+    from summon.repositories.catalog import CatalogConflict, CatalogNotFound, CatalogRepository
+    from summon.services.artwork import normalize_photo
+
+    client, db = isolated_database
+    buffer = BytesIO()
+    Image.new("RGB", (16, 16), "purple").save(buffer, format="JPEG")
+    image = await normalize_photo(buffer.getvalue())
+    repository = CatalogRepository(db, client=client)
+    character = CharacterInput(
+        id="portrait-test",
+        name="Portrait",
+        category="Synthetic",
+        rarity="rare",
+        image_url=image.path,
+    )
+    await repository.create_character(
+        character, actor_id=42, event_id="synthetic-create", artwork=image
+    )
+    assert (await db.characters.find_one({"_id": character.id}))["image_url"] == image.path
+    assert await repository.artwork(image.digest) == image.content
+    assert (await db.activity.find_one({"_id": "synthetic-create"}))["user_id"] == 42
+
+    await db.inventory.insert_one({"user_id": 101, "character_id": character.id, "quantity": 3})
+    await repository.update_character(
+        character.id, CharacterChanges(name="Updated"), actor_id=42, event_id="synthetic-update"
+    )
+    with pytest.raises(CatalogConflict):
+        await repository.update_character(
+            character.id,
+            CharacterChanges(name="Replayed"),
+            actor_id=42,
+            event_id="synthetic-update",
+        )
+    assert (await db.characters.find_one({"_id": character.id}))["name"] == "Updated"
+    assert (await db.inventory.find_one({"user_id": 101, "character_id": character.id}))[
+        "quantity"
+    ] == 3
+
+    second_buffer = BytesIO()
+    Image.new("RGB", (16, 16), "orange").save(second_buffer, format="JPEG")
+    second_image = await normalize_photo(second_buffer.getvalue())
+    with pytest.raises(CatalogNotFound):
+        await repository.update_character(
+            "missing",
+            CharacterChanges(image_url=second_image.path),
+            actor_id=42,
+            event_id="synthetic-missing",
+            artwork=second_image,
+        )
+    assert await db.activity.find_one({"_id": "synthetic-missing"}) is None
+    assert await db.character_artworks.find_one({"_id": second_image.digest}) is None
+
+    duplicate = character.model_copy(update={"image_url": second_image.path})
+    with pytest.raises(CatalogConflict):
+        await repository.create_character(
+            duplicate, actor_id=42, event_id="synthetic-duplicate-id", artwork=second_image
+        )
+    assert await db.activity.find_one({"_id": "synthetic-duplicate-id"}) is None
+    assert await db.character_artworks.find_one({"_id": second_image.digest}) is None
+    assert (await db.inventory.find_one({"user_id": 101, "character_id": character.id}))[
+        "quantity"
+    ] == 3
+
+
+async def test_native_ingress_lease_serializes_competitors_on_replica_set(isolated_database):
+    from summon.bot.ingress import IngressLease, IngressLeaseLost
+
+    _, db = isolated_database
+    leases = [IngressLease(db, 123456), IngressLease(db, 123456)]
+    results = await asyncio.gather(*(lease.acquire() for lease in leases), return_exceptions=True)
+    winners = [index for index, result in enumerate(results) if result is None]
+    assert len(winners) == 1
+    winner = leases[winners[0]]
+    loser = leases[1 - winners[0]]
+    assert isinstance(results[1 - winners[0]], IngressLeaseLost)
+    assert winner.valid() and not loser.valid()
+    await winner.renew()
+    await loser.release()  # Releasing a different owner cannot delete the lease.
+    with pytest.raises(IngressLeaseLost):
+        await loser.acquire()
+    assert winner.valid()
+    await winner.release()
+    await loser.acquire()
+    assert loser.valid()
+    await loser.release()

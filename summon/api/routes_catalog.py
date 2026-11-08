@@ -29,11 +29,23 @@ logger = logging.getLogger(__name__)
 @router.get("/artwork/{digest}", response_class=Response)
 async def artwork(
     digest: Annotated[str, Path(pattern=r"^[0-9a-f]{64}$")],
+    request: Request,
     store: Any = Depends(get_store),
 ) -> Response:
     """Public immutable image data for the Mini App and Telegram's photo fetcher."""
     lookup = getattr(store.catalog, "artwork", None)
-    content = await lookup(digest) if callable(lookup) else None
+    if not callable(lookup):
+        raise HTTPException(404, "Artwork not found")
+    limiter = getattr(store, "limiter", None)
+    if limiter is None:
+        raise HTTPException(503, "Artwork is temporarily unavailable")
+    remote = request.client.host if request.client else "unknown"
+    # Apply the bound before loading or hashing image bytes, including misses.
+    # Do not trust browser-supplied forwarding headers. Shared Vercel egress can
+    # aggregate clients; public caching reduces the chance of hitting this cap.
+    if not await limiter.allow(f"artwork:{remote}", limit=600, seconds=60):
+        raise HTTPException(429, "Too many artwork requests")
+    content = await lookup(digest)
     if not content:
         raise HTTPException(404, "Artwork not found")
     return Response(content=content, media_type="image/jpeg")
